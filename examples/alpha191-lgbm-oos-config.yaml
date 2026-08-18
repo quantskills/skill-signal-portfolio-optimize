@@ -1,0 +1,50 @@
+schema_version: 2
+
+signal:
+  type: rank_score
+  higher_is_better: true
+  winsorize_mad: 5.0
+  zscore: true
+  annualized_alpha_scale: 0.05
+
+covariance:
+  annualized: true
+  periods_per_year: 252
+  eigenvalue_floor: 1.0e-10
+  symmetry_tolerance: 1.0e-10
+
+optimizer:
+  objective_mode: score_max_te
+  solver_backend: auto
+  risk_aversion: 5.0
+  turnover_penalty: 0.001
+  smoothing_epsilon: 1.0e-8
+  max_iterations: 4000
+  ftol: 1.0e-9
+
+constraints:
+  max_weight: 0.02
+  max_active_weight: 0.02
+  max_turnover: 0.30
+  max_tracking_error: 0.06
+  sector_active_limit: null
+  factor_active_limit: null
+  industry_active_range: null
+  style_active_ranges:
+    SIZE:
+      enabled: true
+      target_active: 0.00
+      tolerance: 0.05
+    BETA:
+      enabled: false
+    MOMENTUM:
+      enabled: false
+    RESVOL:
+      enabled: false
+    NLSIZE:
+      enabled: false
+  weight_sum_tolerance: 1.0e-8
+  constraint_tolerance: 1.0e-6
+
+baseline:
+  top_n: 200

@@ -1,3 +1,4 @@
-name: skill-template
-entrypoint: SKILL.md
-canonical_root: SKILL.md
+interface:
+  display_name: "Signal Portfolio Optimize"
+  short_description: "Optimize and backtest one stock signal with risk controls"
+  default_prompt: "Use $skill-signal-portfolio-optimize to build or dynamically extend an open risk model, optimize my frozen stock signal under exposure and turnover controls, checkpoint each date, and compare it with equal-weight and benchmark portfolios in a next-day rolling backtest."

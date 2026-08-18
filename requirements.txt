@@ -1,0 +1,10 @@
+numpy>=1.26
+pandas>=2.1
+pyarrow>=14
+PyYAML>=6
+scipy>=1.11
+cvxpy>=1.5
+osqp>=0.6
+clarabel>=0.9
+duckdb>=1.0
+pytest>=8

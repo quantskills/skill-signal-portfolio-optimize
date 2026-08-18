@@ -1,0 +1,136 @@
+# Input Schema
+
+## Identifier and date rules
+
+- Use one ticker representation consistently across every file.
+- Preserve exchange suffixes when present, for example `000001.SZ`.
+- Numeric tickers such as `1` are accepted, but are not automatically mapped to suffixed identifiers.
+- Represent dates as `YYYYMMDD`, ISO date strings, or timestamps that resolve to one trading date.
+- Duplicate rows for the requested date are errors.
+
+## Signal
+
+Required long-form CSV or Parquet:
+
+```text
+date | ticker | prediction
+```
+
+`prediction` must be finite. It represents one final alpha signal, not a raw multi-factor matrix.
+
+## Asset covariance
+
+Required square CSV or Parquet with identical ticker labels on rows and columns. For CSV, the first column contains row tickers:
+
+```text
+ticker    | 000001.SZ | 000002.SZ
+000001.SZ | 0.0800    | 0.0120
+000002.SZ | 0.0120    | 0.1200
+```
+
+The matrix may contain extra names but must cover every optimization-universe ticker, be finite, and use annualized return covariance when `covariance.annualized: true`.
+
+## Benchmark weights
+
+Required long-form CSV or Parquet:
+
+```text
+date | ticker | benchmark_weight
+```
+
+Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe, even when they have no signal.
+
+## Current weights
+
+Optional unless turnover is constrained or any asset is non-tradable:
+
+```text
+date | ticker | current_weight
+```
+
+Current weights must be long-only and sum to one. Positive current holdings automatically join the optimization universe. Missing names are treated as zero after the union is built.
+
+## Industry labels
+
+Required when `constraints.industry_active_range` or legacy `sector_active_limit` is set:
+
+```text
+date? | ticker | sector
+```
+
+The `date` column is optional. When present, only the requested date is used. Every optimization-universe ticker must have one non-empty industry label.
+
+## Style exposures
+
+Required when `constraints.style_active_ranges` or legacy `factor_active_limit` is set:
+
+```text
+date? | ticker | SIZE | BETA | MOMENTUM | ...
+```
+
+Configured style columns must be numeric and finite for every optimization-universe ticker. Extra style columns are ignored. Columns prefixed with `INDUSTRY:` are ignored as style constraints; provide industry labels separately.
+
+## Tradability
+
+Optional long-form CSV or Parquet:
+
+```text
+date? | ticker | tradable
+```
+
+Accepted true values are `true`, `1`, `yes`, and `y`; false values are `false`, `0`, `no`, and `n`. A false value freezes the asset at its current weight.
+
+## Rolling asset returns
+
+Required by the rolling runner:
+
+```text
+date | ticker | return
+```
+
+Use simple close-to-close returns. Rows may be sparse for assets not held, but every non-zero
+holding must have a finite return on each simulated date.
+
+When `--covariance-root` is a directory, store each matrix at one of:
+
+```text
+date=YYYYMMDD/asset_cov.parquet
+date=YYYYMMDD/covariance.parquet
+YYYYMMDD.parquet
+```
+
+When `--exposure-root` is supplied, store the corresponding style exposures at one of:
+
+```text
+date=YYYYMMDD/exposures.parquet
+date=YYYYMMDD/style_exposures.parquet
+YYYYMMDD.parquet
+```
+
+Use the same date-partitioned risk-model root for `--covariance-root` and
+`--exposure-root` when it contains both `asset_cov.parquet` and `exposures.parquet`.
+
+`--covariance-root` may be omitted only when all required dynamic-risk inputs are supplied.
+Dynamic risk returns and market cap use the wide panel format documented in
+[risk-model.md](risk-model.md). Large panels are loaded once per rolling process, not once per
+rebalance date.
+
+## Frozen Alpha191+LGBM adapter
+
+`scripts/prepare_alpha191_lgbm_inputs.py` writes:
+
+- `signal.parquet`: deterministic Top-N `date | ticker | prediction` rows;
+- `optimizer_universe.parquet`: Top-N candidates union positive-weight benchmark constituents;
+- `benchmark_weights.parquet`: benchmark rows on selected rebalance dates;
+- `rebalance_dates.parquet`: selected dates and per-date coverage counts;
+- `input_manifest.json`: source hashes, ranking direction, selection interval, and counts.
+
+Use `optimizer_universe.parquet` to build covariance. Use `signal.parquet` for optimization.
+When the adapter has already selected rebalance dates, pass `--rebalance-every 1` downstream.
+Rounded benchmark weights are accepted only when their raw daily sum is within the configured
+normalization tolerance, then divided by that daily sum. The manifest records the raw range,
+maximum deviation, tolerance, and normalization rule.
+The adapter requires a long-form `date | ticker | tradable` eligibility file. It ranks only
+tradable signal rows. Benchmark constituents need a market record but may be non-tradable;
+constituents without records are excluded only below an explicit aggregate-weight tolerance,
+then the retained benchmark is renormalized and the exclusion is disclosed in the manifest.

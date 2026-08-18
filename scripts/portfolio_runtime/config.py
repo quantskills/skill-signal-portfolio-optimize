@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .errors import ConfigError
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "schema_version": 1,
+    "signal": {
+        "type": "rank_score",
+        "higher_is_better": True,
+        "winsorize_mad": 5.0,
+        "zscore": True,
+        "annualized_alpha_scale": 0.05,
+    },
+    "covariance": {
+        "annualized": True,
+        "periods_per_year": 252,
+        "eigenvalue_floor": 1.0e-10,
+        "symmetry_tolerance": 1.0e-10,
+    },
+    "optimizer": {
+        "objective_mode": "mean_variance",
+        "solver_backend": "scipy_slsqp",
+        "risk_aversion": 5.0,
+        "turnover_penalty": 0.001,
+        "smoothing_epsilon": 1.0e-8,
+        "max_iterations": 2000,
+        "ftol": 1.0e-10,
+    },
+    "constraints": {
+        "max_weight": 0.20,
+        "max_active_weight": 0.15,
+        "max_turnover": None,
+        "max_tracking_error": None,
+        "sector_active_limit": None,
+        "factor_active_limit": None,
+        "industry_active_range": None,
+        "style_active_ranges": None,
+        "weight_sum_tolerance": 1.0e-8,
+        "constraint_tolerance": 1.0e-6,
+    },
+    "baseline": {"top_n": 5},
+}
+
+
+def _merge_strict(default: dict[str, Any], supplied: dict[str, Any], path: str = "") -> dict[str, Any]:
+    unknown = set(supplied) - set(default)
+    if unknown:
+        names = ", ".join(sorted(f"{path}{key}" for key in unknown))
+        raise ConfigError(f"unknown configuration key(s): {names}")
+    merged = deepcopy(default)
+    for key, value in supplied.items():
+        if isinstance(default[key], dict):
+            if not isinstance(value, dict):
+                raise ConfigError(f"{path}{key} must be a mapping")
+            merged[key] = _merge_strict(default[key], value, f"{path}{key}.")
+        else:
+            merged[key] = value
+    return merged
+
+
+def _finite_number(value: Any, name: str, *, minimum: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{name} must be numeric")
+    number = float(value)
+    if not (-float("inf") < number < float("inf")):
+        raise ConfigError(f"{name} must be finite")
+    if minimum is not None and number < minimum:
+        raise ConfigError(f"{name} must be at least {minimum}")
+    return number
+
+
+def _optional_limit(value: Any, name: str) -> float | dict[str, float] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if not value:
+            raise ConfigError(f"{name} mapping cannot be empty")
+        return {
+            str(key): _finite_number(item, f"{name}.{key}", minimum=0.0)
+            for key, item in value.items()
+        }
+    return _finite_number(value, name, minimum=0.0)
+
+
+def _exposure_range(value: Any, name: str) -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a mapping")
+    keys = set(value)
+    if keys == {"target_active", "tolerance"}:
+        target = _finite_number(value["target_active"], f"{name}.target_active")
+        tolerance = _finite_number(
+            value["tolerance"], f"{name}.tolerance", minimum=0.0
+        )
+        return {"lower_active": target - tolerance, "upper_active": target + tolerance}
+    if keys == {"min_active", "max_active"}:
+        lower = _finite_number(value["min_active"], f"{name}.min_active")
+        upper = _finite_number(value["max_active"], f"{name}.max_active")
+        if lower > upper:
+            raise ConfigError(f"{name}.min_active must not exceed max_active")
+        return {"lower_active": lower, "upper_active": upper}
+    raise ConfigError(
+        f"{name} must contain exactly target_active+tolerance or min_active+max_active"
+    )
+
+
+def _industry_ranges(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    name = "constraints.industry_active_range"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a mapping")
+    unknown = set(value) - {"default", "overrides"}
+    if unknown:
+        raise ConfigError(
+            "unknown configuration key(s): "
+            + ", ".join(sorted(f"{name}.{key}" for key in unknown))
+        )
+    default = value.get("default")
+    overrides = value.get("overrides", {})
+    if default is None and not overrides:
+        raise ConfigError(f"{name} must define default or overrides")
+    if not isinstance(overrides, dict):
+        raise ConfigError(f"{name}.overrides must be a mapping")
+    return {
+        "default": None if default is None else _exposure_range(default, f"{name}.default"),
+        "overrides": {
+            str(industry): _exposure_range(specification, f"{name}.overrides.{industry}")
+            for industry, specification in overrides.items()
+        },
+    }
+
+
+def _style_ranges(value: Any) -> dict[str, dict[str, Any]] | None:
+    if value is None:
+        return None
+    name = "constraints.style_active_ranges"
+    if not isinstance(value, dict) or not value:
+        raise ConfigError(f"{name} must be a non-empty mapping")
+    result: dict[str, dict[str, Any]] = {}
+    for raw_factor, raw_specification in value.items():
+        factor = str(raw_factor).strip()
+        label = f"{name}.{factor}"
+        if not factor:
+            raise ConfigError(f"{name} contains an empty factor name")
+        if factor.upper().startswith("INDUSTRY:"):
+            raise ConfigError(f"{label} is an industry dummy; use industry_active_range")
+        if not isinstance(raw_specification, dict):
+            raise ConfigError(f"{label} must be a mapping")
+        specification = dict(raw_specification)
+        enabled = specification.pop("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"{label}.enabled must be boolean")
+        if not enabled:
+            if specification:
+                raise ConfigError(f"{label} is disabled and must not define an exposure range")
+            result[factor] = {"enabled": False}
+            continue
+        result[factor] = {"enabled": True, **_exposure_range(specification, label)}
+    return result
+
+
+def validate_config(config: dict[str, Any]) -> dict[str, Any]:
+    if config["schema_version"] not in {1, 2}:
+        raise ConfigError("schema_version must equal 1 or 2")
+
+    signal = config["signal"]
+    if signal["type"] not in {"rank_score", "expected_return"}:
+        raise ConfigError("signal.type must be rank_score or expected_return")
+    if not isinstance(signal["higher_is_better"], bool):
+        raise ConfigError("signal.higher_is_better must be boolean")
+    signal["winsorize_mad"] = _finite_number(
+        signal["winsorize_mad"], "signal.winsorize_mad", minimum=0.0
+    )
+    if not isinstance(signal["zscore"], bool):
+        raise ConfigError("signal.zscore must be boolean")
+    if signal["type"] == "expected_return" and signal["zscore"]:
+        raise ConfigError("signal.zscore must be false for expected_return inputs")
+    signal["annualized_alpha_scale"] = _finite_number(
+        signal["annualized_alpha_scale"],
+        "signal.annualized_alpha_scale",
+        minimum=0.0,
+    )
+
+    covariance = config["covariance"]
+    if not isinstance(covariance["annualized"], bool):
+        raise ConfigError("covariance.annualized must be boolean")
+    periods = covariance["periods_per_year"]
+    if isinstance(periods, bool) or not isinstance(periods, int) or periods <= 0:
+        raise ConfigError("covariance.periods_per_year must be a positive integer")
+    covariance["eigenvalue_floor"] = _finite_number(
+        covariance["eigenvalue_floor"],
+        "covariance.eigenvalue_floor",
+        minimum=0.0,
+    )
+    covariance["symmetry_tolerance"] = _finite_number(
+        covariance["symmetry_tolerance"],
+        "covariance.symmetry_tolerance",
+        minimum=0.0,
+    )
+
+    optimizer = config["optimizer"]
+    if optimizer["objective_mode"] not in {"mean_variance", "score_max_te"}:
+        raise ConfigError(
+            "optimizer.objective_mode must be mean_variance or score_max_te"
+        )
+    if optimizer["solver_backend"] not in {"scipy_slsqp", "cvxpy", "auto"}:
+        raise ConfigError(
+            "optimizer.solver_backend must be scipy_slsqp, cvxpy, or auto"
+        )
+    for key in ("risk_aversion", "turnover_penalty", "smoothing_epsilon", "ftol"):
+        optimizer[key] = _finite_number(
+            optimizer[key], f"optimizer.{key}", minimum=0.0
+        )
+    if optimizer["risk_aversion"] <= 0:
+        raise ConfigError("optimizer.risk_aversion must be positive")
+    if optimizer["smoothing_epsilon"] <= 0:
+        raise ConfigError("optimizer.smoothing_epsilon must be positive")
+    if optimizer["ftol"] <= 0:
+        raise ConfigError("optimizer.ftol must be positive")
+    iterations = optimizer["max_iterations"]
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
+        raise ConfigError("optimizer.max_iterations must be a positive integer")
+
+    constraints = config["constraints"]
+    for key in ("max_weight", "max_active_weight", "weight_sum_tolerance", "constraint_tolerance"):
+        constraints[key] = _finite_number(
+            constraints[key], f"constraints.{key}", minimum=0.0
+        )
+    if constraints["max_weight"] <= 0:
+        raise ConfigError("constraints.max_weight must be positive")
+    for key in ("max_turnover", "max_tracking_error"):
+        if constraints[key] is not None:
+            constraints[key] = _finite_number(
+                constraints[key], f"constraints.{key}", minimum=0.0
+            )
+    constraints["sector_active_limit"] = _optional_limit(
+        constraints["sector_active_limit"], "constraints.sector_active_limit"
+    )
+    constraints["factor_active_limit"] = _optional_limit(
+        constraints["factor_active_limit"], "constraints.factor_active_limit"
+    )
+    constraints["industry_active_range"] = _industry_ranges(
+        constraints["industry_active_range"]
+    )
+    constraints["style_active_ranges"] = _style_ranges(
+        constraints["style_active_ranges"]
+    )
+    if (
+        constraints["sector_active_limit"] is not None
+        and constraints["industry_active_range"] is not None
+    ):
+        raise ConfigError(
+            "configure only one of sector_active_limit and industry_active_range"
+        )
+    if (
+        constraints["factor_active_limit"] is not None
+        and constraints["style_active_ranges"] is not None
+    ):
+        raise ConfigError(
+            "configure only one of factor_active_limit and style_active_ranges"
+        )
+    if config["schema_version"] == 2:
+        styles = constraints["style_active_ranges"] or {}
+        if "SIZE" not in styles or not styles["SIZE"].get("enabled", False):
+            raise ConfigError(
+                "constraints.style_active_ranges.SIZE must be enabled in schema_version 2"
+            )
+    if optimizer["objective_mode"] == "score_max_te":
+        if signal["type"] != "rank_score":
+            raise ConfigError(
+                "optimizer.objective_mode score_max_te requires signal.type rank_score"
+            )
+        if constraints["max_tracking_error"] is None:
+            raise ConfigError(
+                "optimizer.objective_mode score_max_te requires constraints.max_tracking_error"
+            )
+
+    top_n = config["baseline"]["top_n"]
+    if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n <= 0:
+        raise ConfigError("baseline.top_n must be a positive integer")
+    return config
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    config_path = Path(path).expanduser().resolve()
+    try:
+        supplied = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ConfigError(f"cannot read config {config_path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"invalid YAML in {config_path}: {exc}") from exc
+    if supplied is None:
+        supplied = {}
+    if not isinstance(supplied, dict):
+        raise ConfigError("configuration root must be a mapping")
+    return validate_config(_merge_strict(DEFAULT_CONFIG, supplied))
