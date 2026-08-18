@@ -20,6 +20,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", required=True, help="YAML configuration file")
     parser.add_argument("--signal-file", required=True, help="Long-form signal CSV/Parquet")
+    parser.add_argument(
+        "--candidate-file",
+        help="Optional date-ticker candidate universe; defaults to all signal rows",
+    )
     parser.add_argument("--covariance-file", required=True, help="Square covariance CSV/Parquet")
     parser.add_argument("--benchmark-file", required=True, help="Long-form benchmark weights")
     parser.add_argument("--current-weights-file", help="Optional current weights")
@@ -41,6 +45,7 @@ def main() -> int:
             config_path=args.config,
             signal_file=args.signal_file,
             covariance_file=args.covariance_file,
+            candidate_file=args.candidate_file,
             benchmark_file=args.benchmark_file,
             current_weights_file=args.current_weights_file,
             sector_file=args.sector_file,

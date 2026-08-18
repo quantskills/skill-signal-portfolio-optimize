@@ -116,6 +116,15 @@ def load_signal(path: str | Path, requested_date: str) -> pd.Series:
     return values.astype(float).sort_index()
 
 
+def load_candidate_universe(path: str | Path, requested_date: str) -> pd.Index:
+    frame = select_date_rows(read_table(path), requested_date, "candidate universe")
+    _require_columns(frame, ["ticker"], "candidate universe")
+    indexed = _normalize_index(frame[["ticker"]], "candidate universe")
+    if len(indexed.index) == 0:
+        raise InputDataError("candidate universe is empty")
+    return pd.Index(sorted(indexed.index), name="ticker")
+
+
 def load_weight_series(
     path: str | Path,
     requested_date: str,

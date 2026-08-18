@@ -18,6 +18,7 @@ from .config import load_config
 from .diagnostics import constraint_report, portfolio_metrics
 from .errors import InputDataError
 from .io import (
+    load_candidate_universe,
     load_covariance,
     load_exposures,
     load_labels,
@@ -41,13 +42,16 @@ OUTPUT_FILES = (
 
 
 def build_optimization_universe(
-    signal: pd.Series,
+    candidates: pd.Series | pd.Index,
     benchmark: pd.Series,
     current: pd.Series | None,
     tolerance: float,
 ) -> pd.Index:
     """Return the exact ticker set that the optimizer must cover."""
-    universe_names = set(signal.index)
+    candidate_names = (
+        candidates.index if isinstance(candidates, pd.Series) else candidates
+    )
+    universe_names = set(candidate_names)
     universe_names.update(benchmark[benchmark.abs() > tolerance].index)
     if current is not None:
         universe_names.update(current[current.abs() > tolerance].index)
@@ -122,6 +126,7 @@ def run_single_date(
     *,
     config_path: str | Path,
     signal_file: str | Path,
+    candidate_file: str | Path | None = None,
     covariance_file: str | Path,
     benchmark_file: str | Path,
     requested_date: object,
@@ -139,6 +144,17 @@ def run_single_date(
         signal, config["signal"], date
     )
     tolerance = float(config["constraints"]["weight_sum_tolerance"])
+    candidates = (
+        pd.Index(signal.index, name="ticker")
+        if candidate_file is None
+        else load_candidate_universe(candidate_file, date)
+    )
+    missing_candidates = candidates.difference(signal.index)
+    if len(missing_candidates):
+        raise InputDataError(
+            "candidate universe contains ticker(s) missing from full signal: "
+            f"{list(missing_candidates[:10])}"
+        )
 
     benchmark_input = load_weight_series(
         benchmark_file, date, "benchmark_weight", "benchmark"
@@ -163,15 +179,13 @@ def run_single_date(
         )
 
     universe = build_optimization_universe(
-        signal, benchmark_input, current_input, tolerance
+        candidates, benchmark_input, current_input, tolerance
     )
     benchmark = benchmark_input.reindex(universe, fill_value=0.0)
     current = (
         None if current_input is None else current_input.reindex(universe, fill_value=0.0)
     )
     calibrated = calibrated_signal.reindex(universe)
-    calibrated["signal_score"] = calibrated["signal_score"].fillna(0.0)
-    calibrated["expected_return"] = calibrated["expected_return"].fillna(0.0)
 
     industry_constraint = (
         config["constraints"]["sector_active_limit"] is not None
@@ -210,6 +224,21 @@ def run_single_date(
     if (~tradable).any() and current is None:
         raise InputDataError("current_weights_file is required for non-tradable assets")
 
+    missing_prediction = calibrated["signal_score"].isna()
+    allowed_frozen_missing = pd.Series(False, index=universe, dtype=bool)
+    if current is not None:
+        allowed_frozen_missing = missing_prediction & ~tradable & current.gt(tolerance)
+    policy = config["signal"]["missing_prediction_policy"]
+    if policy == "error_except_frozen":
+        invalid_missing = missing_prediction & ~allowed_frozen_missing
+        if invalid_missing.any():
+            raise InputDataError(
+                "optimization ticker(s) missing full-universe prediction: "
+                f"{list(universe[invalid_missing][:10])}"
+            )
+    calibrated["signal_score"] = calibrated["signal_score"].fillna(0.0)
+    calibrated["expected_return"] = calibrated["expected_return"].fillna(0.0)
+
     covariance, covariance_diagnostics = load_covariance(
         covariance_file,
         universe,
@@ -220,7 +249,8 @@ def run_single_date(
     )
 
     signal_baseline = build_equal_weight_baseline(
-        calibrated_signal["signal_score"], config["baseline"]["top_n"]
+        calibrated_signal.loc[candidates, "signal_score"],
+        config["baseline"]["top_n"],
     )
     baseline = signal_baseline.reindex(universe, fill_value=0.0)
     optimized = optimize_portfolio(
@@ -272,6 +302,26 @@ def run_single_date(
         },
     }
 
+    candidate_mask = universe.isin(candidates)
+    signal_diagnostics.update(
+        {
+            "calibration_asset_count": int(len(signal)),
+            "candidate_asset_count": int(len(candidates)),
+            "optimization_asset_count": int(len(universe)),
+            "optimization_prediction_coverage": float(
+                1.0 - missing_prediction.mean()
+            ),
+            "missing_prediction_policy": policy,
+            "allowed_frozen_missing_prediction_count": int(
+                allowed_frozen_missing.sum()
+            ),
+            "portfolio_candidate_weight": {
+                "equal_weight_signal": float(baseline[candidate_mask].sum()),
+                "risk_optimized": float(optimized.weights[candidate_mask].sum()),
+            },
+        }
+    )
+
     common = pd.DataFrame(
         {
             "date": date,
@@ -280,6 +330,8 @@ def run_single_date(
             "current_weight": (
                 np.nan if current is None else current.to_numpy(dtype=float)
             ),
+            "signal_available": ~missing_prediction.to_numpy(dtype=bool),
+            "is_candidate": candidate_mask,
             "has_signal": universe.isin(signal.index),
             "raw_prediction": calibrated["raw_prediction"].to_numpy(dtype=float),
             "signal_score": calibrated["signal_score"].to_numpy(dtype=float),
@@ -299,6 +351,7 @@ def run_single_date(
     target_weights = pd.concat(target_frames, ignore_index=True)
 
     supplied_paths = {
+        "candidates": candidate_file,
         "config": config_path,
         "signal": signal_file,
         "covariance": covariance_file,
@@ -317,12 +370,16 @@ def run_single_date(
 
     completed = datetime.now(timezone.utc)
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "implementation_version": __version__,
         "status": "success",
         "requested_date": date,
         "asset_count": int(len(universe)),
         "signal_asset_count": int(len(signal)),
+        "candidate_asset_count": int(len(candidates)),
+        "benchmark_or_current_only_asset_count": int(
+            len(universe.difference(candidates))
+        ),
         "benchmark_only_asset_count": int(
             len(universe.difference(signal.index))
         ),

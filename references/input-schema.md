@@ -8,7 +8,7 @@
 - Represent dates as `YYYYMMDD`, ISO date strings, or timestamps that resolve to one trading date.
 - Duplicate rows for the requested date are errors.
 
-## Signal
+## Full signal
 
 Required long-form CSV or Parquet:
 
@@ -16,7 +16,17 @@ Required long-form CSV or Parquet:
 date | ticker | prediction
 ```
 
-`prediction` must be finite. It represents one final alpha signal, not a raw multi-factor matrix.
+`prediction` must be finite. It represents one final alpha signal, not a raw multi-factor matrix. Winsorization and standardization use every row on the requested date before the optimization universe is formed.
+
+## Candidate universe
+
+Optional long-form CSV or Parquet:
+
+```text
+date | ticker
+```
+
+Candidates must be a non-empty subset of the full signal on each requested date. When no candidate file is supplied, every full-signal ticker is a candidate for backward compatibility. The optimization universe is the union of candidates, positive benchmark weights, and positive current holdings; full-signal names outside that union are used only for calibration.
 
 ## Asset covariance
 
@@ -38,7 +48,7 @@ Required long-form CSV or Parquet:
 date | ticker | benchmark_weight
 ```
 
-Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe, even when they have no signal.
+Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe. In schema version 3 they must have a full-signal prediction unless they are positive, non-tradable frozen current holdings; schema versions 1 and 2 retain neutral-fill compatibility.
 
 ## Current weights
 
@@ -119,18 +129,16 @@ rebalance date.
 
 `scripts/prepare_alpha191_lgbm_inputs.py` writes:
 
-- `signal.parquet`: deterministic Top-N `date | ticker | prediction` rows;
+- `signal_full.parquet`: all selected-date `date | ticker | prediction` rows used for calibration;
+- `signal_candidates.parquet`: deterministic tradable Top-N `date | ticker` rows;
+- `signal.parquet`: legacy Top-N candidate signal retained for compatibility;
 - `optimizer_universe.parquet`: Top-N candidates union positive-weight benchmark constituents;
 - `benchmark_weights.parquet`: benchmark rows on selected rebalance dates;
 - `rebalance_dates.parquet`: selected dates and per-date coverage counts;
 - `input_manifest.json`: source hashes, ranking direction, selection interval, and counts.
 
-Use `optimizer_universe.parquet` to build covariance. Use `signal.parquet` for optimization.
-When the adapter has already selected rebalance dates, pass `--rebalance-every 1` downstream.
-Rounded benchmark weights are accepted only when their raw daily sum is within the configured
-normalization tolerance, then divided by that daily sum. The manifest records the raw range,
-maximum deviation, tolerance, and normalization rule.
-The adapter requires a long-form `date | ticker | tradable` eligibility file. It ranks only
-tradable signal rows. Benchmark constituents need a market record but may be non-tradable;
-constituents without records are excluded only below an explicit aggregate-weight tolerance,
-then the retained benchmark is renormalized and the exclusion is disclosed in the manifest.
+Use `optimizer_universe.parquet` to build covariance. Pass `signal_full.parquet` as `--signal-file` and `signal_candidates.parquet` as `--candidate-file`. When the adapter has already selected rebalance dates, pass `--rebalance-every 1` downstream.
+
+Rounded benchmark weights are accepted only when their raw daily sum is within the configured normalization tolerance, then divided by that daily sum. The manifest records the raw range, maximum deviation, tolerance, and normalization rule.
+
+The adapter requires a long-form `date | ticker | tradable` eligibility file. It ranks only tradable signal rows. Benchmark constituents need a market record but may be non-tradable; constituents without records are excluded only below an explicit aggregate-weight tolerance, then the retained benchmark is renormalized and the exclusion is disclosed in the manifest.

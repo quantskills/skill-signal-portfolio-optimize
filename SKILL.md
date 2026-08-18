@@ -9,12 +9,14 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 
 ## Scope
 
-- Accept exactly one final signal column: `date | ticker | prediction`.
+- Accept exactly one full-cross-section final signal column: `date | ticker | prediction`.
+- Accept an optional `date | ticker` candidate universe; when omitted, all signal names are candidates.
 - Accept signals produced by LightGBM, a single factor, or another upstream model.
 - Do not train models, select factors, or combine raw multi-factor columns.
 - Accept a supplied asset covariance or estimate an open market/style/optional-industry structural model.
-- Build the optimization universe from signal, benchmark, and current-holding names.
-- Require SIZE control in schema version 2 and allow target ranges for other style exposures.
+- Build the optimization universe from candidates, positive benchmark names, and positive current holdings; the full signal does not enlarge the risk matrix.
+- Require SIZE control in schema versions 2 and 3 and allow target ranges for other style exposures.
+- In schema version 3, fail when an optimization asset lacks a prediction except for a positive, non-tradable frozen holding.
 - Do not claim that the open model is MSCI Barra or a proprietary Barra product.
 - Build an equal-weight signal baseline and a risk-optimized portfolio on the same date.
 - Run rolling optimization with drifted current holdings and next-trading-day target execution.
@@ -34,6 +36,7 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 python scripts/run_single_date.py \
   --config /path/to/config.yaml \
   --signal-file /path/to/predictions.parquet \
+  --candidate-file /path/to/candidates.parquet \\
   --covariance-file /path/to/covariance.parquet \
   --benchmark-file /path/to/benchmark_weights.parquet \
   --date 20230104 \
@@ -41,7 +44,7 @@ python scripts/run_single_date.py \
 ```
 
 5. Add `--current-weights-file` when turnover or frozen-position constraints apply.
-6. Add `--industry-file`, `--exposure-file`, or `--tradability-file` only when their corresponding constraints are enabled.
+6. Add `--sector-file`, `--exposure-file`, or `--tradability-file` only when their corresponding constraints are enabled.
 7. Inspect `constraint_diagnostics.json` before consuming `target_weights.parquet`.
 
 For a rolling experiment, read [references/backtest-contract.md](references/backtest-contract.md) and run:
@@ -50,6 +53,7 @@ For a rolling experiment, read [references/backtest-contract.md](references/back
 python scripts/run_rolling_experiment.py \
   --config examples/config.yaml \
   --signal-file /path/to/predictions.parquet \
+  --candidate-file /path/to/candidates.parquet \\
   --covariance-root /path/to/risk_model \
   --exposure-root /path/to/risk_model \
   --benchmark-file /path/to/benchmark_weights.parquet \
@@ -65,6 +69,7 @@ universe, enable exact-universe dynamic risk and persistent checkpoints:
 python scripts/run_rolling_experiment.py \
   --config examples/config.yaml \
   --signal-file /path/to/predictions.parquet \
+  --candidate-file /path/to/candidates.parquet \\
   --covariance-root /path/to/static_risk_model \
   --exposure-root /path/to/static_risk_model \
   --benchmark-file /path/to/benchmark_weights.parquet \
@@ -79,7 +84,7 @@ python scripts/run_rolling_experiment.py \
 
 Pass `--risk-industry-file` when the risk-model config enables industry history. The four
 required dynamic arguments must be supplied together. Static covariance and exposure files
-are reused only when both cover the exact optimization universe assembled from signal,
+are reused only when both cover the exact optimization universe assembled from candidates,
 positive benchmark weights, and positive drifted current holdings. Missing coverage is built
 under the dynamic cache without modifying the static cache.
 
@@ -105,9 +110,7 @@ Use `scripts/prepare_data_factor_store_inputs.py` to export portable return, mar
 benchmark, and tradability files from an authorized canonical data-factor store. Write those
 files outside this repository.
 
-Use `scripts/prepare_alpha191_lgbm_inputs.py` for a frozen Alpha191+LGBM experiment.
-It selects deterministic Top-N candidates on anchored rebalance dates and writes a separate
-optimizer universe equal to those candidates union positive-weight benchmark constituents.
+Use `scripts/prepare_alpha191_lgbm_inputs.py` for a frozen Alpha191+LGBM experiment. It writes a full-cross-section calibration signal, deterministic tradable Top-N candidates on anchored rebalance dates, and a separate optimizer universe equal to those candidates union positive-weight benchmark constituents.
 
 For an existing experiment that already contains a one-date candidate table and square
 asset covariance, first run `scripts/prepare_existing_experiment_inputs.py`. This adapter
@@ -122,6 +125,7 @@ Read [references/optimization.md](references/optimization.md) before changing ob
 - Use `rank_score` for LightGBM predictions and most single-factor values that only carry ordering information.
 - Use `expected_return` only when the input is already calibrated to the covariance horizon and units.
 - Set `higher_is_better: false` for negatively oriented factors.
+- Select and freeze the candidate set upstream; winsorize and standardize scores on the full OOS cross-section before optimizing that set.
 - Keep OOS forecasts frozen. Do not tune signal scaling or constraints by repeatedly inspecting OOS returns.
 - Require identical ticker identifiers across all inputs; never guess exchange suffix mappings.
 
@@ -134,6 +138,7 @@ Read [references/optimization.md](references/optimization.md) before changing ob
 - Repair small covariance asymmetry and negative eigenvalues, and disclose the repair in diagnostics.
 - Treat position, industry, market-cap, configurable style, turnover, tracking-error, and tradability limits as testable constraints.
 - Freeze a non-tradable asset at its current weight; fail if that current weight is unavailable. If market drift already pushed that frozen weight beyond a stock bound, preserve the executable freeze, disclose a frozen-bound exception, and keep the bound strict for every tradable asset.
+- Under schema version 3, never assign a neutral score to a tradable optimization asset with a missing prediction; only a positive non-tradable frozen holding is exempt.
 - Never silently replace a failed optimization with equal weights.
 - When CVXPY is unavailable, solve `score_max_te` with auditable HiGHS ellipsoid cuts; independently recheck every hard constraint.
 

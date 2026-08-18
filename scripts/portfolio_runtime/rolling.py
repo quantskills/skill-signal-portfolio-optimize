@@ -19,6 +19,7 @@ from .config import load_config
 from .dynamic_risk import DynamicRiskModelCache
 from .errors import InputDataError
 from .io import (
+    load_candidate_universe,
     load_signal,
     load_tradability,
     load_weight_series,
@@ -138,11 +139,13 @@ def _diagnostic_rows(
     date: str,
     constraint_path: Path,
     risk_path: Path,
+    signal_path: Path,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     constraint_payload = json.loads(constraint_path.read_text(encoding="utf-8"))
     risk_payload = json.loads(risk_path.read_text(encoding="utf-8"))
     optimized = constraint_payload["risk_optimized"]
     constraints = optimized["constraints"]
+    signal_payload = json.loads(signal_path.read_text(encoding="utf-8"))
     solver = optimized["solver"]
     risk = risk_payload["risk_optimized"]
     row = {
@@ -159,6 +162,13 @@ def _diagnostic_rows(
         "tracking_error": constraints["tracking_error"],
         "expected_return": risk["expected_return"],
         "active_volatility": risk["active_volatility"],
+        "calibration_asset_count": signal_payload["calibration_asset_count"],
+        "candidate_asset_count": signal_payload["candidate_asset_count"],
+        "optimization_asset_count": signal_payload["optimization_asset_count"],
+        "prediction_coverage": signal_payload["optimization_prediction_coverage"],
+        "candidate_target_weight": signal_payload["portfolio_candidate_weight"][
+            "risk_optimized"
+        ],
     }
     exposure_rows: list[dict[str, Any]] = []
     for kind, values in (
@@ -230,6 +240,7 @@ def run_rolling_experiment(
     *,
     config_path: str | Path,
     signal_file: str | Path,
+    candidate_file: str | Path | None = None,
     benchmark_file: str | Path,
     asset_returns_file: str | Path,
     output_dir: str | Path,
@@ -281,8 +292,9 @@ def run_rolling_experiment(
         )
     portfolio_config = load_config(config_path)
     tolerance = float(portfolio_config["constraints"]["weight_sum_tolerance"])
+    date_source = signal_file if candidate_file is None else candidate_file
     dates = _select_rebalance_dates(
-        signal_file,
+        date_source,
         start_date=start_date,
         end_date=end_date,
         rebalance_every=rebalance_every,
@@ -326,6 +338,9 @@ def run_rolling_experiment(
         "implementation_version": __version__,
         "config_sha256": sha256_file(config_path),
         "signal_sha256": sha256_file(signal_file),
+        "candidate_sha256": (
+            None if candidate_file is None else sha256_file(candidate_file)
+        ),
         "benchmark_sha256": sha256_file(benchmark_file),
         "tradability_sha256": (
             None if tradability_file is None else sha256_file(tradability_file)
@@ -352,12 +367,16 @@ def run_rolling_experiment(
             risk_fingerprint = ""
             risk_asset_count: int | None = None
             if dynamic_cache is not None:
-                signal = load_signal(signal_file, date)
+                candidates = (
+                    load_signal(signal_file, date).index
+                    if candidate_file is None
+                    else load_candidate_universe(candidate_file, date)
+                )
                 benchmark = load_weight_series(
                     benchmark_file, date, "benchmark_weight", "benchmark"
                 )
                 universe = build_optimization_universe(
-                    signal, benchmark, current, tolerance
+                    candidates, benchmark, current, tolerance
                 )
                 dynamic_cache.validate_positive_current_holdings(
                     date, current, tolerance
@@ -458,6 +477,7 @@ def run_rolling_experiment(
                     run_single_date(
                         config_path=config_path,
                         signal_file=signal_file,
+                        candidate_file=candidate_file,
                         covariance_file=covariance_path,
                         benchmark_file=benchmark_file,
                         current_weights_file=current_path,
@@ -494,6 +514,7 @@ def run_rolling_experiment(
                 date,
                 date_output / "constraint_diagnostics.json",
                 date_output / "risk_summary.json",
+                date_output / "signal_diagnostics.json",
             )
             diagnostic_rows.append(diagnostic)
             exposure_rows.extend(exposures)
@@ -584,6 +605,7 @@ def run_rolling_experiment(
         supplied_paths = {
             "config": config_path,
             "signal": signal_file,
+            "candidates": candidate_file,
             "benchmark": benchmark_file,
             "asset_returns": asset_returns_file,
             "sectors": sector_file,
@@ -600,7 +622,7 @@ def run_rolling_experiment(
             if path is not None
         }
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "implementation_version": __version__,
             "status": "success",
             "started_at": started.isoformat(),

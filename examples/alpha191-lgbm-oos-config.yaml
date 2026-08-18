@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 
 signal:
   type: rank_score
@@ -6,6 +6,7 @@ signal:
   winsorize_mad: 5.0
   zscore: true
   annualized_alpha_scale: 0.05
+  missing_prediction_policy: error_except_frozen
 
 covariance:
   annualized: true

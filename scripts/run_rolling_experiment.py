@@ -15,6 +15,11 @@ def parse_args() -> argparse.Namespace:
         description="Run rolling signal portfolio optimization and next-day backtest."
     )
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument(
+        "--candidate-file",
+        type=Path,
+        help="Optional date-ticker candidate universe; defaults to all signal rows",
+    )
     parser.add_argument("--signal-file", required=True, type=Path)
     parser.add_argument(
         "--covariance-root",
@@ -56,6 +61,7 @@ def main() -> int:
         result = run_rolling_experiment(
             config_path=args.config,
             signal_file=args.signal_file,
+            candidate_file=args.candidate_file,
             covariance_root=args.covariance_root,
             benchmark_file=args.benchmark_file,
             asset_returns_file=args.asset_returns_file,

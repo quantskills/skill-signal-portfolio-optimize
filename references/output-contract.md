@@ -8,10 +8,11 @@ Long-form rows for both portfolios:
 
 ```text
 date | ticker | portfolio | target_weight | benchmark_weight |
-current_weight | has_signal | raw_prediction | signal_score | expected_return | tradable
+current_weight | signal_available | is_candidate | has_signal | raw_prediction |
+signal_score | expected_return | tradable
 ```
 
-`portfolio` is either `equal_weight_signal` or `risk_optimized`.
+`portfolio` is either `equal_weight_signal` or `risk_optimized`. `signal_available` reports prediction coverage on the optimization universe; `is_candidate` distinguishes selectable names from benchmark- or current-only names; `has_signal` is retained as a compatibility alias for full-signal membership.
 
 ## `constraint_diagnostics.json`
 
@@ -25,11 +26,11 @@ Contains expected return, ex-ante absolute volatility, active volatility, and ch
 
 ## `signal_diagnostics.json`
 
-Contains signal type, direction, requested date, observation count, raw/calibrated distribution summaries, winsorization count, and calibration settings.
+Contains signal type, direction, requested date, full calibration, candidate, and optimization asset counts, optimization prediction coverage, candidate target weight, missing-prediction policy, allowed frozen-missing count, raw/calibrated distribution summaries, winsorization count, and calibration settings.
 
 ## `run_manifest.json`
 
-Contains schema and implementation versions, resolved configuration, input paths and SHA-256 fingerprints, output filenames, runtime timestamps, Python/package versions, requested date, and optimization, signal, and benchmark-only asset counts.
+Contains schema and implementation versions, resolved configuration, input paths and SHA-256 fingerprints, output filenames, runtime timestamps, Python/package versions, requested date, and optimization, full-signal, candidate, candidate-external, and benchmark-only asset counts.
 
 No single-date file represents orders or fills.
 
@@ -52,7 +53,6 @@ available, every resolved exposure file. It also records per-date risk source
 counts.
 
 When `--checkpoint-root` is supplied, every successful rebalance is persisted under
-`date=YYYYMMDD/run=<signature>/`. The signature covers implementation version, core input
-hashes, drifted current weights, and resolved risk files. A rerun reconstructs drift in order
+`date=YYYYMMDD/run=<signature>/`. The signature covers implementation version, core input hashes including the optional candidate-universe hash, drifted current weights, and resolved risk files. A rerun reconstructs drift in order
 and reuses only an exact, complete checkpoint. Checkpoints and dynamic risk caches are outside
 the final rolling output directory and survive an interrupted run.

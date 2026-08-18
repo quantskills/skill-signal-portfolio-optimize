@@ -64,15 +64,26 @@ def test_prepare_alpha191_lgbm_inputs_selects_dates_and_unions_benchmark(
     assert result["rebalance_count"] == 2
     assert {path.name for path in output.iterdir()} == set(OUTPUT_FILES)
     signal = pd.read_parquet(output / "signal.parquet")
+    full_signal = pd.read_parquet(output / "signal_full.parquet")
+    candidates = pd.read_parquet(output / "signal_candidates.parquet")
+    assert full_signal.groupby("date").size().to_dict() == {20230102: 4, 20230104: 4}
+    assert candidates.equals(signal.loc[:, ["date", "ticker"]])
     assert signal.groupby("date").size().to_dict() == {20230102: 2, 20230104: 2}
     assert set(signal["ticker"]) == {"000002.SZ", "000003.SZ"}
     universe = pd.read_parquet(output / "optimizer_universe.parquet")
     assert universe.groupby("date").size().to_dict() == {20230102: 4, 20230104: 4}
     dates = pd.read_parquet(output / "rebalance_dates.parquet")
     assert dates["date"].tolist() == [20230102, 20230104]
+    assert dates["calibration_count"].tolist() == [4, 4]
     assert dates["universe_count"].tolist() == [4, 4]
     benchmark = pd.read_parquet(output / "benchmark_weights.parquet")
     assert benchmark.groupby("date")["benchmark_weight"].sum().round(12).eq(1.0).all()
+    manifest = json.loads(
+        (output / "input_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["schema_version"] == 2
+    assert manifest["full_signal_rows"] == 8
+    assert manifest["candidate_rows"] == 4
 
 
 def test_prepare_alpha191_lgbm_inputs_excludes_small_missing_benchmark_weight(

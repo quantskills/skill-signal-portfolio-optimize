@@ -17,6 +17,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "winsorize_mad": 5.0,
         "zscore": True,
         "annualized_alpha_scale": 0.05,
+        "missing_prediction_policy": "neutral",
     },
     "covariance": {
         "annualized": True,
@@ -167,8 +168,8 @@ def _style_ranges(value: Any) -> dict[str, dict[str, Any]] | None:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    if config["schema_version"] not in {1, 2}:
-        raise ConfigError("schema_version must equal 1 or 2")
+    if config["schema_version"] not in {1, 2, 3}:
+        raise ConfigError("schema_version must equal 1, 2, or 3")
 
     signal = config["signal"]
     if signal["type"] not in {"rank_score", "expected_return"}:
@@ -187,6 +188,21 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "signal.annualized_alpha_scale",
         minimum=0.0,
     )
+    if signal["missing_prediction_policy"] not in {
+        "neutral",
+        "error_except_frozen",
+    }:
+        raise ConfigError(
+            "signal.missing_prediction_policy must be neutral or error_except_frozen"
+        )
+    if (
+        config["schema_version"] == 3
+        and signal["missing_prediction_policy"] != "error_except_frozen"
+    ):
+        raise ConfigError(
+            "schema_version 3 requires signal.missing_prediction_policy "
+            "error_except_frozen"
+        )
 
     covariance = config["covariance"]
     if not isinstance(covariance["annualized"], bool):
@@ -266,11 +282,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError(
             "configure only one of factor_active_limit and style_active_ranges"
         )
-    if config["schema_version"] == 2:
+    if config["schema_version"] in {2, 3}:
         styles = constraints["style_active_ranges"] or {}
         if "SIZE" not in styles or not styles["SIZE"].get("enabled", False):
             raise ConfigError(
-                "constraints.style_active_ranges.SIZE must be enabled in schema_version 2"
+                "constraints.style_active_ranges.SIZE must be enabled in schema_version 2 or 3"
             )
     if optimizer["objective_mode"] == "score_max_te":
         if signal["type"] != "rank_score":

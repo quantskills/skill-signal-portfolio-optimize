@@ -193,6 +193,7 @@ def _write_static_rolling_fixture(root: Path) -> dict[str, Path]:
     rebalance_dates = [20230102, 20230104]
     tickers = [f"{value:06d}.SZ" for value in range(1, 5)]
     signal = root / "signal.parquet"
+    candidates = root / "candidates.parquet"
     benchmark = root / "benchmark.parquet"
     returns = root / "returns.parquet"
     risk = root / "risk"
@@ -204,6 +205,13 @@ def _write_static_rolling_fixture(root: Path) -> dict[str, Path]:
             for position, ticker in enumerate(tickers)
         ]
     ).to_parquet(signal, index=False)
+    pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker}
+            for date in rebalance_dates
+            for ticker in tickers
+        ]
+    ).to_parquet(candidates, index=False)
     pd.DataFrame(
         [
             {"date": date, "ticker": ticker, "benchmark_weight": 0.25}
@@ -250,6 +258,7 @@ def _write_static_rolling_fixture(root: Path) -> dict[str, Path]:
     )
     return {
         "signal": signal,
+        "candidates": candidates,
         "benchmark": benchmark,
         "returns": returns,
         "risk": risk,
@@ -262,6 +271,7 @@ def test_rolling_checkpoint_resume_reuses_completed_dates(tmp_path: Path) -> Non
     common = {
         "config_path": paths["config"],
         "signal_file": paths["signal"],
+        "candidate_file": paths["candidates"],
         "covariance_root": paths["risk"],
         "exposure_root": paths["risk"],
         "benchmark_file": paths["benchmark"],
@@ -279,3 +289,12 @@ def test_rolling_checkpoint_resume_reuses_completed_dates(tmp_path: Path) -> Non
     )
     assert manifest["checkpoints"]["reused_count"] == 2
     assert manifest["checkpoints"]["built_count"] == 0
+
+    candidate_rows = pd.read_parquet(paths["candidates"])
+    candidate_rows.iloc[::-1].to_parquet(paths["candidates"], index=False)
+    run_rolling_experiment(output_dir=tmp_path / "third", **common)
+    changed_manifest = json.loads(
+        (tmp_path / "third" / "rolling_manifest.json").read_text(encoding="utf-8")
+    )
+    assert changed_manifest["checkpoints"]["reused_count"] == 0
+    assert changed_manifest["checkpoints"]["built_count"] == 2

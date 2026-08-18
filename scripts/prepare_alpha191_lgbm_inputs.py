@@ -25,6 +25,8 @@ from portfolio_runtime.io import normalize_date, normalize_ticker, read_table, s
 
 OUTPUT_FILES = (
     "signal.parquet",
+    "signal_full.parquet",
+    "signal_candidates.parquet",
     "optimizer_universe.parquet",
     "benchmark_weights.parquet",
     "rebalance_dates.parquet",
@@ -77,7 +79,7 @@ def _load_selected_signal(
     rebalance_every: int,
     candidate_count: int,
     higher_is_better: bool,
-) -> tuple[pd.DataFrame, list[str], pd.DataFrame, dict[str, int]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], pd.DataFrame, dict[str, int]]:
     if rebalance_every <= 0:
         raise InputDataError("rebalance_every must be positive")
     if candidate_count <= 0:
@@ -187,6 +189,16 @@ def _load_selected_signal(
         }
         if failures:
             raise InputDataError(f"selected signal rows fail quality checks: {failures}")
+        full_signal = connection.execute(
+            f"""
+            SELECT CAST(source.date AS BIGINT) AS date,
+                   CAST(source.{ticker} AS VARCHAR) AS ticker,
+                   CAST(source.{score} AS DOUBLE) AS prediction
+            FROM {scan} AS source
+            INNER JOIN selected_dates USING (date)
+            ORDER BY date, ticker
+            """
+        ).fetchdf()
         direction = "DESC" if higher_is_better else "ASC"
         signal = connection.execute(
             f"""
@@ -221,10 +233,13 @@ def _load_selected_signal(
         raise InputDataError(f"cannot prepare signal source {signal_path}: {exc}") from exc
     finally:
         connection.close()
-    signal["ticker"] = signal["ticker"].map(normalize_ticker)
-    signal["date"] = signal["date"].map(lambda value: int(normalize_date(value)))
-    if signal.duplicated(["date", "ticker"]).any():
-        raise InputDataError("ticker normalization creates duplicate signal keys")
+    for label, frame in (("full signal", full_signal), ("candidate signal", signal)):
+        frame["ticker"] = frame["ticker"].map(normalize_ticker)
+        frame["date"] = frame["date"].map(lambda value: int(normalize_date(value)))
+        if frame.duplicated(["date", "ticker"]).any():
+            raise InputDataError(
+                f"ticker normalization creates duplicate {label} keys"
+            )
     counts = signal.groupby("date").size().reindex(
         [int(value) for value in selected_dates], fill_value=0
     )
@@ -240,7 +255,7 @@ def _load_selected_signal(
     )
     if eligibility.duplicated(["date", "ticker"]).any():
         raise InputDataError("ticker normalization creates duplicate eligibility keys")
-    return signal, selected_dates, eligibility, quality_record
+    return full_signal, signal, selected_dates, eligibility, quality_record
 
 
 def _load_benchmark(
@@ -368,16 +383,18 @@ def prepare_inputs(
         raise InputDataError(f"input file does not exist: {benchmark_path}")
     if not eligibility_path.is_file():
         raise InputDataError(f"input file does not exist: {eligibility_path}")
-    signal, selected_dates, eligibility, source_quality = _load_selected_signal(
-        signal_path=signal_path,
-        eligibility_path=eligibility_path,
-        ticker_column=ticker_column,
-        signal_column=signal_column,
-        start_date=start,
-        end_date=end,
-        rebalance_every=rebalance_every,
-        candidate_count=candidate_count,
-        higher_is_better=higher_is_better,
+    full_signal, signal, selected_dates, eligibility, source_quality = (
+        _load_selected_signal(
+            signal_path=signal_path,
+            eligibility_path=eligibility_path,
+            ticker_column=ticker_column,
+            signal_column=signal_column,
+            start_date=start,
+            end_date=end,
+            rebalance_every=rebalance_every,
+            candidate_count=candidate_count,
+            higher_is_better=higher_is_better,
+        )
     )
     benchmark, benchmark_quality = _load_benchmark(
         benchmark_path,
@@ -397,6 +414,7 @@ def prepare_inputs(
     universe = universe.sort_values(["date", "ticker"], kind="stable").reset_index(
         drop=True
     )
+    full_signal_counts = full_signal.groupby("date").size()
     signal_counts = signal.groupby("date").size()
     benchmark_counts = benchmark.groupby("date").size()
     universe_counts = universe.groupby("date").size()
@@ -404,6 +422,9 @@ def prepare_inputs(
         {
             "date": [int(value) for value in selected_dates],
             "ordinal": np.arange(1, len(selected_dates) + 1, dtype=int),
+            "calibration_count": [
+                full_signal_counts[int(value)] for value in selected_dates
+            ],
             "signal_count": [signal_counts[int(value)] for value in selected_dates],
             "benchmark_count": [benchmark_counts[int(value)] for value in selected_dates],
             "universe_count": [universe_counts[int(value)] for value in selected_dates],
@@ -411,7 +432,7 @@ def prepare_inputs(
     )
     destination, temporary = _prepare_output_directory(output_dir)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "success",
         "started_at": started.isoformat(),
         "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -424,7 +445,13 @@ def prepare_inputs(
         "candidate_count_per_date": candidate_count,
         "higher_is_better": higher_is_better,
         "ranking_tie_break": "prediction then ticker ascending",
+        "signal_semantics": (
+            "signal_full is the calibration cross-section; signal_candidates is the "
+            "tradable Top-N set; signal.parquet is a legacy candidate-signal alias"
+        ),
         "universe_definition": "top_signal_candidates_union_positive_benchmark_constituents",
+        "full_signal_rows": int(len(full_signal)),
+        "candidate_rows": int(len(signal)),
         "signal_rows": int(len(signal)),
         "benchmark_rows": int(len(benchmark)),
         "optimizer_universe_rows": int(len(universe)),
@@ -457,6 +484,10 @@ def prepare_inputs(
     }
     try:
         signal.to_parquet(temporary / "signal.parquet", index=False)
+        full_signal.to_parquet(temporary / "signal_full.parquet", index=False)
+        signal.loc[:, ["date", "ticker"]].to_parquet(
+            temporary / "signal_candidates.parquet", index=False
+        )
         universe.to_parquet(temporary / "optimizer_universe.parquet", index=False)
         benchmark.to_parquet(temporary / "benchmark_weights.parquet", index=False)
         dates.to_parquet(temporary / "rebalance_dates.parquet", index=False)
@@ -474,6 +505,8 @@ def prepare_inputs(
     return {
         "status": "success",
         "rebalance_count": len(selected_dates),
+        "full_signal_rows": int(len(full_signal)),
+        "candidate_rows": int(len(signal)),
         "signal_rows": int(len(signal)),
         "optimizer_universe_rows": int(len(universe)),
         "universe_count_min": int(dates["universe_count"].min()),

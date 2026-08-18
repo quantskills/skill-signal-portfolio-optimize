@@ -135,10 +135,15 @@ class SingleDatePipelineTest(unittest.TestCase):
             config[section][key] = value
         self.config.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
-    def run_pipeline(self, output_name: str = "output") -> dict[str, object]:
+    def run_pipeline(
+        self,
+        output_name: str = "output",
+        candidate_file: Path | None = None,
+    ) -> dict[str, object]:
         return run_single_date(
             config_path=self.config,
             signal_file=self.signal,
+            candidate_file=candidate_file,
             covariance_file=self.covariance,
             benchmark_file=self.benchmark,
             current_weights_file=self.current,
@@ -168,6 +173,24 @@ class SingleDatePipelineTest(unittest.TestCase):
             yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
         )
 
+    def write_v3_config(self) -> None:
+        self.write_v2_config(
+            styles={"SIZE": {"target_active": 0.0, "tolerance": 0.30}}
+        )
+        config = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        config["schema_version"] = 3
+        config["signal"]["missing_prediction_policy"] = "error_except_frozen"
+        self.config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+
+    def write_candidates(
+        self, tickers: list[str], name: str = "candidates.csv"
+    ) -> Path:
+        path = self.root / name
+        pd.DataFrame({"date": self.date, "ticker": tickers}).to_csv(path, index=False)
+        return path
+
     def test_end_to_end_writes_stable_outputs_and_satisfies_constraints(self) -> None:
         result = self.run_pipeline()
         output = Path(result["output_dir"])
@@ -195,7 +218,7 @@ class SingleDatePipelineTest(unittest.TestCase):
 
         manifest = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "success")
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 3)
         self.assertEqual(manifest["implementation_version"], __version__)
         self.assertEqual(manifest["asset_count"], 6)
         self.assertEqual(set(manifest["outputs"]), set(OUTPUT_FILES))
@@ -257,6 +280,18 @@ class SingleDatePipelineTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ConfigError, "SIZE must be enabled"):
             self.run_pipeline()
+
+    def test_v3_requires_strict_missing_prediction_policy(self) -> None:
+        self.write_v2_config(
+            styles={"SIZE": {"target_active": 0.0, "tolerance": 0.30}}
+        )
+        config = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        config["schema_version"] = 3
+        self.config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ConfigError, "error_except_frozen"):
+            self.run_pipeline("invalid-v3-output")
 
     def test_benchmark_only_asset_joins_optimization_universe(self) -> None:
         extra_ticker = "000007.SZ"
@@ -343,6 +378,82 @@ class SingleDatePipelineTest(unittest.TestCase):
             (Path(result["output_dir"]) / "run_manifest.json").read_text(encoding="utf-8")
         )
         self.assertGreaterEqual(manifest["benchmark_only_asset_count"], 1)
+
+    def test_full_signal_calibration_is_separate_from_candidate_universe(self) -> None:
+        candidates = self.write_candidates(self.tickers[:2])
+
+        result = self.run_pipeline("candidate-output", candidates)
+
+        output = Path(result["output_dir"])
+        weights = pd.read_parquet(output / "target_weights.parquet")
+        optimized = weights.loc[
+            weights["portfolio"].eq("risk_optimized")
+        ].set_index("ticker")
+        baseline = weights.loc[
+            weights["portfolio"].eq("equal_weight_signal")
+        ].set_index("ticker")
+        diagnostics = json.loads(
+            (output / "signal_diagnostics.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(
+            (output / "run_manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(diagnostics["calibration_asset_count"], 6)
+        self.assertEqual(diagnostics["candidate_asset_count"], 2)
+        self.assertEqual(diagnostics["optimization_asset_count"], 6)
+        self.assertEqual(
+            float(diagnostics["optimization_prediction_coverage"]), 1.0
+        )
+        self.assertFalse(bool(optimized.loc[self.tickers[-1], "is_candidate"]))
+        self.assertTrue(bool(optimized.loc[self.tickers[-1], "signal_available"]))
+        self.assertLess(float(optimized.loc[self.tickers[-1], "signal_score"]), 0.0)
+        self.assertEqual(
+            set(baseline.index[baseline["target_weight"].gt(0.0)]),
+            set(self.tickers[:2]),
+        )
+        self.assertEqual(
+            diagnostics["portfolio_candidate_weight"]["equal_weight_signal"], 1.0
+        )
+        self.assertEqual(manifest["candidate_asset_count"], 2)
+        self.assertEqual(manifest["benchmark_or_current_only_asset_count"], 4)
+
+    def test_candidate_missing_from_full_signal_is_rejected(self) -> None:
+        candidates = self.write_candidates([*self.tickers[:2], "000099.SZ"])
+        with self.assertRaisesRegex(InputDataError, "candidate universe contains"):
+            self.run_pipeline("missing-candidate-output", candidates)
+
+    def test_v3_rejects_missing_prediction_for_tradable_asset(self) -> None:
+        self.write_v3_config()
+        signal = pd.read_csv(self.signal)
+        signal = signal.loc[signal["ticker"].ne(self.tickers[-1])]
+        signal.to_csv(self.signal, index=False)
+        candidates = self.write_candidates(self.tickers[:2])
+
+        with self.assertRaisesRegex(InputDataError, "missing full-universe prediction"):
+            self.run_pipeline("strict-missing-output", candidates)
+
+    def test_v3_allows_missing_prediction_only_for_frozen_positive_holding(self) -> None:
+        self.write_v3_config()
+        signal = pd.read_csv(self.signal)
+        signal = signal.loc[signal["ticker"].ne(self.tickers[0])]
+        signal.to_csv(self.signal, index=False)
+        candidates = self.write_candidates(self.tickers[1:])
+
+        result = self.run_pipeline("strict-frozen-output", candidates)
+
+        output = Path(result["output_dir"])
+        weights = pd.read_parquet(output / "target_weights.parquet")
+        frozen = weights.loc[
+            weights["portfolio"].eq("risk_optimized")
+            & weights["ticker"].eq(self.tickers[0])
+        ].iloc[0]
+        diagnostics = json.loads(
+            (output / "signal_diagnostics.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(bool(frozen["signal_available"]))
+        self.assertAlmostEqual(float(frozen["target_weight"]), 1.0 / 6.0)
+        self.assertEqual(float(frozen["signal_score"]), 0.0)
+        self.assertEqual(diagnostics["allowed_frozen_missing_prediction_count"], 1)
 
     def test_signal_rejects_additional_factor_columns(self) -> None:
         frame = pd.read_csv(self.signal)
