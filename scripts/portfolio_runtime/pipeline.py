@@ -253,6 +253,9 @@ def run_single_date(
         config["baseline"]["top_n"],
     )
     baseline = signal_baseline.reindex(universe, fill_value=0.0)
+    candidate_mask = pd.Series(
+        universe.isin(candidates), index=universe, name="is_candidate", dtype=bool
+    )
     optimized = optimize_portfolio(
         calibrated["expected_return"],
         covariance,
@@ -264,6 +267,7 @@ def run_single_date(
         config["optimizer"],
         config["constraints"],
         signal_score=calibrated["signal_score"],
+        candidate_mask=candidate_mask,
     )
 
     baseline_constraints = constraint_report(
@@ -275,6 +279,7 @@ def run_single_date(
         exposures,
         tradable,
         config["constraints"],
+        candidate_mask=candidate_mask,
     )
     risk_baseline = portfolio_metrics(
         baseline, calibrated["expected_return"], covariance, benchmark
@@ -302,7 +307,6 @@ def run_single_date(
         },
     }
 
-    candidate_mask = universe.isin(candidates)
     signal_diagnostics.update(
         {
             "calibration_asset_count": int(len(signal)),
@@ -331,7 +335,7 @@ def run_single_date(
                 np.nan if current is None else current.to_numpy(dtype=float)
             ),
             "signal_available": ~missing_prediction.to_numpy(dtype=bool),
-            "is_candidate": candidate_mask,
+            "is_candidate": candidate_mask.to_numpy(dtype=bool),
             "has_signal": universe.isin(signal.index),
             "raw_prediction": calibrated["raw_prediction"].to_numpy(dtype=float),
             "signal_score": calibrated["signal_score"].to_numpy(dtype=float),
@@ -370,7 +374,7 @@ def run_single_date(
 
     completed = datetime.now(timezone.utc)
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "implementation_version": __version__,
         "status": "success",
         "requested_date": date,

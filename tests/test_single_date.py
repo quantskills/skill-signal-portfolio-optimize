@@ -184,6 +184,19 @@ class SingleDatePipelineTest(unittest.TestCase):
             yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
         )
 
+    def write_v4_config(
+        self, candidate_weight_range: dict[str, float | None]
+    ) -> None:
+        self.write_v3_config()
+        config = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        config["schema_version"] = 4
+        config["signal"]["rank_transform"] = "normal_score"
+        config["signal"]["rank_power"] = 1.0
+        config["constraints"]["candidate_weight_range"] = candidate_weight_range
+        self.config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+
     def write_candidates(
         self, tickers: list[str], name: str = "candidates.csv"
     ) -> Path:
@@ -218,7 +231,7 @@ class SingleDatePipelineTest(unittest.TestCase):
 
         manifest = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "success")
-        self.assertEqual(manifest["schema_version"], 3)
+        self.assertEqual(manifest["schema_version"], 4)
         self.assertEqual(manifest["implementation_version"], __version__)
         self.assertEqual(manifest["asset_count"], 6)
         self.assertEqual(set(manifest["outputs"]), set(OUTPUT_FILES))
@@ -421,6 +434,34 @@ class SingleDatePipelineTest(unittest.TestCase):
         candidates = self.write_candidates([*self.tickers[:2], "000099.SZ"])
         with self.assertRaisesRegex(InputDataError, "candidate universe contains"):
             self.run_pipeline("missing-candidate-output", candidates)
+
+    def test_v4_enforces_candidate_aggregate_weight_and_reports_slack(self) -> None:
+        self.write_v4_config({"min_weight": 0.55, "max_weight": None})
+        tradability = pd.read_csv(self.tradability)
+        tradability["tradable"] = True
+        tradability.to_csv(self.tradability, index=False)
+        candidates = self.write_candidates(self.tickers[:2])
+
+        result = self.run_pipeline("candidate-floor-output", candidates)
+
+        constraints = json.loads(
+            (
+                Path(result["output_dir"]) / "constraint_diagnostics.json"
+            ).read_text(encoding="utf-8")
+        )["risk_optimized"]["constraints"]
+        assert constraints["candidate_weight"] >= 0.55 - 1.0e-6
+        assert constraints["candidate_weight_range"]["passed"]
+        assert constraints["constraint_slacks"]["candidate_weight_lower"] >= -1.0e-6
+
+    def test_v4_fails_when_candidate_weight_floor_is_infeasible(self) -> None:
+        self.write_v4_config({"min_weight": 0.70, "max_weight": None})
+        tradability = pd.read_csv(self.tradability)
+        tradability["tradable"] = True
+        tradability.to_csv(self.tradability, index=False)
+        candidates = self.write_candidates(self.tickers[:2])
+
+        with self.assertRaisesRegex(OptimizationError, "infeasible"):
+            self.run_pipeline("candidate-infeasible-output", candidates)
 
     def test_v3_rejects_missing_prediction_for_tradable_asset(self) -> None:
         self.write_v3_config()

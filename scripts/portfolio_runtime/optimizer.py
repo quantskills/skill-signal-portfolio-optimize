@@ -35,6 +35,7 @@ def _build_linear_system(
     current: pd.Series | None,
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
+    candidate_mask: pd.Series | None,
     tradable: pd.Series,
     config: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Bounds, bool]:
@@ -105,6 +106,22 @@ def _build_linear_system(
             add_active_range(
                 coefficients, center, specification["lower_active"], specification["upper_active"]
             )
+
+    candidate_range = config.get("candidate_weight_range")
+    if candidate_range is not None:
+        if candidate_mask is None:
+            raise OptimizationError(
+                "candidate_mask is required when candidate_weight_range is configured"
+            )
+        coefficients = candidate_mask.to_numpy(dtype=float)
+        if not coefficients.any():
+            raise OptimizationError("candidate_mask contains no candidate assets")
+        positive = np.zeros(dimension)
+        positive[:n_assets] = coefficients
+        inequality_rows.append(positive)
+        inequality_values.append(float(candidate_range["max_weight"]))
+        inequality_rows.append(-positive)
+        inequality_values.append(-float(candidate_range["min_weight"]))
 
     if with_turnover:
         if current is None:
@@ -197,6 +214,7 @@ def _optimize_scipy(
     current: pd.Series | None,
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
+    candidate_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
@@ -210,7 +228,7 @@ def _optimize_scipy(
     current_values = None if current is None else current.to_numpy(dtype=float)
 
     full_a_eq, full_b_eq, full_a_ub, full_b_ub, full_bounds, with_turnover = _build_linear_system(
-        benchmark, current, sectors, exposures, tradable, constraint_config
+        benchmark, current, sectors, exposures, candidate_mask, tradable, constraint_config
     )
     initial = _preferred_benchmark_start(
         benchmark,
@@ -231,7 +249,13 @@ def _optimize_scipy(
     if with_turnover:
         reduced_config = {**constraint_config, "max_turnover": None}
         a_eq, b_eq, a_ub, b_ub, bounds, _ = _build_linear_system(
-            benchmark, current, sectors, exposures, tradable, reduced_config
+            benchmark,
+            current,
+            sectors,
+            exposures,
+            candidate_mask,
+            tradable,
+            reduced_config,
         )
         initial = np.asarray(initial[:n_assets], dtype=float)
     else:
@@ -394,6 +418,7 @@ def _optimize_scipy(
         exposures,
         tradable,
         constraint_config,
+        candidate_mask=candidate_mask,
     )
     if not report["passed"]:
         details = ", ".join(item["constraint"] for item in report["violations"])
@@ -424,6 +449,7 @@ def _optimize_score_highs(
     current: pd.Series | None,
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
+    candidate_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
@@ -433,7 +459,7 @@ def _optimize_score_highs(
     sigma = covariance.to_numpy(dtype=float)
     benchmark_values = benchmark.to_numpy(dtype=float)
     a_eq, b_eq, base_a_ub, base_b_ub, bounds, with_turnover = _build_linear_system(
-        benchmark, current, sectors, exposures, tradable, constraint_config
+        benchmark, current, sectors, exposures, candidate_mask, tradable, constraint_config
     )
     objective = np.zeros(len(bounds.lb), dtype=float)
     objective[:n_assets] = -objective_signal.to_numpy(dtype=float)
@@ -607,6 +633,7 @@ def _optimize_score_highs(
         exposures,
         tradable,
         constraint_config,
+        candidate_mask=candidate_mask,
     )
     if not report["passed"]:
         details = ", ".join(item["constraint"] for item in report["violations"])
@@ -658,6 +685,7 @@ def _optimize_cvxpy(
     current: pd.Series | None,
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
+    candidate_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
@@ -667,7 +695,7 @@ def _optimize_cvxpy(
     sigma = covariance.to_numpy(dtype=float)
     benchmark_values = benchmark.to_numpy(dtype=float)
     a_eq, b_eq, a_ub, b_ub, bounds, with_turnover = _build_linear_system(
-        benchmark, current, sectors, exposures, tradable, constraint_config
+        benchmark, current, sectors, exposures, candidate_mask, tradable, constraint_config
     )
     dimension = len(bounds.lb)
     decision = cp.Variable(dimension)
@@ -746,6 +774,7 @@ def _optimize_cvxpy(
         exposures,
         tradable,
         constraint_config,
+        candidate_mask=candidate_mask,
     )
     if not report["passed"]:
         details = ", ".join(item["constraint"] for item in report["violations"])
@@ -779,7 +808,17 @@ def optimize_portfolio(
     constraint_config: dict[str, Any],
     *,
     signal_score: pd.Series | None = None,
+    candidate_mask: pd.Series | None = None,
 ) -> OptimizationResult:
+    if candidate_mask is not None:
+        candidate_mask = candidate_mask.reindex(expected_return.index)
+        if candidate_mask.isna().any():
+            raise OptimizationError("candidate_mask is missing optimization assets")
+        candidate_mask = candidate_mask.astype(bool)
+    elif constraint_config.get("candidate_weight_range") is not None:
+        raise OptimizationError(
+            "candidate_mask is required when candidate_weight_range is configured"
+        )
     objective_mode = optimizer_config["objective_mode"]
     if objective_mode == "score_max_te":
         if signal_score is None:
@@ -801,6 +840,7 @@ def optimize_portfolio(
                 current,
                 sectors,
                 exposures,
+                candidate_mask,
                 tradable,
                 optimizer_config,
                 constraint_config,
@@ -817,6 +857,7 @@ def optimize_portfolio(
             current,
             sectors,
             exposures,
+            candidate_mask,
             tradable,
             optimizer_config,
             constraint_config,
@@ -829,6 +870,7 @@ def optimize_portfolio(
         current,
         sectors,
         exposures,
+        candidate_mask,
         tradable,
         optimizer_config,
         constraint_config,

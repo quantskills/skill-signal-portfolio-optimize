@@ -1,0 +1,32 @@
+schema_version: 1
+
+variants:
+  - name: uniform_no_floor
+    overrides:
+      signal.rank_transform: uniform
+      signal.rank_power: 1.0
+      constraints.candidate_weight_range: null
+  - name: normal_score_no_floor
+    overrides:
+      signal.rank_transform: normal_score
+      signal.rank_power: 1.0
+      constraints.candidate_weight_range: null
+  - name: normal_score_floor_20
+    overrides:
+      signal.rank_transform: normal_score
+      constraints.candidate_weight_range:
+        min_weight: 0.20
+        max_weight: null
+  - name: normal_score_floor_25
+    overrides:
+      signal.rank_transform: normal_score
+      constraints.candidate_weight_range:
+        min_weight: 0.25
+        max_weight: null
+  - name: power_1_5_floor_30
+    overrides:
+      signal.rank_transform: power
+      signal.rank_power: 1.5
+      constraints.candidate_weight_range:
+        min_weight: 0.30
+        max_weight: null

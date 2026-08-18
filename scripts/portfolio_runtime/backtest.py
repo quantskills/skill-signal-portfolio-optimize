@@ -170,7 +170,42 @@ def backtest_targets(
     return pd.DataFrame(rows).sort_values(["date", "portfolio"], kind="stable")
 
 
+def add_benchmark_relative_performance(daily: pd.DataFrame) -> pd.DataFrame:
+    result = daily.copy()
+    relative_columns = [
+        "benchmark_net_return",
+        "active_return",
+        "active_nav",
+        "active_drawdown",
+    ]
+    benchmark = result.loc[
+        result["portfolio"].eq("benchmark"), ["date", "net_return", "nav"]
+    ].copy()
+    if benchmark.empty:
+        for column in relative_columns:
+            result[column] = np.nan
+        return result
+    if benchmark["date"].duplicated().any():
+        raise InputDataError("benchmark daily performance contains duplicate dates")
+    benchmark = benchmark.rename(
+        columns={"net_return": "benchmark_net_return", "nav": "benchmark_nav"}
+    )
+    result = result.merge(benchmark, on="date", how="left", validate="many_to_one")
+    if result[["benchmark_net_return", "benchmark_nav"]].isna().any().any():
+        raise InputDataError("benchmark daily performance does not cover all portfolio dates")
+    result["active_return"] = result["net_return"] - result["benchmark_net_return"]
+    result["active_nav"] = result["nav"] / result["benchmark_nav"]
+    result["active_drawdown"] = result.groupby("portfolio", sort=False)[
+        "active_nav"
+    ].transform(lambda values: values / values.cummax() - 1.0)
+    return result.drop(columns="benchmark_nav").sort_values(
+        ["date", "portfolio"], kind="stable"
+    )
+
+
 def summarize_backtest(daily: pd.DataFrame, periods_per_year: int = 252) -> dict[str, Any]:
+    if "active_return" not in daily.columns:
+        daily = add_benchmark_relative_performance(daily)
     result: dict[str, Any] = {"periods_per_year": int(periods_per_year), "portfolios": {}}
     for portfolio, frame in daily.groupby("portfolio", sort=True):
         returns = frame["net_return"].to_numpy(dtype=float)
@@ -187,6 +222,39 @@ def summarize_backtest(daily: pd.DataFrame, periods_per_year: int = 252) -> dict
             if count > 1 and np.std(returns, ddof=1) > 0
             else None
         )
+        relative_available = bool(frame["active_return"].notna().all())
+        relative_metrics: dict[str, float | None]
+        if relative_available:
+            active_returns = frame["active_return"].to_numpy(dtype=float)
+            active_std = float(np.std(active_returns, ddof=1)) if count > 1 else 0.0
+            active_ending_nav = float(frame.iloc[-1]["active_nav"])
+            relative_metrics = {
+                "annualized_excess_return": float(
+                    active_ending_nav ** (periods_per_year / count) - 1.0
+                ),
+                "realized_tracking_error": float(
+                    active_std * np.sqrt(periods_per_year)
+                ),
+                "information_ratio": (
+                    float(
+                        np.mean(active_returns)
+                        / active_std
+                        * np.sqrt(periods_per_year)
+                    )
+                    if active_std > 0
+                    else None
+                ),
+                "active_ending_nav": active_ending_nav,
+                "maximum_active_drawdown": float(frame["active_drawdown"].min()),
+            }
+        else:
+            relative_metrics = {
+                "annualized_excess_return": None,
+                "realized_tracking_error": None,
+                "information_ratio": None,
+                "active_ending_nav": None,
+                "maximum_active_drawdown": None,
+            }
         result["portfolios"][str(portfolio)] = {
             "observations": count,
             "date_start": str(frame["date"].min()),
@@ -198,5 +266,6 @@ def summarize_backtest(daily: pd.DataFrame, periods_per_year: int = 252) -> dict
             "maximum_drawdown": float(frame["drawdown"].min()),
             "total_one_way_turnover": float(frame["turnover"].sum()),
             "total_transaction_cost": float(frame["transaction_cost"].sum()),
+            **relative_metrics,
         }
     return result

@@ -47,6 +47,7 @@ def test_cvxpy_score_backend_returns_independently_validated_solution() -> None:
         "factor_active_limit": None,
         "industry_active_range": None,
         "style_active_ranges": None,
+        "candidate_weight_range": {"min_weight": 0.55, "max_weight": 1.0},
         "weight_sum_tolerance": 1.0e-8,
         "constraint_tolerance": 1.0e-6,
     }
@@ -62,9 +63,11 @@ def test_cvxpy_score_backend_returns_independently_validated_solution() -> None:
         optimizer,
         constraints,
         signal_score=score,
+        candidate_mask=pd.Series([True, True, False, False], index=tickers),
     )
 
     assert result.solver["backend"] == "cvxpy"
     assert result.constraints["passed"]
     assert np.isclose(result.weights.sum(), 1.0)
     assert result.weights.iloc[0] > result.weights.iloc[-1]
+    assert result.weights.iloc[:2].sum() >= 0.55 - 1.0e-6

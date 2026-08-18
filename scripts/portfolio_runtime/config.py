@@ -16,6 +16,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "higher_is_better": True,
         "winsorize_mad": 5.0,
         "zscore": True,
+        "rank_transform": "uniform",
+        "rank_power": 1.0,
         "annualized_alpha_scale": 0.05,
         "missing_prediction_policy": "neutral",
     },
@@ -43,6 +45,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "factor_active_limit": None,
         "industry_active_range": None,
         "style_active_ranges": None,
+        "candidate_weight_range": None,
         "weight_sum_tolerance": 1.0e-8,
         "constraint_tolerance": 1.0e-6,
     },
@@ -106,8 +109,15 @@ def _exposure_range(value: Any, name: str) -> dict[str, float]:
         if lower > upper:
             raise ConfigError(f"{name}.min_active must not exceed max_active")
         return {"lower_active": lower, "upper_active": upper}
+    if keys == {"lower_active", "upper_active"}:
+        lower = _finite_number(value["lower_active"], f"{name}.lower_active")
+        upper = _finite_number(value["upper_active"], f"{name}.upper_active")
+        if lower > upper:
+            raise ConfigError(f"{name}.lower_active must not exceed upper_active")
+        return {"lower_active": lower, "upper_active": upper}
     raise ConfigError(
-        f"{name} must contain exactly target_active+tolerance or min_active+max_active"
+        f"{name} must contain exactly target_active+tolerance, min_active+max_active, "
+        "or lower_active+upper_active"
     )
 
 
@@ -167,9 +177,40 @@ def _style_ranges(value: Any) -> dict[str, dict[str, Any]] | None:
     return result
 
 
+def _candidate_weight_range(value: Any) -> dict[str, float] | None:
+    if value is None:
+        return None
+    name = "constraints.candidate_weight_range"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a mapping")
+    unknown = set(value) - {"min_weight", "max_weight"}
+    if unknown:
+        raise ConfigError(
+            "unknown configuration key(s): "
+            + ", ".join(sorted(f"{name}.{key}" for key in unknown))
+        )
+    if not value or all(value.get(key) is None for key in ("min_weight", "max_weight")):
+        raise ConfigError(f"{name} must define min_weight or max_weight")
+    lower = (
+        0.0
+        if value.get("min_weight") is None
+        else _finite_number(value["min_weight"], f"{name}.min_weight", minimum=0.0)
+    )
+    upper = (
+        1.0
+        if value.get("max_weight") is None
+        else _finite_number(value["max_weight"], f"{name}.max_weight", minimum=0.0)
+    )
+    if lower > 1.0 or upper > 1.0:
+        raise ConfigError(f"{name} bounds must not exceed 1")
+    if lower > upper:
+        raise ConfigError(f"{name}.min_weight must not exceed max_weight")
+    return {"min_weight": lower, "max_weight": upper}
+
+
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    if config["schema_version"] not in {1, 2, 3}:
-        raise ConfigError("schema_version must equal 1, 2, or 3")
+    if config["schema_version"] not in {1, 2, 3, 4}:
+        raise ConfigError("schema_version must equal 1, 2, 3, or 4")
 
     signal = config["signal"]
     if signal["type"] not in {"rank_score", "expected_return"}:
@@ -181,8 +222,23 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     )
     if not isinstance(signal["zscore"], bool):
         raise ConfigError("signal.zscore must be boolean")
+    if signal["rank_transform"] not in {"uniform", "normal_score", "power"}:
+        raise ConfigError(
+            "signal.rank_transform must be uniform, normal_score, or power"
+        )
+    signal["rank_power"] = _finite_number(
+        signal["rank_power"], "signal.rank_power", minimum=0.0
+    )
+    if signal["rank_power"] <= 0:
+        raise ConfigError("signal.rank_power must be positive")
     if signal["type"] == "expected_return" and signal["zscore"]:
         raise ConfigError("signal.zscore must be false for expected_return inputs")
+    if signal["type"] == "expected_return" and (
+        signal["rank_transform"] != "uniform" or signal["rank_power"] != 1.0
+    ):
+        raise ConfigError(
+            "signal rank_transform and rank_power apply only to rank_score inputs"
+        )
     signal["annualized_alpha_scale"] = _finite_number(
         signal["annualized_alpha_scale"],
         "signal.annualized_alpha_scale",
@@ -196,11 +252,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             "signal.missing_prediction_policy must be neutral or error_except_frozen"
         )
     if (
-        config["schema_version"] == 3
+        config["schema_version"] in {3, 4}
         and signal["missing_prediction_policy"] != "error_except_frozen"
     ):
         raise ConfigError(
-            "schema_version 3 requires signal.missing_prediction_policy "
+            "schema_version 3 or 4 requires signal.missing_prediction_policy "
             "error_except_frozen"
         )
 
@@ -268,6 +324,9 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     constraints["style_active_ranges"] = _style_ranges(
         constraints["style_active_ranges"]
     )
+    constraints["candidate_weight_range"] = _candidate_weight_range(
+        constraints["candidate_weight_range"]
+    )
     if (
         constraints["sector_active_limit"] is not None
         and constraints["industry_active_range"] is not None
@@ -282,11 +341,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError(
             "configure only one of factor_active_limit and style_active_ranges"
         )
-    if config["schema_version"] in {2, 3}:
+    if config["schema_version"] in {2, 3, 4}:
         styles = constraints["style_active_ranges"] or {}
         if "SIZE" not in styles or not styles["SIZE"].get("enabled", False):
             raise ConfigError(
-                "constraints.style_active_ranges.SIZE must be enabled in schema_version 2 or 3"
+                "constraints.style_active_ranges.SIZE must be enabled in schema_version 2, 3, or 4"
             )
     if optimizer["objective_mode"] == "score_max_te":
         if signal["type"] != "rank_score":

@@ -39,8 +39,10 @@ def test_highs_outer_inner_solves_binding_tracking_error() -> None:
             "max_weight": 0.6,
             "max_active_weight": 0.4,
             "max_tracking_error": 0.05,
+            "candidate_weight_range": {"min_weight": 0.55, "max_weight": 1.0},
         }
     )
+    candidate_mask = pd.Series([True, True, False, False], index=tickers)
 
     result = optimize_portfolio(
         expected,
@@ -53,6 +55,7 @@ def test_highs_outer_inner_solves_binding_tracking_error() -> None:
         optimizer,
         constraints,
         signal_score=score,
+        candidate_mask=candidate_mask,
     )
 
     assert result.constraints["passed"]
@@ -60,3 +63,4 @@ def test_highs_outer_inner_solves_binding_tracking_error() -> None:
     assert result.solver["backend"] == "scipy_highs_outer_inner"
     assert result.solver["risk_anchor_iterations"] > 0
     assert result.solver["certified_optimality_gap"] <= 1.0e-5
+    assert result.weights[candidate_mask].sum() >= 0.55 - 1.0e-6

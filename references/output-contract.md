@@ -16,7 +16,7 @@ signal_score | expected_return | tradable
 
 ## `constraint_diagnostics.json`
 
-Contains solver status, iterations, objective value, hard-constraint tolerances, turnover, and per-industry/style benchmark exposure, portfolio exposure, active exposure, lower/upper bounds, slack, binding status, and violations for both portfolios. Raw and controllable stock-weight maxima are both recorded. A drifted non-tradable position outside a stock bound is held exactly and listed under `frozen_bound_exceptions`; the exception does not relax bounds for tradable assets.
+Contains solver status, iterations, objective value, hard-constraint tolerances, turnover, candidate aggregate weight, and per-industry/style benchmark exposure, portfolio exposure, active exposure, lower/upper bounds, slack, binding status, and violations for both portfolios. `constraint_slacks` uses positive values for remaining capacity, zero for binding constraints, and negative values for violations. Raw and controllable stock-weight maxima are both recorded. A drifted non-tradable position outside a stock bound is held exactly and listed under `frozen_bound_exceptions`; the exception does not relax bounds for tradable assets.
 
 Only `risk_optimized` must satisfy every configured optimizer constraint. Baseline violations are reported for comparison.
 
@@ -26,7 +26,7 @@ Contains expected return, ex-ante absolute volatility, active volatility, and ch
 
 ## `signal_diagnostics.json`
 
-Contains signal type, direction, requested date, full calibration, candidate, and optimization asset counts, optimization prediction coverage, candidate target weight, missing-prediction policy, allowed frozen-missing count, raw/calibrated distribution summaries, winsorization count, and calibration settings.
+Contains signal type, direction, requested date, full calibration, candidate, and optimization asset counts, optimization prediction coverage, candidate target weight, missing-prediction policy, allowed frozen-missing count, raw/calibrated distribution summaries, winsorization count, rank transform, rank power, and calibration settings.
 
 ## `run_manifest.json`
 
@@ -46,7 +46,11 @@ No single-date file represents orders or fills.
 - `rolling_manifest.json`
 
 The daily table contains gross return, proportional transaction cost, net return, turnover,
-NAV, and drawdown for equal-weight, optimized, and simulated benchmark portfolios.
+NAV, drawdown, benchmark net return, active return, active NAV, and active drawdown for
+equal-weight, optimized, and simulated benchmark portfolios. `portfolio_metrics.json` adds
+geometrically annualized excess return, realized tracking error, information ratio, ending
+active NAV, and maximum active drawdown. `optimization_diagnostics.parquet` includes scalar
+slacks for turnover, tracking error, stock limits, and candidate-weight bounds.
 `rolling_manifest.json` records a SHA-256 entry for every resolved covariance and, when
 available, every resolved exposure file. It also records per-date risk source
 (`static_reused`, `dynamic_built`, or `dynamic_reused`), dynamic-cache counts, and checkpoint
@@ -56,3 +60,11 @@ When `--checkpoint-root` is supplied, every successful rebalance is persisted un
 `date=YYYYMMDD/run=<signature>/`. The signature covers implementation version, core input hashes including the optional candidate-universe hash, drifted current weights, and resolved risk files. A rerun reconstructs drift in order
 and reuses only an exact, complete checkpoint. Checkpoints and dynamic risk caches are outside
 the final rolling output directory and survive an interrupted run.
+
+## Parameter sweep outputs
+
+`scripts/run_parameter_sweep.py` writes resolved variant configs under `configs/`, complete
+rolling artifacts under `runs/<variant>/`, and `sweep_summary.csv` plus
+`sweep_summary.json` at the output root. Each summary row records success or the explicit
+optimization error. With `--continue-on-error`, later variants continue after an infeasible
+variant; no failed variant is converted to fallback weights.

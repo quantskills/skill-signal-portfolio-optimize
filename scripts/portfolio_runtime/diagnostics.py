@@ -119,6 +119,36 @@ def _range_detail(
     }
 
 
+def _candidate_range_detail(
+    candidate_weight: float,
+    specification: dict[str, float] | None,
+    tolerance: float,
+) -> dict[str, float | bool | None]:
+    if specification is None:
+        return {
+            "portfolio_weight": candidate_weight,
+            "min_weight": None,
+            "max_weight": None,
+            "lower_slack": None,
+            "upper_slack": None,
+            "binding": False,
+            "passed": True,
+        }
+    lower = float(specification["min_weight"])
+    upper = float(specification["max_weight"])
+    lower_slack = candidate_weight - lower
+    upper_slack = upper - candidate_weight
+    return {
+        "portfolio_weight": candidate_weight,
+        "min_weight": lower,
+        "max_weight": upper,
+        "lower_slack": lower_slack,
+        "upper_slack": upper_slack,
+        "binding": bool(lower_slack <= tolerance or upper_slack <= tolerance),
+        "passed": bool(lower_slack >= -tolerance and upper_slack >= -tolerance),
+    }
+
+
 def portfolio_metrics(
     weights: pd.Series,
     expected_return: pd.Series,
@@ -150,6 +180,8 @@ def constraint_report(
     exposures: pd.DataFrame | None,
     tradable: pd.Series,
     constraint_config: dict[str, Any],
+    *,
+    candidate_mask: pd.Series | None = None,
 ) -> dict[str, Any]:
     tolerance = float(constraint_config["constraint_tolerance"])
     weight_sum_tolerance = float(constraint_config["weight_sum_tolerance"])
@@ -181,11 +213,26 @@ def constraint_report(
         "maximum_frozen_weight_deviation": None,
         "industry_exposures": {},
         "style_exposures": {},
+        "candidate_weight": None,
+        "candidate_weight_range": None,
+        "constraint_slacks": {},
         "sector_active_exposure": {},
         "factor_active_exposure": {},
         "binding_constraints": [],
         "violations": [],
     }
+
+    if candidate_mask is not None:
+        aligned_candidate = candidate_mask.reindex(weights.index)
+        if aligned_candidate.isna().any():
+            raise ConfigError("candidate mask does not match portfolio weights")
+        candidate_weight = float(weights[aligned_candidate.astype(bool)].sum())
+        report["candidate_weight"] = candidate_weight
+        report["candidate_weight_range"] = _candidate_range_detail(
+            candidate_weight,
+            constraint_config.get("candidate_weight_range"),
+            tolerance,
+        )
 
     if current is not None:
         report["one_way_turnover"] = float(0.5 * (weights - current).abs().sum())
@@ -276,6 +323,20 @@ def constraint_report(
     if report["maximum_frozen_weight_deviation"] is not None:
         violation("tradability_freeze", report["maximum_frozen_weight_deviation"])
 
+    candidate_detail = report["candidate_weight_range"]
+    if (
+        constraint_config.get("candidate_weight_range") is not None
+        and candidate_detail is not None
+    ):
+        violation(
+            "candidate_weight_range:lower",
+            -float(candidate_detail["lower_slack"]),
+        )
+        violation(
+            "candidate_weight_range:upper",
+            -float(candidate_detail["upper_slack"]),
+        )
+
     for name in sector_ranges:
         detail = report["industry_exposures"][name]
         violation(
@@ -293,5 +354,41 @@ def constraint_report(
             f"style_active_range:{name}:upper", -float(detail["upper_slack"])
         )
 
+    report["constraint_slacks"] = {
+        "fully_invested": weight_sum_tolerance - report["weight_sum_error"],
+        "long_only": report["minimum_weight"],
+        "max_weight": (
+            float(constraint_config["max_weight"])
+            - report["maximum_controllable_weight"]
+        ),
+        "max_active_weight": (
+            float(constraint_config["max_active_weight"])
+            - report["maximum_controllable_absolute_active_weight"]
+        ),
+        "max_turnover": (
+            None
+            if constraint_config["max_turnover"] is None
+            or report["one_way_turnover"] is None
+            else float(constraint_config["max_turnover"])
+            - report["one_way_turnover"]
+        ),
+        "max_tracking_error": (
+            None
+            if constraint_config["max_tracking_error"] is None
+            else float(constraint_config["max_tracking_error"])
+            - report["tracking_error"]
+        ),
+        "candidate_weight_lower": (
+            None if candidate_detail is None else candidate_detail["lower_slack"]
+        ),
+        "candidate_weight_upper": (
+            None if candidate_detail is None else candidate_detail["upper_slack"]
+        ),
+        "tradability_freeze": (
+            None
+            if report["maximum_frozen_weight_deviation"] is None
+            else tolerance - report["maximum_frozen_weight_deviation"]
+        ),
+    }
     report["passed"] = not report["violations"]
     return report

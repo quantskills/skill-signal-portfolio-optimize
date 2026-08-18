@@ -1,10 +1,12 @@
-schema_version: 3
+schema_version: 4
 
 signal:
   type: rank_score
   higher_is_better: true
   winsorize_mad: 5.0
   zscore: true
+  rank_transform: normal_score
+  rank_power: 1.0
   annualized_alpha_scale: 0.05
   missing_prediction_policy: error_except_frozen
 
@@ -44,6 +46,9 @@ constraints:
       enabled: false
     NLSIZE:
       enabled: false
+  candidate_weight_range:
+    min_weight: 0.20
+    max_weight: null
   weight_sum_tolerance: 1.0e-8
   constraint_tolerance: 1.0e-6
 

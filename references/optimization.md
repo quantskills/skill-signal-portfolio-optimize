@@ -27,7 +27,7 @@ reported solver failure.
 
 ## Signal calibration
 
-`rank_score` inputs are direction-adjusted, MAD-winsorized, converted to cross-sectional percentile ranks, standardized, and multiplied by `annualized_alpha_scale`. This scale is a research assumption, not a fitted expected return.
+`rank_score` inputs are direction-adjusted and MAD-winsorized before one of three monotonic rank transforms is applied. `uniform` preserves the v0.8 centered-percentile behavior. `normal_score` maps plotting positions `(rank-0.5)/N` through the standard-normal quantile. `power` applies `sign(p-0.5) * abs(p-0.5)^rank_power`. Optional standardization follows the transform. `annualized_alpha_scale` is a research assumption, not a fitted expected return.
 
 `expected_return` inputs are direction-adjusted and optionally winsorized, but are not standardized because that would destroy their return units. Set `signal.zscore: false`; the values must already match the annualized covariance units.
 
@@ -43,10 +43,11 @@ Supported constraints are:
 - exact one-way turnover limit, defined as `0.5 * sum(abs(w-current))`
 - annualized ex-ante tracking-error limit
 - frozen weights for non-tradable assets
+- aggregate candidate-universe portfolio-weight range
 
 A position that becomes non-tradable after market drift cannot be sold back to its configured stock bound. The optimizer therefore fixes it at the exact current weight, reports it in `frozen_bound_exceptions`, and applies maximum-weight and maximum-active-weight checks to the remaining controllable assets. Raw portfolio maxima remain in diagnostics, so the exception is never hidden. Once the asset becomes tradable, the ordinary bounds apply again.
 
-Each exposure accepts either `target_active+tolerance` or `min_active+max_active`. `SIZE` is mandatory in schema version 2. Legacy symmetric scalar or mapping limits remain accepted in schema version 1.
+Each exposure accepts either `target_active+tolerance` or `min_active+max_active`. `SIZE` is mandatory in schema versions 2 through 4. Legacy symmetric scalar or mapping limits remain accepted in schema version 1. Candidate weight bounds are absolute portfolio weights between zero and one; omitted lower or upper bounds resolve to zero or one.
 
 The optimization universe is the union of signal names, positive-weight benchmark constituents, and positive current holdings. Names without a signal receive zero expected return; the equal-weight signal baseline still selects only signaled names.
 

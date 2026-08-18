@@ -14,7 +14,13 @@ import numpy as np
 import pandas as pd
 
 from . import __version__
-from .backtest import backtest_targets, drift_weights, load_asset_returns, summarize_backtest
+from .backtest import (
+    add_benchmark_relative_performance,
+    backtest_targets,
+    drift_weights,
+    load_asset_returns,
+    summarize_backtest,
+)
 from .config import load_config
 from .dynamic_risk import DynamicRiskModelCache
 from .errors import InputDataError
@@ -148,6 +154,7 @@ def _diagnostic_rows(
     signal_payload = json.loads(signal_path.read_text(encoding="utf-8"))
     solver = optimized["solver"]
     risk = risk_payload["risk_optimized"]
+    slacks = constraints.get("constraint_slacks", {})
     row = {
         "date": date,
         "solver_backend": solver.get("backend"),
@@ -160,6 +167,12 @@ def _diagnostic_rows(
         "binding_constraint_count": len(constraints["binding_constraints"]),
         "one_way_turnover": constraints["one_way_turnover"],
         "tracking_error": constraints["tracking_error"],
+        "turnover_slack": slacks.get("max_turnover"),
+        "tracking_error_slack": slacks.get("max_tracking_error"),
+        "max_weight_slack": slacks.get("max_weight"),
+        "max_active_weight_slack": slacks.get("max_active_weight"),
+        "candidate_weight_lower_slack": slacks.get("candidate_weight_lower"),
+        "candidate_weight_upper_slack": slacks.get("candidate_weight_upper"),
         "expected_return": risk["expected_return"],
         "active_volatility": risk["active_volatility"],
         "calibration_asset_count": signal_payload["calibration_asset_count"],
@@ -566,11 +579,13 @@ def run_rolling_experiment(
             "equal_weight_signal": initial,
             "benchmark": initial,
         }
-        daily = backtest_targets(
-            target_contract,
-            asset_returns,
-            transaction_cost_bps=transaction_cost_bps,
-            initial_weights=initial_map,
+        daily = add_benchmark_relative_performance(
+            backtest_targets(
+                target_contract,
+                asset_returns,
+                transaction_cost_bps=transaction_cost_bps,
+                initial_weights=initial_map,
+            )
         )
         metrics = summarize_backtest(daily)
         diagnostics = pd.DataFrame(diagnostic_rows)
@@ -622,7 +637,7 @@ def run_rolling_experiment(
             if path is not None
         }
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "implementation_version": __version__,
             "status": "success",
             "started_at": started.isoformat(),

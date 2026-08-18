@@ -15,7 +15,11 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from portfolio_runtime.backtest import backtest_targets, summarize_backtest  # noqa: E402
+from portfolio_runtime.backtest import (  # noqa: E402
+    add_benchmark_relative_performance,
+    backtest_targets,
+    summarize_backtest,
+)
 from portfolio_runtime.errors import InputDataError  # noqa: E402
 from portfolio_runtime.rolling import ROLLING_OUTPUT_FILES, run_rolling_experiment  # noqa: E402
 
@@ -79,6 +83,30 @@ def test_backtest_allows_one_held_asset_to_be_written_off() -> None:
 
     assert np.isclose(daily.iloc[0]["gross_return"], -0.1)
     assert np.isclose(daily.iloc[0]["net_return"], -0.1)
+
+
+def test_benchmark_relative_performance_and_metrics() -> None:
+    daily = pd.DataFrame(
+        {
+            "date": ["20230103", "20230103", "20230104", "20230104"],
+            "portfolio": ["benchmark", "risk_optimized"] * 2,
+            "net_return": [0.01, 0.02, -0.01, 0.00],
+            "nav": [1.01, 1.02, 0.9999, 1.02],
+            "drawdown": [0.0, 0.0, -0.01, 0.0],
+            "turnover": 0.0,
+            "transaction_cost": 0.0,
+        }
+    )
+
+    enriched = add_benchmark_relative_performance(daily)
+    optimized = enriched.loc[enriched["portfolio"].eq("risk_optimized")]
+    metrics = summarize_backtest(enriched)["portfolios"]["risk_optimized"]
+
+    assert np.allclose(optimized["active_return"], [0.01, 0.01])
+    assert np.isclose(float(optimized.iloc[-1]["active_nav"]), 1.02 / 0.9999)
+    assert metrics["annualized_excess_return"] > 0
+    assert np.isclose(metrics["realized_tracking_error"], 0.0)
+    assert metrics["information_ratio"] is None
 
 
 def test_rolling_experiment_writes_stable_outputs(tmp_path: Path) -> None:
@@ -188,10 +216,19 @@ def test_rolling_experiment_writes_stable_outputs(tmp_path: Path) -> None:
         "equal_weight_signal",
         "risk_optimized",
     }
+    assert {
+        "benchmark_net_return",
+        "active_return",
+        "active_nav",
+        "active_drawdown",
+    }.issubset(daily.columns)
     diagnostics = pd.read_parquet(output / "optimization_diagnostics.parquet")
     assert diagnostics["constraints_passed"].all()
     assert diagnostics["objective_mode"].eq("score_max_te").all()
     assert diagnostics["solver_backend"].eq("scipy_highs_outer_inner").all()
+    assert "tracking_error_slack" in diagnostics.columns
+    metrics = json.loads((output / "portfolio_metrics.json").read_text())
+    assert metrics["portfolios"]["risk_optimized"]["realized_tracking_error"] is not None
     manifest = json.loads((output / "rolling_manifest.json").read_text())
     assert "next available trading date" in manifest["execution_timing"]
     assert [item["date"] for item in manifest["exposure_inputs"]] == [

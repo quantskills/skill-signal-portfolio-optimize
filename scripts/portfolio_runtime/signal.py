@@ -4,6 +4,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.special import ndtri
 
 from .errors import InputDataError
 
@@ -41,8 +42,24 @@ def calibrate_signal(
     winsorized, changed = _mad_winsorize(oriented, config["winsorize_mad"])
 
     if config["type"] == "rank_score":
-        score = winsorized.rank(method="average", pct=True)
-        score = score - float(score.mean())
+        rank = winsorized.rank(method="average")
+        percentile = (rank - 0.5) / float(len(rank))
+        transform = config["rank_transform"]
+        if transform == "uniform":
+            score = winsorized.rank(method="average", pct=True)
+            score = score - float(score.mean())
+        elif transform == "normal_score":
+            score = pd.Series(
+                ndtri(percentile.to_numpy(dtype=float)),
+                index=winsorized.index,
+                dtype=float,
+            )
+            score = score - float(score.mean())
+        else:
+            centered = percentile - 0.5
+            power = float(config["rank_power"])
+            score = np.sign(centered) * centered.abs().pow(power)
+            score = score - float(score.mean())
         standard_deviation = float(score.std(ddof=0))
         if standard_deviation <= 0:
             raise InputDataError("rank signal has no cross-sectional variation")
@@ -77,6 +94,8 @@ def calibrate_signal(
         "winsorize_mad": float(config["winsorize_mad"]),
         "winsorized_observation_count": changed,
         "zscore": bool(config["zscore"]),
+        "rank_transform": config["rank_transform"],
+        "rank_power": float(config["rank_power"]),
         "annualized_alpha_scale": float(config["annualized_alpha_scale"]),
         "raw_prediction": _summary(prediction),
         "signal_score": _summary(frame["signal_score"]),

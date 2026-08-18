@@ -10,13 +10,13 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 ## Scope
 
 - Accept exactly one full-cross-section final signal column: `date | ticker | prediction`.
-- Accept an optional `date | ticker` candidate universe; when omitted, all signal names are candidates.
+- Accept an optional `date | ticker` candidate universe; when omitted, all signal names are candidates. Optionally constrain their aggregate portfolio weight.
 - Accept signals produced by LightGBM, a single factor, or another upstream model.
 - Do not train models, select factors, or combine raw multi-factor columns.
 - Accept a supplied asset covariance or estimate an open market/style/optional-industry structural model.
 - Build the optimization universe from candidates, positive benchmark names, and positive current holdings; the full signal does not enlarge the risk matrix.
-- Require SIZE control in schema versions 2 and 3 and allow target ranges for other style exposures.
-- In schema version 3, fail when an optimization asset lacks a prediction except for a positive, non-tradable frozen holding.
+- Require SIZE control in schema versions 2 through 4 and allow target ranges for other style exposures.
+- In schema versions 3 and 4, fail when an optimization asset lacks a prediction except for a positive, non-tradable frozen holding.
 - Do not claim that the open model is MSCI Barra or a proprietary Barra product.
 - Build an equal-weight signal baseline and a risk-optimized portfolio on the same date.
 - Run rolling optimization with drifted current holdings and next-trading-day target execution.
@@ -36,7 +36,7 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 python scripts/run_single_date.py \
   --config /path/to/config.yaml \
   --signal-file /path/to/predictions.parquet \
-  --candidate-file /path/to/candidates.parquet \\
+  --candidate-file /path/to/candidates.parquet \
   --covariance-file /path/to/covariance.parquet \
   --benchmark-file /path/to/benchmark_weights.parquet \
   --date 20230104 \
@@ -53,7 +53,7 @@ For a rolling experiment, read [references/backtest-contract.md](references/back
 python scripts/run_rolling_experiment.py \
   --config examples/config.yaml \
   --signal-file /path/to/predictions.parquet \
-  --candidate-file /path/to/candidates.parquet \\
+  --candidate-file /path/to/candidates.parquet \
   --covariance-root /path/to/risk_model \
   --exposure-root /path/to/risk_model \
   --benchmark-file /path/to/benchmark_weights.parquet \
@@ -69,7 +69,7 @@ universe, enable exact-universe dynamic risk and persistent checkpoints:
 python scripts/run_rolling_experiment.py \
   --config examples/config.yaml \
   --signal-file /path/to/predictions.parquet \
-  --candidate-file /path/to/candidates.parquet \\
+  --candidate-file /path/to/candidates.parquet \
   --covariance-root /path/to/static_risk_model \
   --exposure-root /path/to/static_risk_model \
   --benchmark-file /path/to/benchmark_weights.parquet \
@@ -106,6 +106,23 @@ The risk-model universe must include positive-weight benchmark constituents as w
 candidates. Rerunning the same command skips complete date caches only when recorded input hashes
 still match. It fails on incomplete or stale caches instead of overwriting them.
 
+Use `scripts/run_parameter_sweep.py` with `examples/parameter-sweep.yaml` to compare frozen
+OOS variants. It writes each resolved config, one rolling output per variant, and CSV/JSON
+summary tables. A rerun reuses a completed variant only when its config hash still matches.
+
+```bash
+python scripts/run_parameter_sweep.py \
+  --base-config examples/alpha191-lgbm-oos-config.yaml \
+  --matrix-file examples/parameter-sweep.yaml \
+  --signal-file /path/to/signal_full.parquet \
+  --candidate-file /path/to/signal_candidates.parquet \
+  --covariance-root /path/to/risk_model \
+  --exposure-root /path/to/risk_model \
+  --benchmark-file /path/to/benchmark_weights.parquet \
+  --asset-returns-file /path/to/asset_returns.parquet \
+  --output-root /path/to/sweep_output
+```
+
 Use `scripts/prepare_data_factor_store_inputs.py` to export portable return, market-cap,
 benchmark, and tradability files from an authorized canonical data-factor store. Write those
 files outside this repository.
@@ -123,6 +140,7 @@ Read [references/optimization.md](references/optimization.md) before changing ob
 ## Signal Rules
 
 - Use `rank_score` for LightGBM predictions and most single-factor values that only carry ordering information.
+- Use `rank_transform: uniform` for backward-compatible percentile spacing, `normal_score` for Gaussian rank spacing, or `power` with `rank_power` for an explicit tail-emphasis assumption.
 - Use `expected_return` only when the input is already calibrated to the covariance horizon and units.
 - Set `higher_is_better: false` for negatively oriented factors.
 - Select and freeze the candidate set upstream; winsorize and standardize scores on the full OOS cross-section before optimizing that set.
@@ -137,6 +155,7 @@ Read [references/optimization.md](references/optimization.md) before changing ob
 - Require benchmark weights to sum to one within configured tolerance.
 - Repair small covariance asymmetry and negative eigenvalues, and disclose the repair in diagnostics.
 - Treat position, industry, market-cap, configurable style, turnover, tracking-error, and tradability limits as testable constraints.
+- Treat `candidate_weight_range` as a hard aggregate-weight range over the supplied candidate universe, not as a filter on benchmark or carried names.
 - Freeze a non-tradable asset at its current weight; fail if that current weight is unavailable. If market drift already pushed that frozen weight beyond a stock bound, preserve the executable freeze, disclose a frozen-bound exception, and keep the bound strict for every tradable asset.
 - Under schema version 3, never assign a neutral score to a tradable optimization asset with a missing prediction; only a positive non-tradable frozen holding is exempt.
 - Never silently replace a failed optimization with equal weights.

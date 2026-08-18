@@ -33,6 +33,11 @@ Apply identical dates, asset returns, execution timing, and transaction-cost ass
 The benchmark is simulated from supplied rebalance weights. Disclose this method rather than
 describing it as an official index return.
 
+Compute daily active return as portfolio net return minus simulated benchmark net return.
+Compute active NAV as portfolio NAV divided by benchmark NAV, geometrically annualized excess
+return from that active NAV, realized tracking error as annualized active-return volatility,
+and information ratio as annualized mean active return divided by active-return volatility.
+
 ## Failure rules
 
 Fail when a target date lacks a following trading date, target weights do not sum to one, a

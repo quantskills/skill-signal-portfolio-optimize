@@ -26,7 +26,7 @@ Optional long-form CSV or Parquet:
 date | ticker
 ```
 
-Candidates must be a non-empty subset of the full signal on each requested date. When no candidate file is supplied, every full-signal ticker is a candidate for backward compatibility. The optimization universe is the union of candidates, positive benchmark weights, and positive current holdings; full-signal names outside that union are used only for calibration.
+Candidates must be a non-empty subset of the full signal on each requested date. When no candidate file is supplied, every full-signal ticker is a candidate for backward compatibility. The optimization universe is the union of candidates, positive benchmark weights, and positive current holdings; full-signal names outside that union are used only for calibration. `constraints.candidate_weight_range` optionally places an absolute lower and/or upper bound on the sum of candidate target weights.
 
 ## Asset covariance
 
@@ -48,7 +48,7 @@ Required long-form CSV or Parquet:
 date | ticker | benchmark_weight
 ```
 
-Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe. In schema version 3 they must have a full-signal prediction unless they are positive, non-tradable frozen current holdings; schema versions 1 and 2 retain neutral-fill compatibility.
+Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe. In schema versions 3 and 4 they must have a full-signal prediction unless they are positive, non-tradable frozen current holdings; schema versions 1 and 2 retain neutral-fill compatibility.
 
 ## Current weights
 
