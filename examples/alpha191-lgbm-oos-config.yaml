@@ -1,4 +1,4 @@
-schema_version: 4
+schema_version: 5
 
 signal:
   type: rank_score
@@ -11,19 +11,25 @@ signal:
   missing_prediction_policy: error_except_frozen
 
 covariance:
+  risk_form: factor_model
   annualized: true
   periods_per_year: 252
   eigenvalue_floor: 1.0e-10
   symmetry_tolerance: 1.0e-10
 
 optimizer:
-  objective_mode: score_max_te
+  objective_mode: lexicographic_signal_cost
   solver_backend: auto
   risk_aversion: 5.0
   turnover_penalty: 0.001
   smoothing_epsilon: 1.0e-8
   max_iterations: 4000
   ftol: 1.0e-9
+  minimum_signal_capture: 0.995
+  stability_penalty: 1.0e-8
+
+cost_model:
+  linear_cost_bps: 7.0
 
 constraints:
   max_weight: 0.02
@@ -46,9 +52,7 @@ constraints:
       enabled: false
     NLSIZE:
       enabled: false
-  candidate_weight_range:
-    min_weight: 0.20
-    max_weight: null
+  candidate_weight_range: null
   weight_sum_tolerance: 1.0e-8
   constraint_tolerance: 1.0e-6
 

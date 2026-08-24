@@ -23,6 +23,8 @@ from .risk_model import (
 class ResolvedRiskModel:
     covariance_file: Path
     exposure_file: Path
+    factor_covariance_file: Path
+    specific_variance_file: Path
     source: str
     cache_directory: Path
     fingerprint: str
@@ -200,6 +202,8 @@ class DynamicRiskModelCache:
                 return ResolvedRiskModel(
                     covariance_file=static_covariance_file,
                     exposure_file=static_exposure_file,
+                    factor_covariance_file=static_covariance_file.parent / "factor_cov.parquet",
+                    specific_variance_file=static_covariance_file.parent / "specific_var.parquet",
                     source="static_reused",
                     cache_directory=static_covariance_file.parent,
                     fingerprint=fingerprint,
@@ -234,6 +238,8 @@ class DynamicRiskModelCache:
         return ResolvedRiskModel(
             covariance_file=directory / "asset_cov.parquet",
             exposure_file=directory / "exposures.parquet",
+            factor_covariance_file=directory / "factor_cov.parquet",
+            specific_variance_file=directory / "specific_var.parquet",
             source=source,
             cache_directory=directory,
             fingerprint=fingerprint,

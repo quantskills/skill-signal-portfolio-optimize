@@ -28,6 +28,10 @@ date | ticker
 
 Candidates must be a non-empty subset of the full signal on each requested date. When no candidate file is supplied, every full-signal ticker is a candidate for backward compatibility. The optimization universe is the union of candidates, positive benchmark weights, and positive current holdings; full-signal names outside that union are used only for calibration. `constraints.candidate_weight_range` optionally places an absolute lower and/or upper bound on the sum of candidate target weights.
 
+## Risk input modes
+
+Set `covariance.risk_form` to exactly one of `asset_covariance` or `factor_model`. Do not supply dense and factor-form files together. The risk form and every resolved input hash enter run manifests and rolling checkpoint signatures.
+
 ## Asset covariance
 
 Required square CSV or Parquet with identical ticker labels on rows and columns. For CSV, the first column contains row tickers:
@@ -40,6 +44,16 @@ ticker    | 000001.SZ | 000002.SZ
 
 The matrix may contain extra names but must cover every optimization-universe ticker, be finite, and use annualized return covariance when `covariance.annualized: true`.
 
+## Factor-form risk
+
+For `factor_model`, supply three aligned files:
+
+- exposures: `ticker` index or column plus every factor in `factor_covariance`;
+- factor covariance: square factor-by-factor `factor_cov.parquet`;
+- specific variance: `ticker | specific_var`, finite and non-negative.
+
+The files may contain extra assets but must cover the complete candidate, positive benchmark, and drifted current-holding union. Rolling roots resolve `date=YYYYMMDD/exposures.parquet`, `factor_cov.parquet`, and `specific_var.parquet`. The optimizer evaluates `X F X' + D` directly without assembling an asset covariance for the solve.
+
 ## Benchmark weights
 
 Required long-form CSV or Parquet:
@@ -48,7 +62,7 @@ Required long-form CSV or Parquet:
 date | ticker | benchmark_weight
 ```
 
-Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe. In schema versions 3 and 4 they must have a full-signal prediction unless they are positive, non-tradable frozen current holdings; schema versions 1 and 2 retain neutral-fill compatibility.
+Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe. In schema versions 3 through 5 they must have a full-signal prediction unless they are positive, non-tradable frozen current holdings; schema versions 1 and 2 retain neutral-fill compatibility.
 
 ## Current weights
 

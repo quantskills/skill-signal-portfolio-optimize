@@ -22,6 +22,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "missing_prediction_policy": "neutral",
     },
     "covariance": {
+        "risk_form": "asset_covariance",
         "annualized": True,
         "periods_per_year": 252,
         "eigenvalue_floor": 1.0e-10,
@@ -35,7 +36,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "smoothing_epsilon": 1.0e-8,
         "max_iterations": 2000,
         "ftol": 1.0e-10,
+        "minimum_signal_capture": 0.995,
+        "stability_penalty": 1.0e-8,
     },
+    "cost_model": {"linear_cost_bps": 0.0},
     "constraints": {
         "max_weight": 0.20,
         "max_active_weight": 0.15,
@@ -209,8 +213,8 @@ def _candidate_weight_range(value: Any) -> dict[str, float] | None:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    if config["schema_version"] not in {1, 2, 3, 4}:
-        raise ConfigError("schema_version must equal 1, 2, 3, or 4")
+    if config["schema_version"] not in {1, 2, 3, 4, 5}:
+        raise ConfigError("schema_version must equal 1, 2, 3, 4, or 5")
 
     signal = config["signal"]
     if signal["type"] not in {"rank_score", "expected_return"}:
@@ -252,15 +256,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             "signal.missing_prediction_policy must be neutral or error_except_frozen"
         )
     if (
-        config["schema_version"] in {3, 4}
+        config["schema_version"] in {3, 4, 5}
         and signal["missing_prediction_policy"] != "error_except_frozen"
     ):
         raise ConfigError(
-            "schema_version 3 or 4 requires signal.missing_prediction_policy "
+            "schema_version 3, 4, or 5 requires signal.missing_prediction_policy "
             "error_except_frozen"
         )
 
     covariance = config["covariance"]
+    if covariance["risk_form"] not in {"asset_covariance", "factor_model"}:
+        raise ConfigError(
+            "covariance.risk_form must be asset_covariance or factor_model"
+        )
     if not isinstance(covariance["annualized"], bool):
         raise ConfigError("covariance.annualized must be boolean")
     periods = covariance["periods_per_year"]
@@ -278,15 +286,26 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     optimizer = config["optimizer"]
-    if optimizer["objective_mode"] not in {"mean_variance", "score_max_te"}:
+    if optimizer["objective_mode"] not in {
+        "mean_variance",
+        "score_max_te",
+        "lexicographic_signal_cost",
+    }:
         raise ConfigError(
-            "optimizer.objective_mode must be mean_variance or score_max_te"
+            "optimizer.objective_mode must be mean_variance, score_max_te, or "
+            "lexicographic_signal_cost"
         )
-    if optimizer["solver_backend"] not in {"scipy_slsqp", "cvxpy", "auto"}:
+    if optimizer["solver_backend"] not in {"scipy_slsqp", "scipy_highs", "cvxpy", "auto"}:
         raise ConfigError(
-            "optimizer.solver_backend must be scipy_slsqp, cvxpy, or auto"
+            "optimizer.solver_backend must be scipy_slsqp, scipy_highs, cvxpy, or auto"
         )
-    for key in ("risk_aversion", "turnover_penalty", "smoothing_epsilon", "ftol"):
+    for key in (
+        "risk_aversion",
+        "turnover_penalty",
+        "smoothing_epsilon",
+        "ftol",
+        "stability_penalty",
+    ):
         optimizer[key] = _finite_number(
             optimizer[key], f"optimizer.{key}", minimum=0.0
         )
@@ -296,6 +315,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("optimizer.smoothing_epsilon must be positive")
     if optimizer["ftol"] <= 0:
         raise ConfigError("optimizer.ftol must be positive")
+    if optimizer["stability_penalty"] <= 0:
+        raise ConfigError("optimizer.stability_penalty must be positive")
+    optimizer["minimum_signal_capture"] = _finite_number(
+        optimizer["minimum_signal_capture"],
+        "optimizer.minimum_signal_capture",
+        minimum=0.0,
+    )
+    if optimizer["minimum_signal_capture"] > 1.0:
+        raise ConfigError("optimizer.minimum_signal_capture must not exceed 1")
     iterations = optimizer["max_iterations"]
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
         raise ConfigError("optimizer.max_iterations must be a positive integer")
@@ -341,21 +369,36 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError(
             "configure only one of factor_active_limit and style_active_ranges"
         )
-    if config["schema_version"] in {2, 3, 4}:
+    if config["schema_version"] in {2, 3, 4, 5}:
         styles = constraints["style_active_ranges"] or {}
         if "SIZE" not in styles or not styles["SIZE"].get("enabled", False):
             raise ConfigError(
-                "constraints.style_active_ranges.SIZE must be enabled in schema_version 2, 3, or 4"
+                "constraints.style_active_ranges.SIZE must be enabled in schema_version 2, 3, 4, or 5"
             )
-    if optimizer["objective_mode"] == "score_max_te":
+    if optimizer["objective_mode"] in {"score_max_te", "lexicographic_signal_cost"}:
         if signal["type"] != "rank_score":
             raise ConfigError(
-                "optimizer.objective_mode score_max_te requires signal.type rank_score"
+                "score-based optimizer objectives require signal.type rank_score"
             )
         if constraints["max_tracking_error"] is None:
             raise ConfigError(
-                "optimizer.objective_mode score_max_te requires constraints.max_tracking_error"
+                "score-based optimizer objectives require constraints.max_tracking_error"
             )
+
+    if (
+        config["schema_version"] == 5
+        and optimizer["objective_mode"] != "lexicographic_signal_cost"
+    ):
+        raise ConfigError(
+            "schema_version 5 requires optimizer.objective_mode "
+            "lexicographic_signal_cost"
+        )
+
+    config["cost_model"]["linear_cost_bps"] = _finite_number(
+        config["cost_model"]["linear_cost_bps"],
+        "cost_model.linear_cost_bps",
+        minimum=0.0,
+    )
 
     top_n = config["baseline"]["top_n"]
     if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n <= 0:

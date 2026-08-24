@@ -1,6 +1,6 @@
 # Output Contract
 
-Successful runs write five files into a new or empty output directory.
+Successful runs write six files into a new or empty output directory.
 
 ## `target_weights.parquet`
 
@@ -28,9 +28,13 @@ Contains expected return, ex-ante absolute volatility, active volatility, and ch
 
 Contains signal type, direction, requested date, full calibration, candidate, and optimization asset counts, optimization prediction coverage, candidate target weight, missing-prediction policy, allowed frozen-missing count, raw/calibrated distribution summaries, winsorization count, rank transform, rank power, and calibration settings.
 
+## `optimization_summary.json`
+
+Contains the primary and final signal utilities, signal utility floor and capture ratio, exact one-way turnover, estimated linear transaction cost, turnover saved versus the same-signal equal-weight baseline, risk form, selected backend, both stage statuses, hard-constraint slacks and bindings, available duals, and explicit reasons for unavailable dual or KKT fields.
+
 ## `run_manifest.json`
 
-Contains schema and implementation versions, resolved configuration, input paths and SHA-256 fingerprints, output filenames, runtime timestamps, Python/package versions, requested date, and optimization, full-signal, candidate, candidate-external, and benchmark-only asset counts.
+Contains schema and implementation versions, effective cost source, risk form, stable output hashes, resolved configuration, input paths and SHA-256 fingerprints, output filenames, runtime timestamps, Python/package versions, requested date, and optimization, full-signal, candidate, candidate-external, and benchmark-only asset counts.
 
 No single-date file represents orders or fills.
 
@@ -44,6 +48,7 @@ No single-date file represents orders or fills.
 - `optimization_diagnostics.parquet`
 - `portfolio_metrics.json`
 - `rolling_manifest.json`
+- `optimization_summary.json`
 
 The daily table contains gross return, proportional transaction cost, net return, turnover,
 NAV, drawdown, benchmark net return, active return, active NAV, and active drawdown for
@@ -51,6 +56,7 @@ equal-weight, optimized, and simulated benchmark portfolios. `portfolio_metrics.
 geometrically annualized excess return, realized tracking error, information ratio, ending
 active NAV, and maximum active drawdown. `optimization_diagnostics.parquet` includes scalar
 slacks for turnover, tracking error, stock limits, and candidate-weight bounds.
+`optimization_summary.json` aggregates constraint binding counts and ratios, signal-capture minimum/mean/maximum, signal utility loss, turnover, estimated cost, runtime, backend, risk form, and cache reuse.
 `rolling_manifest.json` records a SHA-256 entry for every resolved covariance and, when
 available, every resolved exposure file. It also records per-date risk source
 (`static_reused`, `dynamic_built`, or `dynamic_reused`), dynamic-cache counts, and checkpoint

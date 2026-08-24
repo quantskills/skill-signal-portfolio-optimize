@@ -23,8 +23,12 @@ from portfolio_runtime.sweep import (  # noqa: E402
 
 def test_example_sweep_matrix_is_valid() -> None:
     variants = load_sweep_variants(ROOT / "examples" / "parameter-sweep.yaml")
-    assert len(variants) == 5
-    assert len({variant["name"] for variant in variants}) == 5
+    assert [variant["name"] for variant in variants] == [
+        "capture_10000",
+        "capture_09975",
+        "capture_09950",
+        "capture_09900",
+    ]
 
 
 def test_dotted_overrides_validate_resolved_config() -> None:

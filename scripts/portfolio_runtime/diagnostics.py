@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .errors import ConfigError
+from .risk import PortfolioRisk, as_portfolio_risk
 
 
 def expand_limits(
@@ -152,16 +153,16 @@ def _candidate_range_detail(
 def portfolio_metrics(
     weights: pd.Series,
     expected_return: pd.Series,
-    covariance: pd.DataFrame,
+    covariance: pd.DataFrame | PortfolioRisk,
     benchmark: pd.Series,
 ) -> dict[str, float]:
     w = weights.to_numpy(dtype=float)
     mu = expected_return.to_numpy(dtype=float)
     b = benchmark.to_numpy(dtype=float)
-    sigma = covariance.to_numpy(dtype=float)
+    risk = as_portfolio_risk(covariance)
     active = w - b
-    absolute_variance = max(float(w @ sigma @ w), 0.0)
-    active_variance = max(float(active @ sigma @ active), 0.0)
+    absolute_variance = max(risk.variance(w), 0.0)
+    active_variance = max(risk.variance(active), 0.0)
     return {
         "expected_return": float(w @ mu),
         "absolute_volatility": float(np.sqrt(absolute_variance)),
@@ -208,7 +209,7 @@ def constraint_report(
         "frozen_bound_exceptions": [],
         "one_way_turnover": None,
         "tracking_error": float(
-            np.sqrt(max(float(active.to_numpy() @ covariance.to_numpy() @ active.to_numpy()), 0.0))
+            np.sqrt(max(as_portfolio_risk(covariance).variance(active.to_numpy(dtype=float)), 0.0))
         ),
         "maximum_frozen_weight_deviation": None,
         "industry_exposures": {},

@@ -15,6 +15,7 @@ import pandas as pd
 
 from . import __version__
 from .config import load_config
+from .cost import resolve_linear_cost_bps
 from .diagnostics import constraint_report, portfolio_metrics
 from .errors import InputDataError
 from .io import (
@@ -29,6 +30,7 @@ from .io import (
     sha256_file,
 )
 from .optimizer import build_equal_weight_baseline, optimize_portfolio
+from .risk import PortfolioRisk, load_factor_risk
 from .signal import calibrate_signal
 
 
@@ -38,6 +40,7 @@ OUTPUT_FILES = (
     "risk_summary.json",
     "signal_diagnostics.json",
     "run_manifest.json",
+    "optimization_summary.json",
 )
 
 
@@ -127,18 +130,24 @@ def run_single_date(
     config_path: str | Path,
     signal_file: str | Path,
     candidate_file: str | Path | None = None,
-    covariance_file: str | Path,
+    covariance_file: str | Path | None,
     benchmark_file: str | Path,
     requested_date: object,
     output_dir: str | Path,
     current_weights_file: str | Path | None = None,
     sector_file: str | Path | None = None,
     exposure_file: str | Path | None = None,
+    factor_covariance_file: str | Path | None = None,
+    specific_variance_file: str | Path | None = None,
+    transaction_cost_bps: float | None = None,
     tradability_file: str | Path | None = None,
 ) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     date = normalize_date(requested_date)
     config = load_config(config_path)
+    effective_cost_bps, cost_resolution = resolve_linear_cost_bps(
+        config, transaction_cost_bps
+    )
     signal = load_signal(signal_file, date)
     calibrated_signal, signal_diagnostics = calibrate_signal(
         signal, config["signal"], date
@@ -239,14 +248,44 @@ def run_single_date(
     calibrated["signal_score"] = calibrated["signal_score"].fillna(0.0)
     calibrated["expected_return"] = calibrated["expected_return"].fillna(0.0)
 
-    covariance, covariance_diagnostics = load_covariance(
-        covariance_file,
-        universe,
-        annualized=config["covariance"]["annualized"],
-        periods_per_year=config["covariance"]["periods_per_year"],
-        eigenvalue_floor=config["covariance"]["eigenvalue_floor"],
-        symmetry_tolerance=config["covariance"]["symmetry_tolerance"],
-    )
+    risk_form = config["covariance"]["risk_form"]
+    if risk_form == "asset_covariance":
+        if covariance_file is None:
+            raise InputDataError("covariance_file is required for asset_covariance risk")
+        if factor_covariance_file is not None or specific_variance_file is not None:
+            raise InputDataError("dense and factor-form risk inputs are mutually exclusive")
+        covariance, covariance_diagnostics = load_covariance(
+            covariance_file,
+            universe,
+            annualized=config["covariance"]["annualized"],
+            periods_per_year=config["covariance"]["periods_per_year"],
+            eigenvalue_floor=config["covariance"]["eigenvalue_floor"],
+            symmetry_tolerance=config["covariance"]["symmetry_tolerance"],
+        )
+        risk: pd.DataFrame | PortfolioRisk = covariance
+        covariance_diagnostics = {
+            "risk_form": "asset_covariance", **covariance_diagnostics
+        }
+    else:
+        if covariance_file is not None:
+            raise InputDataError("dense and factor-form risk inputs are mutually exclusive")
+        if exposure_file is None or factor_covariance_file is None or specific_variance_file is None:
+            raise InputDataError(
+                "factor_model risk requires exposure_file, factor_covariance_file, "
+                "and specific_variance_file"
+            )
+        risk = load_factor_risk(
+            exposure_file=str(exposure_file),
+            factor_covariance_file=str(factor_covariance_file),
+            specific_variance_file=str(specific_variance_file),
+            universe=universe,
+            requested_date=date,
+            annualized=config["covariance"]["annualized"],
+            periods_per_year=config["covariance"]["periods_per_year"],
+            eigenvalue_floor=config["covariance"]["eigenvalue_floor"],
+            symmetry_tolerance=config["covariance"]["symmetry_tolerance"],
+        )
+        covariance_diagnostics = dict(risk.diagnostics or {})
 
     signal_baseline = build_equal_weight_baseline(
         calibrated_signal.loc[candidates, "signal_score"],
@@ -258,7 +297,7 @@ def run_single_date(
     )
     optimized = optimize_portfolio(
         calibrated["expected_return"],
-        covariance,
+        risk,
         benchmark,
         current,
         sectors,
@@ -268,13 +307,14 @@ def run_single_date(
         config["constraints"],
         signal_score=calibrated["signal_score"],
         candidate_mask=candidate_mask,
+        cost_model={"linear_cost_bps": effective_cost_bps},
     )
 
     baseline_constraints = constraint_report(
         baseline,
         benchmark,
         current,
-        covariance,
+        risk,
         sectors,
         exposures,
         tradable,
@@ -282,10 +322,10 @@ def run_single_date(
         candidate_mask=candidate_mask,
     )
     risk_baseline = portfolio_metrics(
-        baseline, calibrated["expected_return"], covariance, benchmark
+        baseline, calibrated["expected_return"], risk, benchmark
     )
     risk_optimized = portfolio_metrics(
-        optimized.weights, calibrated["expected_return"], covariance, benchmark
+        optimized.weights, calibrated["expected_return"], risk, benchmark
     )
     risk_summary = {
         "covariance": covariance_diagnostics,
@@ -295,6 +335,43 @@ def run_single_date(
             key: float(risk_optimized[key] - risk_baseline[key])
             for key in risk_baseline
         },
+    }
+    baseline_turnover = (
+        None if current is None else float(0.5 * (baseline - current).abs().sum())
+    )
+    optimization_summary = {
+        "objective_mode": config["optimizer"]["objective_mode"],
+        "backend": optimized.solver.get("backend"),
+        "risk_form": risk_form,
+        "primary_signal_utility": optimized.solver.get("primary_signal_utility"),
+        "signal_utility_floor": optimized.solver.get("signal_utility_floor"),
+        "signal_utility_solver_floor": optimized.solver.get(
+            "signal_utility_solver_floor"
+        ),
+        "signal_utility_tolerance": optimized.solver.get(
+            "signal_utility_tolerance"
+        ),
+        "primary_optimality_gap": optimized.solver.get("primary_optimality_gap"),
+        "secondary_optimality_gap": optimized.solver.get("secondary_optimality_gap"),
+        "final_signal_utility": optimized.solver.get("final_signal_utility"),
+        "signal_capture_ratio": optimized.solver.get("signal_capture_ratio"),
+        "minimum_signal_capture": optimized.solver.get("minimum_signal_capture"),
+        "one_way_turnover": optimized.solver.get("one_way_turnover"),
+        "baseline_one_way_turnover": baseline_turnover,
+        "turnover_saved": (
+            None
+            if baseline_turnover is None or optimized.solver.get("one_way_turnover") is None
+            else float(baseline_turnover - optimized.solver["one_way_turnover"])
+        ),
+        "estimated_transaction_cost": optimized.solver.get("estimated_transaction_cost"),
+        "cost_model": cost_resolution,
+        "constraint_slacks": optimized.constraints.get("constraint_slacks", {}),
+        "binding_constraints": optimized.constraints.get("binding_constraints", []),
+        "constraint_duals": optimized.solver.get("constraint_duals"),
+        "constraint_duals_unavailable_reason": optimized.solver.get(
+            "constraint_duals_unavailable_reason"
+        ),
+        "constraints_passed": bool(optimized.constraints["passed"]),
     }
     constraint_diagnostics = {
         "risk_optimized": {
@@ -359,6 +436,8 @@ def run_single_date(
         "config": config_path,
         "signal": signal_file,
         "covariance": covariance_file,
+        "factor_covariance": factor_covariance_file,
+        "specific_variance": specific_variance_file,
         "benchmark": benchmark_file,
         "current_weights": current_weights_file,
         "sectors": sector_file,
@@ -390,6 +469,8 @@ def run_single_date(
         "started_at": started.isoformat(),
         "completed_at": completed.isoformat(),
         "config": config,
+        "cost_model_resolution": cost_resolution,
+        "risk_form": risk_form,
         "inputs": inputs,
         "outputs": list(OUTPUT_FILES),
         "runtime": {
@@ -408,6 +489,12 @@ def run_single_date(
         _write_json(temporary / "constraint_diagnostics.json", constraint_diagnostics)
         _write_json(temporary / "risk_summary.json", risk_summary)
         _write_json(temporary / "signal_diagnostics.json", signal_diagnostics)
+        _write_json(temporary / "optimization_summary.json", optimization_summary)
+        manifest["output_sha256"] = {
+            name: sha256_file(temporary / name)
+            for name in OUTPUT_FILES
+            if name != "run_manifest.json" and (temporary / name).is_file()
+        }
         _write_json(temporary / "run_manifest.json", manifest)
         _publish_output(destination, temporary)
     except BaseException:

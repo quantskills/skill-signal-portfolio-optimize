@@ -9,6 +9,8 @@
 
 ## Returns and costs
 
+Use the same `cost_model.linear_cost_bps` value in optimization diagnostics and backtest accounting. An explicit CLI override replaces both uses and is disclosed in the manifest; it never changes only one side.
+
 For pre-return weights `w` and simple asset returns `r`, calculate gross portfolio return as
 `w'r`. Drift end-of-day weights in proportion to `w * (1+r)`.
 
@@ -20,7 +22,7 @@ Calculate one-way turnover at an effective rebalance as:
 
 Calculate proportional transaction cost as `turnover * bps / 10000` and subtract it from the
 gross return on the effective date. Do not model orders, partial fills, or nonlinear market
-impact in v0.6.
+impact in v1.0.
 
 ## Comparators
 

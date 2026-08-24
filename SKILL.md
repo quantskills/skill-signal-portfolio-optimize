@@ -1,11 +1,56 @@
 ---
 name: skill-signal-portfolio-optimize
-description: Estimate an open structural multifactor risk model or convert one final cross-sectional stock signal into benchmark-relative long-only target weights, then run an auditable next-trading-day rolling backtest. Use when Codex needs to build covariance from historical returns and market cap with required, optional, or disabled industry history; optimize a LightGBM or single-factor signal under position, SIZE, configurable style, industry, turnover, tracking-error, and tradability constraints; maximize a rank score under a risk budget; compare equal-weight, benchmark, and optimized portfolios; or diagnose risk-model, solver, exposure, turnover, return, NAV, and drawdown results. Also use for Chinese requests such as 风险模型、协方差估计、信号组合优化、单因子权重优化、风险约束配权、行业风格中性、滚动优化、净值回撤、换手成本或优化前后回测对比.
+description: Build an open Barra-style structural equity risk model and convert one frozen cross-sectional stock signal into benchmark-relative long-only target weights with auditable two-stage signal-capture, transaction-cost, exposure, turnover, tracking-error, and tradability controls. Use when Codex needs to optimize a LightGBM or single-factor stock signal, estimate or consume covariance, enforce market-cap, style, or point-in-time industry constraints, run a next-trading-day rolling portfolio study, or diagnose weights, risk, turnover, NAV, and drawdown results. Also use for Chinese requests such as 风险模型、协方差估计、信号组合优化、单因子权重优化、风险约束配权、行业风格中性、滚动优化、净值回撤、换手成本或优化前后回测对比.
+quantSkills:
+  schema_version: 2.1.0
+  organization: quantskills
+  organization_url: https://github.com/quantskills
+  repository: skill-signal-portfolio-optimize
+  repository_url: https://github.com/quantskills/skill-signal-portfolio-optimize
+  project_type: skill
+  license: GPL-3.0-only
+  maintainer: X-Tech-group
+  collection: portfolio-construction
+  catalog:
+    category: "05"
+    subcategory: 05.portfolio-construction
+  workflow:
+    primary_stage: portfolio-construction
+    workflow_stages:
+      - data-ingestion
+      - modeling
+      - risk
+      - portfolio-construction
+      - backtesting
+      - evaluation
+      - reporting
+  tags:
+    - portfolio-optimization
+    - signal-optimization
+    - risk-model
+    - benchmark-relative
+    - factor-model
+    - risk-control
+    - backtesting
+  platforms:
+    - cursor
+    - claude-code
+    - codex
+    - hermes
+    - openclaw
+  status: active
+  requires: []
+  validation_level: runnable
+  maintainer_type: community
+  summary_en: "Converts one stock signal into benchmark-relative target weights with auditable risk, exposure, turnover, and cost controls."
+  summary_zh: "将单个股票信号转换为受基准相对风险、风格、行业、换手和成本约束的可审计组合权重。"
+  interface:
+    mode: natural-language
 ---
 
 # Signal Portfolio Optimize
 
-Turn one frozen stock-level signal into reviewable target weights. Treat the signal as an upstream return forecast and keep it separate from the risk factors used to constrain the portfolio.
+Turn one frozen stock-level signal into reviewable target weights. Treat the signal as an upstream alpha forecast and keep it separate from the risk factors used to constrain the portfolio.
 
 ## Scope
 
@@ -13,17 +58,17 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 - Accept an optional `date | ticker` candidate universe; when omitted, all signal names are candidates. Optionally constrain their aggregate portfolio weight.
 - Accept signals produced by LightGBM, a single factor, or another upstream model.
 - Do not train models, select factors, or combine raw multi-factor columns.
-- Accept a supplied asset covariance or estimate an open market/style/optional-industry structural model.
+- Accept either a supplied asset covariance or mutually exclusive `X`, `F`, and `D` factor-form risk inputs; otherwise estimate an open market/style/optional-industry structural model.
 - Build the optimization universe from candidates, positive benchmark names, and positive current holdings; the full signal does not enlarge the risk matrix.
-- Require SIZE control in schema versions 2 through 4 and allow target ranges for other style exposures.
-- In schema versions 3 and 4, fail when an optimization asset lacks a prediction except for a positive, non-tradable frozen holding.
+- Require SIZE control in schema versions 2 through 5 and allow target ranges for other style exposures.
+- In schema versions 3 through 5, fail when an optimization asset lacks a prediction except for a positive, non-tradable frozen holding.
 - Do not claim that the open model is MSCI Barra or a proprietary Barra product.
 - Build an equal-weight signal baseline and a risk-optimized portfolio on the same date.
 - Run rolling optimization with drifted current holdings and next-trading-day target execution.
 - Reuse complete static risk files and dynamically rebuild exact risk coverage when carried holdings expand the optimization universe.
 - Persist input-signed date checkpoints so interrupted rolling experiments can resume safely.
 - Fail closed on missing covariance coverage, invalid weights, infeasible constraints, or non-finite inputs.
-- Produce target weights and machine-readable diagnostics; do not place orders.
+- Produce target weights, `optimization_summary.json`, and machine-readable diagnostics; do not place orders.
 
 ## Workflow
 
@@ -58,7 +103,7 @@ python scripts/run_rolling_experiment.py \
   --exposure-root /path/to/risk_model \
   --benchmark-file /path/to/benchmark_weights.parquet \
   --asset-returns-file /path/to/asset_returns.parquet \
-  --transaction-cost-bps 10 \
+  --transaction-cost-bps 7 \
   --output-dir /path/to/rolling_output
 ```
 
@@ -137,6 +182,17 @@ It deliberately uses an equal-weight benchmark over that eligible universe and r
 
 Read [references/optimization.md](references/optimization.md) before changing objectives, scaling signals, or interpreting risk. Read [references/output-contract.md](references/output-contract.md) before consuming outputs programmatically.
 
+## Risk Model
+
+- Estimate the open structural factors MARKET, SIZE, BETA, MOMENTUM, RESVOL, and NLSIZE from point-in-time returns and market-cap inputs. These mean market, capitalization, market sensitivity, momentum, residual volatility, and nonlinear size.
+- Add industry dummy factors only when interval-valid point-in-time classifications are available. Do not backfill a current industry snapshot into history.
+- Residualize and standardize style exposures cross-sectionally, estimate factor returns by weighted regression, and combine factor covariance with specific variance.
+- Use shrinkage, eigenvalue flooring, and positive-semidefinite repair where configured; disclose every repair and effective observation count.
+- Keep factor calculation separate from portfolio constraints: a calculated factor is not automatically constrained. The example configuration requires SIZE control and leaves the other style ranges configurable.
+- Accept a supplied asset covariance for simple integrations or explicit exposure, factor-covariance, and specific-variance files for factor-form optimization.
+
+This is a transparent Barra-style implementation. It does not reproduce MSCI Barra's proprietary factor definitions, estimation universe, descriptors, or production covariance adjustments.
+
 ## Signal Rules
 
 - Use `rank_score` for LightGBM predictions and most single-factor values that only carry ordering information.
@@ -150,30 +206,43 @@ Read [references/optimization.md](references/optimization.md) before changing ob
 ## Optimization Rules
 
 - Optimize active risk relative to the supplied benchmark.
-- Use `score_max_te` for rank signals and require an explicit tracking-error limit.
+- Use schema 5 `lexicographic_signal_cost` for rank signals: maximize active signal utility first, then retain `minimum_signal_capture` and minimize exact linear cost plus a strictly positive L2 stability term.
+- Keep `score_max_te` available for schema 1 through 4 compatibility.
 - Use `mean_variance` only when signal return units and covariance horizon are compatible.
 - Require benchmark weights to sum to one within configured tolerance.
 - Repair small covariance asymmetry and negative eigenvalues, and disclose the repair in diagnostics.
 - Treat position, industry, market-cap, configurable style, turnover, tracking-error, and tradability limits as testable constraints.
 - Treat `candidate_weight_range` as a hard aggregate-weight range over the supplied candidate universe, not as a filter on benchmark or carried names.
 - Freeze a non-tradable asset at its current weight; fail if that current weight is unavailable. If market drift already pushed that frozen weight beyond a stock bound, preserve the executable freeze, disclose a frozen-bound exception, and keep the bound strict for every tradable asset.
-- Under schema version 3, never assign a neutral score to a tradable optimization asset with a missing prediction; only a positive non-tradable frozen holding is exempt.
+- Under schema versions 3 through 5, never assign a neutral score to a tradable optimization asset with a missing prediction; only a positive non-tradable frozen holding is exempt.
 - Never silently replace a failed optimization with equal weights.
-- When CVXPY is unavailable, solve `score_max_te` with auditable HiGHS ellipsoid cuts; independently recheck every hard constraint.
+- Select and record the schema 5 backend before solving: use CVXPY/Clarabel only when both are installed, otherwise use the SciPy two-stage backend. Never switch after a solve starts or describe cross-environment backend selection as bitwise deterministic.
+- When CVXPY is unavailable, solve legacy `score_max_te` with auditable HiGHS ellipsoid cuts; independently recheck every hard constraint.
 
 ## Outputs
 
-Write exactly these stable artifacts for a successful run:
+Write these stable artifacts for a successful run:
 
 - `target_weights.parquet`
 - `constraint_diagnostics.json`
 - `risk_summary.json`
 - `signal_diagnostics.json`
 - `run_manifest.json`
+- `optimization_summary.json`
 
 Single-date output contains target weights, not executable orders. Rolling output contains a
 research backtest, not broker fills. Keep production data and experiment outputs outside this
 repository.
+
+## Validation Status And Limitations
+
+- Catalog status is `active`; validation level is `runnable`. The checked-in examples, validator, and test suite exercise the documented commands. Final community listing and validation still require QuantSkills maintainer review.
+- The current risk model can calculate six open market/style factors. Industry calculation and industry-neutral constraints require point-in-time interval history and are not enabled by default.
+- The reported 2023-2026 results are development-period evidence on one frozen Alpha191+LightGBM signal, not a sealed holdout and not proof of general performance.
+- The rolling engine models next-trading-day target execution and configurable linear transaction costs. It does not model intraday fills, market impact, borrow, or live order routing.
+- Solver results can differ slightly by backend and numerical library. Always use the recorded backend, resolved configuration, input hashes, and constraint diagnostics when reproducing a run.
+
+See [references/validation-notes.md](references/validation-notes.md) for version-level evidence and interpretation limits.
 
 ## Project Boundary
 

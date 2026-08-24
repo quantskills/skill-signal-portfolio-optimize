@@ -13,7 +13,7 @@ import yaml
 from portfolio_runtime.config import load_config
 from portfolio_runtime.errors import InputDataError, PortfolioOptimizeError
 from portfolio_runtime.io import sha256_file
-from portfolio_runtime.rolling import run_rolling_experiment
+from portfolio_runtime.rolling import _runtime_source_hash, run_rolling_experiment
 from portfolio_runtime.sweep import (
     apply_dotted_overrides,
     flatten_sweep_metrics,
@@ -35,12 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sector-file", type=Path)
     parser.add_argument("--exposure-file", type=Path)
     parser.add_argument("--exposure-root", type=Path)
+    parser.add_argument("--factor-covariance-root", type=Path)
+    parser.add_argument("--specific-variance-root", type=Path)
     parser.add_argument("--tradability-file", type=Path)
     parser.add_argument("--initial-weights-file", type=Path)
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
     parser.add_argument("--rebalance-every", type=int, default=1)
-    parser.add_argument("--transaction-cost-bps", type=float, default=0.0)
+    parser.add_argument("--transaction-cost-bps", type=float)
     parser.add_argument("--risk-model-config", type=Path)
     parser.add_argument("--risk-returns-file", type=Path)
     parser.add_argument("--risk-market-cap-file", type=Path)
@@ -71,7 +73,11 @@ def _completed_metrics(output: Path, config_path: Path) -> dict[str, Any] | None
         raise InputDataError(f"incomplete sweep run output exists at {output}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     recorded = manifest.get("inputs", {}).get("config", {}).get("sha256")
-    if manifest.get("status") != "success" or recorded != sha256_file(config_path):
+    if (
+        manifest.get("status") != "success"
+        or recorded != sha256_file(config_path)
+        or manifest.get("runtime_source_sha256") != _runtime_source_hash()
+    ):
         raise InputDataError(f"stale sweep run output exists at {output}")
     return json.loads(metrics_path.read_text(encoding="utf-8"))
 
@@ -123,6 +129,8 @@ def main() -> int:
                         sector_file=args.sector_file,
                         exposure_file=args.exposure_file,
                         exposure_root=args.exposure_root,
+                        factor_covariance_root=args.factor_covariance_root,
+                        specific_variance_root=args.specific_variance_root,
                         tradability_file=args.tradability_file,
                         initial_weights_file=args.initial_weights_file,
                         start_date=args.start_date,

@@ -13,6 +13,7 @@ from .diagnostics import (
     resolve_style_ranges,
 )
 from .errors import OptimizationError
+from .risk import PortfolioRisk
 
 
 @dataclass(frozen=True)
@@ -143,7 +144,10 @@ def _build_linear_system(
         turnover = np.zeros(dimension)
         turnover[n_assets:] = 1.0
         inequality_rows.append(turnover)
-        inequality_values.append(2.0 * float(config["max_turnover"]))
+        turnover_margin = float(config["constraint_tolerance"])
+        inequality_values.append(
+            2.0 * max(float(config["max_turnover"]) - turnover_margin, 0.0)
+        )
 
     a_eq = np.vstack(equality_rows)
     b_eq = np.asarray(equality_values, dtype=float)
@@ -209,7 +213,7 @@ def _preferred_benchmark_start(
 def _optimize_scipy(
     expected_return: pd.Series,
     objective_signal: pd.Series,
-    covariance: pd.DataFrame,
+    covariance: pd.DataFrame | PortfolioRisk,
     benchmark: pd.Series,
     current: pd.Series | None,
     sectors: pd.Series | None,
@@ -444,7 +448,7 @@ def _optimize_scipy(
 def _optimize_score_highs(
     expected_return: pd.Series,
     objective_signal: pd.Series,
-    covariance: pd.DataFrame,
+    covariance: pd.DataFrame | PortfolioRisk,
     benchmark: pd.Series,
     current: pd.Series | None,
     sectors: pd.Series | None,
@@ -680,7 +684,7 @@ def _import_cvxpy() -> Any:
 def _optimize_cvxpy(
     expected_return: pd.Series,
     objective_signal: pd.Series,
-    covariance: pd.DataFrame,
+    covariance: pd.DataFrame | PortfolioRisk,
     benchmark: pd.Series,
     current: pd.Series | None,
     sectors: pd.Series | None,
@@ -798,7 +802,7 @@ def _optimize_cvxpy(
 
 def optimize_portfolio(
     expected_return: pd.Series,
-    covariance: pd.DataFrame,
+    covariance: pd.DataFrame | PortfolioRisk,
     benchmark: pd.Series,
     current: pd.Series | None,
     sectors: pd.Series | None,
@@ -809,6 +813,7 @@ def optimize_portfolio(
     *,
     signal_score: pd.Series | None = None,
     candidate_mask: pd.Series | None = None,
+    cost_model: dict[str, Any] | None = None,
 ) -> OptimizationResult:
     if candidate_mask is not None:
         candidate_mask = candidate_mask.reindex(expected_return.index)
@@ -820,14 +825,32 @@ def optimize_portfolio(
             "candidate_mask is required when candidate_weight_range is configured"
         )
     objective_mode = optimizer_config["objective_mode"]
-    if objective_mode == "score_max_te":
+    if objective_mode in {"score_max_te", "lexicographic_signal_cost"}:
         if signal_score is None:
-            raise OptimizationError("score_max_te requires a signal_score vector")
+            raise OptimizationError(f"{objective_mode} requires a signal_score vector")
         objective_signal = signal_score.reindex(expected_return.index)
         if objective_signal.isna().any() or not np.isfinite(objective_signal).all():
             raise OptimizationError("signal_score contains missing or non-finite values")
     else:
         objective_signal = expected_return
+
+    if objective_mode == "lexicographic_signal_cost":
+        from .lexicographic import optimize_lexicographic_signal_cost
+
+        return optimize_lexicographic_signal_cost(
+            expected_return=expected_return,
+            signal_score=objective_signal,
+            risk_input=covariance,
+            benchmark=benchmark,
+            current=current,
+            sectors=sectors,
+            exposures=exposures,
+            candidate_mask=candidate_mask,
+            tradable=tradable,
+            optimizer_config=optimizer_config,
+            constraint_config=constraint_config,
+            linear_cost_bps=float((cost_model or {"linear_cost_bps": 0.0})["linear_cost_bps"]),
+        )
 
     backend = optimizer_config["solver_backend"]
     if backend in {"cvxpy", "auto"}:

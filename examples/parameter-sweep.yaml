@@ -1,32 +1,19 @@
 schema_version: 1
 
 variants:
-  - name: uniform_no_floor
+  - name: capture_10000
     overrides:
-      signal.rank_transform: uniform
-      signal.rank_power: 1.0
+      optimizer.minimum_signal_capture: 1.000
       constraints.candidate_weight_range: null
-  - name: normal_score_no_floor
+  - name: capture_09975
     overrides:
-      signal.rank_transform: normal_score
-      signal.rank_power: 1.0
+      optimizer.minimum_signal_capture: 0.9975
       constraints.candidate_weight_range: null
-  - name: normal_score_floor_20
+  - name: capture_09950
     overrides:
-      signal.rank_transform: normal_score
-      constraints.candidate_weight_range:
-        min_weight: 0.20
-        max_weight: null
-  - name: normal_score_floor_25
+      optimizer.minimum_signal_capture: 0.995
+      constraints.candidate_weight_range: null
+  - name: capture_09900
     overrides:
-      signal.rank_transform: normal_score
-      constraints.candidate_weight_range:
-        min_weight: 0.25
-        max_weight: null
-  - name: power_1_5_floor_30
-    overrides:
-      signal.rank_transform: power
-      signal.rank_power: 1.5
-      constraints.candidate_weight_range:
-        min_weight: 0.30
-        max_weight: null
+      optimizer.minimum_signal_capture: 0.990
+      constraints.candidate_weight_range: null

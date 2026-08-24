@@ -24,7 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-file",
         help="Optional date-ticker candidate universe; defaults to all signal rows",
     )
-    parser.add_argument("--covariance-file", required=True, help="Square covariance CSV/Parquet")
+    parser.add_argument("--covariance-file", help="Square covariance CSV/Parquet")
+    parser.add_argument("--factor-covariance-file", help="Factor covariance CSV/Parquet")
+    parser.add_argument("--specific-variance-file", help="Specific variance CSV/Parquet")
+    parser.add_argument("--transaction-cost-bps", type=float)
     parser.add_argument("--benchmark-file", required=True, help="Long-form benchmark weights")
     parser.add_argument("--current-weights-file", help="Optional current weights")
     parser.add_argument(
@@ -45,6 +48,9 @@ def main() -> int:
             config_path=args.config,
             signal_file=args.signal_file,
             covariance_file=args.covariance_file,
+            factor_covariance_file=args.factor_covariance_file,
+            specific_variance_file=args.specific_variance_file,
+            transaction_cost_bps=args.transaction_cost_bps,
             candidate_file=args.candidate_file,
             benchmark_file=args.benchmark_file,
             current_weights_file=args.current_weights_file,

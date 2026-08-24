@@ -30,7 +30,7 @@ The open model supports:
 - EWMA specific variance with configurable median shrinkage;
 - industry-median specific-risk imputation when an asset lacks enough residual history.
 
-It assembles annualized asset covariance as:
+It represents annualized risk as:
 
 ```text
 Sigma = X F X' + diag(specific_variance)
@@ -108,6 +108,8 @@ record; a non-tradable holding remains frozen at its current weight.
 - `exposures.parquet`
 - `factor_returns.parquet`
 - `risk_model_manifest.json`
+
+The optimizer may consume the emitted `exposures.parquet`, `factor_cov.parquet`, and `specific_var.parquet` directly. For active weights `a`, it evaluates `(X'a)'F(X'a) + sum(D * a^2)`. The dense `asset_cov.parquet` entry remains available for compatibility and equivalence tests.
 
 The manifest discloses model type, timing contract, lookback, factor list, whether industry
 history was used, regression coverage, and specific-risk imputation. Fundamental styles are

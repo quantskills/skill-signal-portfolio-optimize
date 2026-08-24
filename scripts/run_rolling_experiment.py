@@ -35,12 +35,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Date-partitioned root containing date=YYYYMMDD/exposures.parquet",
     )
+    parser.add_argument("--factor-covariance-root", type=Path)
+    parser.add_argument("--specific-variance-root", type=Path)
     parser.add_argument("--tradability-file", type=Path)
     parser.add_argument("--initial-weights-file", type=Path)
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
     parser.add_argument("--rebalance-every", type=int, default=1)
-    parser.add_argument("--transaction-cost-bps", type=float, default=0.0)
+    parser.add_argument("--transaction-cost-bps", type=float)
     parser.add_argument("--risk-model-config", type=Path)
     parser.add_argument("--risk-returns-file", type=Path)
     parser.add_argument("--risk-market-cap-file", type=Path)
@@ -68,6 +70,8 @@ def main() -> int:
             sector_file=args.sector_file,
             exposure_file=args.exposure_file,
             exposure_root=args.exposure_root,
+            factor_covariance_root=args.factor_covariance_root,
+            specific_variance_root=args.specific_variance_root,
             tradability_file=args.tradability_file,
             initial_weights_file=args.initial_weights_file,
             start_date=args.start_date,

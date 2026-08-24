@@ -1,5 +1,5 @@
 ---
-description: Optimize and rolling-backtest one final stock signal under explicit risk constraints.
+description: Optimize and rolling-backtest one final stock signal with auditable signal-capture, cost, and risk controls.
 ---
 
 Read and follow the canonical `SKILL.md`. Keep alpha signals separate from risk factors, apply rolling targets on the next trading date, fail closed on invalid inputs or infeasible constraints, and never place live orders.
