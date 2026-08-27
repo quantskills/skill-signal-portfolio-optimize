@@ -406,8 +406,13 @@ def run_rolling_experiment(
     )
     asset_returns = load_asset_returns(str(asset_returns_file))
     if end_date is not None:
+        requested_end = normalize_date(end_date)
+        return_dates = sorted(asset_returns["date"].unique().tolist())
+        following_dates = [date for date in return_dates if date > requested_end]
+        # Keep the first execution date after the final rebalance date.
+        return_end = following_dates[0] if following_dates else requested_end
         asset_returns = asset_returns.loc[
-            asset_returns["date"].le(normalize_date(end_date))
+            asset_returns["date"].le(return_end)
         ].copy()
     returns_wide = asset_returns.pivot(
         index="date", columns="ticker", values="return"

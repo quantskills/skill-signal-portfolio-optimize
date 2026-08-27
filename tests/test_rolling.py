@@ -203,6 +203,7 @@ def test_rolling_experiment_writes_stable_outputs(tmp_path: Path) -> None:
         exposure_root=exposure_root,
         benchmark_file=benchmark_path,
         asset_returns_file=returns_path,
+        end_date="20230104",
         output_dir=output,
         transaction_cost_bps=10.0,
     )
