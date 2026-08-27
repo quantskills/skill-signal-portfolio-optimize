@@ -84,6 +84,21 @@ date? | ticker | sector
 
 The `date` column is optional. When present, only the requested date is used. Every optimization-universe ticker must have one non-empty industry label.
 
+For interval history in the form `stock_symbol | l1_code | in_date | out_date`, use
+`scripts/prepare_industry_labels.py` to produce daily labels. The adapter treats both interval
+endpoints as inclusive, rejects overlapping intervals and duplicate active labels, and records a
+coverage table and input-hash manifest. It defaults to strict `--missing-policy error`. For
+candidate-only gaps, `--missing-policy exclude` writes a filtered date/ticker candidate file and
+an exclusion audit; pass that filtered file to the optimizer. Do not pass an unfiltered candidate
+file with partial labels to a hard industry constraint run.
+
+```bash
+python scripts/prepare_industry_labels.py \
+  --history-file /path/to/industry_membership_history.parquet \
+  --universe-file /path/to/optimizer_universe.parquet \
+  --output-file /path/to/industry_labels.parquet
+```
+
 ## Style exposures
 
 Required when `constraints.style_active_ranges` or legacy `factor_active_limit` is set:

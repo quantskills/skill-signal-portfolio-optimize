@@ -4,7 +4,7 @@
 
 - Catalog status: `active`
 - Validation level: `runnable`
-- Current implementation version: `1.0.0`
+- Current implementation version: `1.1.0`; the comparison table below records the historical v1.0.0 experiment.
 - Validation claim: commands, examples, declarations, and automated tests are runnable
 - Excluded claim: this repository is not yet `verified` against a sealed holdout or independent reproduction package
 - Governance note: final community listing and validation require QuantSkills maintainer review

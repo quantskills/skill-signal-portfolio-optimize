@@ -75,6 +75,21 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 1. Read [references/input-schema.md](references/input-schema.md) before preparing inputs.
 2. Copy `examples/config.yaml` and set signal semantics and portfolio constraints.
 3. When asset covariance is unavailable, read [references/risk-model.md](references/risk-model.md). Use `scripts/build_risk_model.py` for one date or `scripts/build_rolling_risk_models.py` for resumable date-partitioned caches, using only information available through each as-of date.
+   For industry-constrained v1.1 runs, first materialize daily labels from interval history:
+
+```bash
+python scripts/prepare_industry_labels.py \
+  --history-file /path/to/industry_membership_history.parquet \
+  --universe-file /path/to/optimizer_universe.parquet \
+  --output-file /path/to/industry_labels.parquet \
+  --minimum-coverage 1.0
+```
+
+   The command fails closed by default when any requested date has incomplete coverage, overlapping
+   intervals, or duplicate active classifications. For candidate-only gaps, run it on the
+   candidate universe with --missing-policy exclude, --filtered-universe-file, and
+   --exclusions-file; pass the filtered candidate file to the optimizer. Benchmark and existing
+   holdings must still pass strict coverage. It never uses a current snapshot as historical data.
 4. Run one-date optimization:
 
 ```bash
@@ -186,6 +201,7 @@ Read [references/optimization.md](references/optimization.md) before changing ob
 
 - Estimate the open structural factors MARKET, SIZE, BETA, MOMENTUM, RESVOL, and NLSIZE from point-in-time returns and market-cap inputs. These mean market, capitalization, market sensitivity, momentum, residual volatility, and nonlinear size.
 - Add industry dummy factors only when interval-valid point-in-time classifications are available. Do not backfill a current industry snapshot into history.
+- For v1.1 industry-constrained runs, use scripts/prepare_industry_labels.py to project the same interval history into the optimizer date | ticker | sector contract. Require complete coverage for the optimization universe. If only candidates are missing labels, use --missing-policy exclude to produce a date-filtered candidate file and an exclusion audit; benchmark and existing holdings remain strict.
 - Residualize and standardize style exposures cross-sectionally, estimate factor returns by weighted regression, and combine factor covariance with specific variance.
 - Use shrinkage, eigenvalue flooring, and positive-semidefinite repair where configured; disclose every repair and effective observation count.
 - Keep factor calculation separate from portfolio constraints: a calculated factor is not automatically constrained. The example configuration requires SIZE control and leaves the other style ranges configurable.
@@ -237,7 +253,7 @@ repository.
 ## Validation Status And Limitations
 
 - Catalog status is `active`; validation level is `runnable`. The checked-in examples, validator, and test suite exercise the documented commands. Final community listing and validation still require QuantSkills maintainer review.
-- The current risk model can calculate six open market/style factors. Industry calculation and industry-neutral constraints require point-in-time interval history and are not enabled by default.
+- The current risk model can calculate six open market/style factors. v1.1 adds a strict interval-history adapter and industry-constrained configuration; industry controls still require complete point-in-time coverage and are not enabled in the backward-compatible default configuration.
 - The reported 2023-2026 results are development-period evidence on one frozen Alpha191+LightGBM signal, not a sealed holdout and not proof of general performance.
 - The rolling engine models next-trading-day target execution and configurable linear transaction costs. It does not model intraday fills, market impact, borrow, or live order routing.
 - Solver results can differ slightly by backend and numerical library. Always use the recorded backend, resolved configuration, input hashes, and constraint diagnostics when reproducing a run.

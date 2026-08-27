@@ -1,4 +1,4 @@
 interface:
   display_name: "Signal Portfolio Optimizer"
   short_description: "Turn one stock signal into risk-controlled target weights"
-  default_prompt: "Use $skill-signal-portfolio-optimize to build or consume an open Barra-style risk model, optimize my frozen stock signal with two-stage signal capture, linear cost, point-in-time exposure, turnover, tracking-error, and tradability controls, checkpoint each date, and compare equal-weight, benchmark, and optimized portfolios in a next-trading-day rolling backtest."
+  default_prompt: "Use $skill-signal-portfolio-optimize to build or consume an open Barra-style risk model, materialize and validate point-in-time industry labels when needed, optimize my frozen stock signal with two-stage signal capture, linear cost, style/industry exposure, turnover, tracking-error, and tradability controls, checkpoint each date, and compare equal-weight, benchmark, and optimized portfolios in a next-trading-day rolling backtest."

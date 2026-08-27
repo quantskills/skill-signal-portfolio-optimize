@@ -8,7 +8,7 @@ Convert one frozen cross-sectional stock signal into benchmark-relative long-onl
 | --- | --- |
 | Catalog status | `active` |
 | Validation level | `runnable` |
-| Implementation version | `1.0.0` |
+| Implementation version | `1.1.0` |
 | Python | CI uses 3.12 |
 | License | GPL-3.0-only |
 
@@ -33,6 +33,7 @@ It does not train prediction models, select alpha factors, place orders, or repr
 - Estimate an open structural risk model from historical returns and market capitalization.
 - Constrain stock weights, active weights, SIZE and other style exposures, industry exposures, turnover, tracking error, and frozen non-tradable holdings.
 - Use the v1.0.0 lexicographic objective: maximize active signal utility, preserve a minimum signal-capture ratio, then reduce linear transaction cost and weight instability.
+- v1.1.0 adds a strict point-in-time interval adapter that checks daily industry coverage before hard industry constraints are enabled.
 - Run next-trading-day rolling backtests with dynamic risk caches, resumable checkpoints, and parameter sweeps.
 - Emit target weights, risk summaries, constraint diagnostics, signal diagnostics, and hash-backed run manifests.
 
@@ -48,7 +49,7 @@ It does not train prediction models, select alpha factors, place orders, or repr
 | NLSIZE | Nonlinear size | Calculated; optional constraint |
 | INDUSTRY:* | Industry dummies | Calculated only with interval-valid point-in-time history |
 
-Calculation does not automatically enable a constraint. Configure target exposures and tolerances explicitly. Industry support is implemented but disabled by default; never backfill current classifications into historical dates when strict point-in-time interval semantics are unavailable.
+Calculation does not automatically enable a constraint. Configure target exposures and tolerances explicitly. v1.1.0 provides [industry portfolio](examples/v1.1-industry-portfolio-config.yaml) and [industry risk-model](examples/v1.1-industry-risk-model-config.yaml) examples. Industry labels are strict by default; for candidate-only gaps, use --missing-policy exclude to generate a filtered candidate file and exclusion audit. Benchmark and existing holdings still require labels; never backfill current classifications into historical dates.
 
 ## Installation
 

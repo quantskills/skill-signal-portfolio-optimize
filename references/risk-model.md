@@ -18,6 +18,13 @@ data and keep the full timing history in the manifest.
 For each return on date `t`, the estimator uses market cap and industry from the preceding
 aligned trading date. It ignores dates after the requested as-of date.
 
+For portfolio constraints, the risk-model interval history and optimizer labels must come from
+the same source file. Run `scripts/prepare_industry_labels.py` before a v1.1 experiment and
+require complete coverage for the benchmark/current-holding union and for the filtered candidate
+file. Candidate-only gaps may be handled with `--missing-policy exclude` and must be recorded in
+the exclusion audit. Do not use `industry_snapshot_non_pit` or another current snapshot to fill
+historical gaps.
+
 ## Model
 
 The open model supports:

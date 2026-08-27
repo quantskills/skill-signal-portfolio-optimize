@@ -1,0 +1,26 @@
+schema_version: 1
+industry_mode: required
+style_factors:
+  - SIZE
+  - BETA
+  - MOMENTUM
+  - RESVOL
+  - NLSIZE
+style_lookback_days: 252
+style_minimum_observations: 126
+momentum_skip_days: 21
+lookback_days: 300
+minimum_regression_periods: 120
+minimum_cross_section_assets: 200
+minimum_specific_observations: 60
+return_winsorize_mad: 8.0
+size_winsorize_mad: 5.0
+regression_weight_power: 0.5
+factor_covariance_halflife: 90.0
+specific_variance_halflife: 60.0
+factor_covariance_diagonal_shrinkage: 0.10
+specific_variance_median_shrinkage: 0.10
+annualization_periods: 252
+factor_eigenvalue_floor: 1.0e-8
+specific_variance_floor: 1.0e-6
+max_specific_imputation_fraction: 0.20
