@@ -26,6 +26,7 @@ from .cost import resolve_linear_cost_bps
 from .dynamic_risk import DynamicRiskModelCache
 from .errors import InputDataError
 from .io import (
+    DateTableCache,
     load_candidate_universe,
     load_signal,
     load_tradability,
@@ -140,13 +141,22 @@ def _select_rebalance_dates(
     start_date: object | None,
     end_date: object | None,
     rebalance_every: int,
+    table_cache: DateTableCache | None = None,
 ) -> list[str]:
     if rebalance_every <= 0:
         raise InputDataError("rebalance_every must be positive")
-    frame = read_table(signal_file)
+    frame = (
+        table_cache.read(signal_file)
+        if table_cache is not None
+        else read_table(signal_file)
+    )
     if "date" not in frame.columns:
         raise InputDataError("signal file must contain date")
-    dates = sorted({normalize_date(value) for value in frame["date"]})
+    dates = (
+        table_cache.dates(signal_file)
+        if table_cache is not None
+        else sorted({normalize_date(value) for value in frame["date"]})
+    )
     if start_date is not None:
         lower = normalize_date(start_date)
         dates = [value for value in dates if value >= lower]
@@ -163,13 +173,16 @@ def _initial_weights(
     first_date: str,
     benchmark_file: str | Path,
     initial_weights_file: str | Path | None,
+    table_cache: DateTableCache | None = None,
 ) -> pd.Series:
     if initial_weights_file is None:
         return load_weight_series(
-            benchmark_file, first_date, "benchmark_weight", "benchmark"
+            benchmark_file, first_date, "benchmark_weight", "benchmark",
+            table_cache=table_cache,
         )
     return load_weight_series(
-        initial_weights_file, first_date, "current_weight", "initial weights"
+        initial_weights_file, first_date, "current_weight", "initial weights",
+        table_cache=table_cache,
     )
 
 
@@ -357,6 +370,7 @@ def run_rolling_experiment(
     if risk_industry_file is not None and not supplied_dynamic:
         raise InputDataError("risk_industry_file requires complete dynamic risk arguments")
     portfolio_config = load_config(config_path)
+    table_cache = DateTableCache()
     risk_form = portfolio_config["covariance"]["risk_form"]
     effective_cost_bps, cost_resolution = resolve_linear_cost_bps(
         portfolio_config, transaction_cost_bps
@@ -388,6 +402,7 @@ def run_rolling_experiment(
         start_date=start_date,
         end_date=end_date,
         rebalance_every=rebalance_every,
+        table_cache=table_cache,
     )
     asset_returns = load_asset_returns(str(asset_returns_file))
     if end_date is not None:
@@ -405,7 +420,9 @@ def run_rolling_experiment(
     if positions[dates[-1]] + 1 >= len(calendar):
         raise InputDataError("last rebalance date has no following execution date")
 
-    initial = _initial_weights(dates[0], benchmark_file, initial_weights_file)
+    initial = _initial_weights(
+        dates[0], benchmark_file, initial_weights_file, table_cache=table_cache
+    )
     current = initial.copy()
     previous_target: pd.Series | None = None
     previous_date: str | None = None
@@ -464,12 +481,13 @@ def run_rolling_experiment(
             specific_variance_path: Path | None = None
             if dynamic_cache is not None:
                 candidates = (
-                    load_signal(signal_file, date).index
+                    load_signal(signal_file, date, table_cache=table_cache).index
                     if candidate_file is None
-                    else load_candidate_universe(candidate_file, date)
+                    else load_candidate_universe(candidate_file, date, table_cache=table_cache)
                 )
                 benchmark = load_weight_series(
-                    benchmark_file, date, "benchmark_weight", "benchmark"
+                    benchmark_file, date, "benchmark_weight", "benchmark",
+                    table_cache=table_cache,
                 )
                 universe = build_optimization_universe(
                     candidates, benchmark, current, tolerance
@@ -478,7 +496,7 @@ def run_rolling_experiment(
                     date, current, tolerance
                 )
                 if tradability_file is not None:
-                    load_tradability(tradability_file, date, universe)
+                    load_tradability(tradability_file, date, universe, table_cache=table_cache)
                 static_covariance = _optional_covariance_path(covariance_root, date)
                 if exposure_file is not None:
                     static_exposure = Path(exposure_file).expanduser().resolve()
@@ -644,6 +662,7 @@ def run_rolling_experiment(
                         tradability_file=tradability_file,
                         requested_date=date,
                         output_dir=build_output,
+                        table_cache=table_cache,
                     )
                     if checkpoint_path is not None:
                         _write_json(
@@ -702,7 +721,8 @@ def run_rolling_experiment(
         benchmark_targets: list[pd.DataFrame] = []
         for date in dates:
             benchmark = load_weight_series(
-                benchmark_file, date, "benchmark_weight", "benchmark"
+                benchmark_file, date, "benchmark_weight", "benchmark",
+                table_cache=table_cache,
             )
             benchmark_targets.append(
                 pd.DataFrame(
@@ -809,6 +829,7 @@ def run_rolling_experiment(
                 pd.to_numeric(diagnostics["turnover_saved"], errors="coerce").sum()
             ),
             "cost_model": cost_resolution,
+            "input_cache": table_cache.statistics(),
             "risk_cache": (
                 {"enabled": False}
                 if dynamic_cache is None
@@ -869,6 +890,7 @@ def run_rolling_experiment(
             "exposure_inputs": exposure_inputs,
             "factor_risk_inputs": factor_risk_inputs,
             "risk_resolutions": risk_resolutions,
+            "input_cache": table_cache.statistics(),
             "dynamic_risk": (
                 {"enabled": False}
                 if dynamic_cache is None

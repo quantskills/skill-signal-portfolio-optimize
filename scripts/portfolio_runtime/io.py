@@ -13,6 +13,74 @@ from .errors import InputDataError
 SUPPORTED_SUFFIXES = {".csv", ".parquet", ".pq"}
 
 
+class DateTableCache:
+    """Cache input tables and normalized date partitions for rolling runs."""
+
+    def __init__(self) -> None:
+        self._frames: dict[Path, tuple[pd.DataFrame, dict[str, np.ndarray] | None]] = {}
+        self._requests = 0
+        self._loads = 0
+        self._hits = 0
+
+    def read(self, path: str | Path) -> pd.DataFrame:
+        file_path = Path(path).expanduser().resolve()
+        self._requests += 1
+        cached = self._frames.get(file_path)
+        if cached is not None:
+            self._hits += 1
+            return cached[0]
+        frame = read_table(file_path)
+        positions: dict[str, np.ndarray] | None = None
+        if "date" in frame.columns:
+            positions = {}
+            normalized = frame["date"].map(normalize_date)
+            row_numbers = pd.Series(np.arange(len(frame), dtype=np.intp))
+            for date, rows in row_numbers.groupby(normalized.to_numpy(), sort=False):
+                positions[str(date)] = rows.to_numpy(dtype=np.intp, copy=True)
+        self._frames[file_path] = (frame, positions)
+        self._loads += 1
+        return frame
+
+    def select(
+        self,
+        path: str | Path,
+        requested_date: str,
+        label: str,
+        *,
+        date_optional: bool = False,
+    ) -> pd.DataFrame:
+        file_path = Path(path).expanduser().resolve()
+        frame = self.read(file_path)
+        positions = self._frames[file_path][1]
+        if positions is None:
+            if date_optional:
+                return frame.copy()
+            raise InputDataError(f"{label} missing column: date")
+        rows = positions.get(requested_date)
+        if rows is None or len(rows) == 0:
+            raise InputDataError(f"{label} has no rows for {requested_date}")
+        selected = frame.iloc[rows].copy()
+        selected["date"] = requested_date
+        return selected
+
+    def dates(self, path: str | Path) -> list[str]:
+        file_path = Path(path).expanduser().resolve()
+        self.read(file_path)
+        positions = self._frames[file_path][1]
+        if positions is None:
+            raise InputDataError("table has no date column")
+        return sorted(positions)
+
+    def statistics(self) -> dict[str, int | bool]:
+        return {
+            "enabled": True,
+            "cached_file_count": len(self._frames),
+            "file_load_count": self._loads,
+            "cache_hit_count": self._hits,
+            "request_count": self._requests,
+        }
+
+
 def normalize_date(value: object) -> str:
     if value is None or pd.isna(value):
         raise InputDataError("date cannot be missing")
@@ -87,6 +155,30 @@ def select_date_rows(
     return selected
 
 
+
+def _select_table_rows(
+    path: str | Path,
+    requested_date: str,
+    label: str,
+    *,
+    date_optional: bool = False,
+    table_cache: DateTableCache | None = None,
+) -> pd.DataFrame:
+    if table_cache is None:
+        return select_date_rows(
+            read_table(path),
+            requested_date,
+            label,
+            date_optional=date_optional,
+        )
+    return table_cache.select(
+        path,
+        requested_date,
+        label,
+        date_optional=date_optional,
+    )
+
+
 def _normalize_index(frame: pd.DataFrame, label: str) -> pd.DataFrame:
     _require_columns(frame, ["ticker"], label)
     result = frame.copy()
@@ -98,8 +190,13 @@ def _normalize_index(frame: pd.DataFrame, label: str) -> pd.DataFrame:
     return result.set_index("ticker", drop=True)
 
 
-def load_signal(path: str | Path, requested_date: str) -> pd.Series:
-    frame = select_date_rows(read_table(path), requested_date, "signal")
+def load_signal(
+    path: str | Path,
+    requested_date: str,
+    *,
+    table_cache: DateTableCache | None = None,
+) -> pd.Series:
+    frame = _select_table_rows(path, requested_date, "signal", table_cache=table_cache)
     _require_columns(frame, ["ticker", "prediction"], "signal")
     unexpected = set(frame.columns) - {"date", "ticker", "prediction"}
     if unexpected:
@@ -116,8 +213,15 @@ def load_signal(path: str | Path, requested_date: str) -> pd.Series:
     return values.astype(float).sort_index()
 
 
-def load_candidate_universe(path: str | Path, requested_date: str) -> pd.Index:
-    frame = select_date_rows(read_table(path), requested_date, "candidate universe")
+def load_candidate_universe(
+    path: str | Path,
+    requested_date: str,
+    *,
+    table_cache: DateTableCache | None = None,
+) -> pd.Index:
+    frame = _select_table_rows(
+        path, requested_date, "candidate universe", table_cache=table_cache
+    )
     _require_columns(frame, ["ticker"], "candidate universe")
     indexed = _normalize_index(frame[["ticker"]], "candidate universe")
     if len(indexed.index) == 0:
@@ -133,8 +237,9 @@ def load_weight_series(
     universe: pd.Index | None = None,
     *,
     require_complete: bool = False,
+    table_cache: DateTableCache | None = None,
 ) -> pd.Series:
-    frame = select_date_rows(read_table(path), requested_date, label)
+    frame = _select_table_rows(path, requested_date, label, table_cache=table_cache)
     _require_columns(frame, ["ticker", value_column], label)
     indexed = _normalize_index(frame[["ticker", value_column]], label)
     values = pd.to_numeric(indexed[value_column], errors="coerce")
@@ -154,8 +259,10 @@ def load_labels(
     value_column: str,
     label: str,
     universe: pd.Index,
+    *,
+    table_cache: DateTableCache | None = None,
 ) -> pd.Series:
-    frame = select_date_rows(read_table(path), requested_date, label, date_optional=True)
+    frame = _select_table_rows(path, requested_date, label, date_optional=True, table_cache=table_cache)
     _require_columns(frame, ["ticker", value_column], label)
     indexed = _normalize_index(frame[["ticker", value_column]], label)
     missing = universe.difference(indexed.index)
@@ -172,8 +279,12 @@ def load_exposures(
     requested_date: str,
     universe: pd.Index,
     required_factors: set[str] | None = None,
+    *,
+    table_cache: DateTableCache | None = None,
 ) -> pd.DataFrame:
-    frame = select_date_rows(read_table(path), requested_date, "exposures", date_optional=True)
+    frame = _select_table_rows(
+        path, requested_date, "exposures", date_optional=True, table_cache=table_cache
+    )
     if "ticker" not in frame.columns and frame.index.name == "ticker":
         frame = frame.reset_index()
     _require_columns(frame, ["ticker"], "exposures")
@@ -209,9 +320,15 @@ def load_exposures(
 
 
 def load_tradability(
-    path: str | Path, requested_date: str, universe: pd.Index
+    path: str | Path,
+    requested_date: str,
+    universe: pd.Index,
+    *,
+    table_cache: DateTableCache | None = None,
 ) -> pd.Series:
-    frame = select_date_rows(read_table(path), requested_date, "tradability", date_optional=True)
+    frame = _select_table_rows(
+        path, requested_date, "tradability", date_optional=True, table_cache=table_cache
+    )
     _require_columns(frame, ["ticker", "tradable"], "tradability")
     indexed = _normalize_index(frame[["ticker", "tradable"]], "tradability")
     missing = universe.difference(indexed.index)

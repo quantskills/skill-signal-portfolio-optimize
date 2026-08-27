@@ -8,7 +8,7 @@ Convert one frozen cross-sectional stock signal into benchmark-relative long-onl
 | --- | --- |
 | Catalog status | `active` |
 | Validation level | `runnable` |
-| Implementation version | `1.1.0` |
+| Implementation version | `1.2.0` |
 | Python | CI uses 3.12 |
 | License | GPL-3.0-only |
 
@@ -35,6 +35,7 @@ It does not train prediction models, select alpha factors, place orders, or repr
 - Use the v1.0.0 lexicographic objective: maximize active signal utility, preserve a minimum signal-capture ratio, then reduce linear transaction cost and weight instability.
 - v1.1.0 adds a strict point-in-time interval adapter that checks daily industry coverage before hard industry constraints are enabled.
 - Run next-trading-day rolling backtests with dynamic risk caches, resumable checkpoints, and parameter sweeps.
+- v1.2.0 caches repeated rolling input tables in-process and slices them by date without changing optimization semantics.
 - Emit target weights, risk summaries, constraint diagnostics, signal diagnostics, and hash-backed run manifests.
 
 ## Risk Factors

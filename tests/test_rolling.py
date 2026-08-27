@@ -235,6 +235,9 @@ def test_rolling_experiment_writes_stable_outputs(tmp_path: Path) -> None:
         "20230102",
         "20230104",
     ]
+    assert manifest["input_cache"]["enabled"] is True
+    assert manifest["input_cache"]["file_load_count"] >= 3
+    assert manifest["input_cache"]["cache_hit_count"] > 0
 
 
 def test_rolling_rejects_exposure_file_and_root_together(tmp_path: Path) -> None:
@@ -249,3 +252,26 @@ def test_rolling_rejects_exposure_file_and_root_together(tmp_path: Path) -> None
             exposure_root=tmp_path / "risk",
             output_dir=tmp_path / "output",
         )
+
+
+
+def test_date_table_cache_reuses_file_and_preserves_date_slices(tmp_path: Path) -> None:
+    from portfolio_runtime.io import DateTableCache, load_signal
+
+    path = tmp_path / "signal.parquet"
+    pd.DataFrame(
+        {
+            "date": [20230102, 20230102, 20230103],
+            "ticker": ["A", "B", "A"],
+            "prediction": [1.0, 2.0, 3.0],
+        }
+    ).to_parquet(path, index=False)
+    cache = DateTableCache()
+
+    first = load_signal(path, "20230102", table_cache=cache)
+    second = load_signal(path, "20230103", table_cache=cache)
+
+    assert first.to_dict() == {"A": 1.0, "B": 2.0}
+    assert second.to_dict() == {"A": 3.0}
+    assert cache.statistics()["file_load_count"] == 1
+    assert cache.statistics()["cache_hit_count"] == 1

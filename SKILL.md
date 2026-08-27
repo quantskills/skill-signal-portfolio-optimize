@@ -67,6 +67,7 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 - Run rolling optimization with drifted current holdings and next-trading-day target execution.
 - Reuse complete static risk files and dynamically rebuild exact risk coverage when carried holdings expand the optimization universe.
 - Persist input-signed date checkpoints so interrupted rolling experiments can resume safely.
+- v1.2 caches repeated rolling input tables in-process and partitions them by normalized date; this is a performance optimization only and does not change signal, risk, or execution semantics.
 - Fail closed on missing covariance coverage, invalid weights, infeasible constraints, or non-finite inputs.
 - Produce target weights, `optimization_summary.json`, and machine-readable diagnostics; do not place orders.
 

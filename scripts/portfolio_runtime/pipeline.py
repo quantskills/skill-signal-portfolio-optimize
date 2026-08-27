@@ -19,6 +19,7 @@ from .cost import resolve_linear_cost_bps
 from .diagnostics import constraint_report, portfolio_metrics
 from .errors import InputDataError
 from .io import (
+    DateTableCache,
     load_candidate_universe,
     load_covariance,
     load_exposures,
@@ -141,6 +142,7 @@ def run_single_date(
     specific_variance_file: str | Path | None = None,
     transaction_cost_bps: float | None = None,
     tradability_file: str | Path | None = None,
+    table_cache: DateTableCache | None = None,
 ) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     date = normalize_date(requested_date)
@@ -148,7 +150,7 @@ def run_single_date(
     effective_cost_bps, cost_resolution = resolve_linear_cost_bps(
         config, transaction_cost_bps
     )
-    signal = load_signal(signal_file, date)
+    signal = load_signal(signal_file, date, table_cache=table_cache)
     calibrated_signal, signal_diagnostics = calibrate_signal(
         signal, config["signal"], date
     )
@@ -156,7 +158,7 @@ def run_single_date(
     candidates = (
         pd.Index(signal.index, name="ticker")
         if candidate_file is None
-        else load_candidate_universe(candidate_file, date)
+        else load_candidate_universe(candidate_file, date, table_cache=table_cache)
     )
     missing_candidates = candidates.difference(signal.index)
     if len(missing_candidates):
@@ -166,7 +168,7 @@ def run_single_date(
         )
 
     benchmark_input = load_weight_series(
-        benchmark_file, date, "benchmark_weight", "benchmark"
+        benchmark_file, date, "benchmark_weight", "benchmark", table_cache=table_cache
     )
     _validate_weight_vector(
         benchmark_input,
@@ -178,7 +180,8 @@ def run_single_date(
     current_input = None
     if current_weights_file is not None:
         current_input = load_weight_series(
-            current_weights_file, date, "current_weight", "current weights"
+            current_weights_file, date, "current_weight", "current weights",
+            table_cache=table_cache,
         )
         _validate_weight_vector(
             current_input,
@@ -205,7 +208,7 @@ def run_single_date(
             "sector_file is required when an industry constraint is configured"
         )
     sectors = None if sector_file is None else load_labels(
-        sector_file, date, "sector", "sectors", universe
+        sector_file, date, "sector", "sectors", universe, table_cache=table_cache
     )
 
     style_constraint = (
@@ -224,12 +227,12 @@ def run_single_date(
             if specification.get("enabled", False)
         }
     exposures = None if exposure_file is None else load_exposures(
-        exposure_file, date, universe, required_factors
+        exposure_file, date, universe, required_factors, table_cache=table_cache
     )
 
     tradable = pd.Series(True, index=universe, name="tradable", dtype=bool)
     if tradability_file is not None:
-        tradable = load_tradability(tradability_file, date, universe)
+        tradable = load_tradability(tradability_file, date, universe, table_cache=table_cache)
     if (~tradable).any() and current is None:
         raise InputDataError("current_weights_file is required for non-tradable assets")
 
