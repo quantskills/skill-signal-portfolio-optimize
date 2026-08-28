@@ -8,7 +8,7 @@
 | --- | --- |
 | Catalog 状态 | `active` |
 | 验证等级 | `runnable` |
-| 实现版本 | `1.2.0` |
+| 实现版本 | `1.3.0` |
 | Python | CI 使用 3.12 |
 | 许可证 | GPL-3.0-only |
 
@@ -35,6 +35,7 @@
 - v1.1.0 增加严格点时行业区间适配器，按每日覆盖率校验后才能启用行业主动权重约束。
 - 支持下一交易日生效的滚动回测、动态风险缓存、断点续跑和参数扫描。
 - v1.2.0 在滚动进程内缓存并按日期切片重复输入表，减少重复 Parquet 读取；不改变优化语义。
+- v1.3.0 增加独立的 `stockdemo-compatible` 交易执行器，复现 TWAP、次日执行、`keep=0.8`、交易手数、现金、ST/涨跌停过滤和原始指标口径；旧 `native` 回测保持不变。
 - 输出目标权重、风险摘要、约束诊断、信号诊断和带输入哈希的运行清单。
 
 ## 风险因子
@@ -123,6 +124,23 @@ python scripts/run_rolling_experiment.py \
 ```
 
 动态风险建模、因子形式输入、缓存签名和断点续跑参数见 [references/risk-model.md](references/risk-model.md) 与 [references/backtest-contract.md](references/backtest-contract.md)。
+
+## Stockdemo 兼容回测
+
+优化器输出的是目标权重，而 `stockdemo` 的原始回测会根据持仓、现金、交易手数和可交易状态生成订单。v1.3.0 提供独立执行命令，保证 Barra 核心与回测执行层解耦：
+
+```bash
+python scripts/run_stockdemo_compat_backtest.py \
+  --market-file /path/to/stockdemo_market.parquet \
+  --signal-file /path/to/frozen_signal.parquet \
+  --target-weights-file /path/to/rebalance_weights.parquet \
+  --benchmark-file /path/to/benchmark.parquet \
+  --start-date 20230104 --end-date 20260121 \
+  --portfolio both \
+  --output-dir outputs/stockdemo_compat
+```
+
+`--portfolio signal` 运行严格 Top200/`keep` 基线，`--portfolio target` 执行指定的 Barra 目标权重，`both` 会分别写入 `signal_baseline/` 和 `risk_optimized/`。行情至少需要 `date,ticker,open,close,pre_close,is_open,is_st`；`twap` 缺失时按 `stockdemo` 回退到开盘价，可选 `adj_factor` 会按原规则调整成交和估值价格。完整字段和复现边界见 [references/stockdemo-compat.md](references/stockdemo-compat.md)。
 
 ## 验证
 

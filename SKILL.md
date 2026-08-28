@@ -68,6 +68,7 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 - Reuse complete static risk files and dynamically rebuild exact risk coverage when carried holdings expand the optimization universe.
 - Persist input-signed date checkpoints so interrupted rolling experiments can resume safely.
 - v1.2 caches repeated rolling input tables in-process and partitions them by normalized date; this is a performance optimization only and does not change signal, risk, or execution semantics.
+- v1.3 adds an isolated `stockdemo-compatible` order-level replay path. It does not change Barra calculations or the legacy `native` return backtest.
 - Fail closed on missing covariance coverage, invalid weights, infeasible constraints, or non-finite inputs.
 - Produce target weights, `optimization_summary.json`, and machine-readable diagnostics; do not place orders.
 
@@ -122,6 +123,27 @@ python scripts/run_rolling_experiment.py \
   --transaction-cost-bps 7 \
   --output-dir /path/to/rolling_output
 ```
+
+To compare against the original stockdemo execution semantics without changing the
+optimizer, replay the frozen signal and/or the optimizer target weights with:
+
+```bash
+python scripts/run_stockdemo_compat_backtest.py \
+  --market-file /path/to/stockdemo_market.parquet \
+  --signal-file /path/to/frozen_signal.parquet \
+  --target-weights-file /path/to/rebalance_weights.parquet \
+  --benchmark-file /path/to/benchmark.parquet \
+  --start-date 20230104 --end-date 20260121 \
+  --portfolio both \
+  --output-dir /path/to/stockdemo_compat_output
+```
+
+Use `--portfolio signal` for the Top200/`keep=0.8` baseline and `--portfolio target` for
+an existing `risk_optimized` target-weight stream. The command uses TWAP (falling back to
+open when unavailable), next-day
+execution, 100/200-share lots, cash and fee accounting, ST/limit filters, and the
+stockdemo-style metric calculation. It requires the raw market fields documented in
+[references/stockdemo-compat.md](references/stockdemo-compat.md).
 
 For rolling optimization whose current holdings can move outside a prebuilt static risk
 universe, enable exact-universe dynamic risk and persistent checkpoints:
@@ -250,6 +272,11 @@ Write these stable artifacts for a successful run:
 Single-date output contains target weights, not executable orders. Rolling output contains a
 research backtest, not broker fills. Keep production data and experiment outputs outside this
 repository.
+
+The stockdemo-compatible command additionally writes `stats.csv`, `transaction.csv`,
+`holdings.csv`, and `summary.json` under the requested output directory. Treat numerical
+parity as established only after comparing these files with the original stockdemo run on
+a small fixture using the same input data.
 
 ## Validation Status And Limitations
 

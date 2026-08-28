@@ -8,7 +8,7 @@ Convert one frozen cross-sectional stock signal into benchmark-relative long-onl
 | --- | --- |
 | Catalog status | `active` |
 | Validation level | `runnable` |
-| Implementation version | `1.2.0` |
+| Implementation version | `1.3.0` |
 | Python | CI uses 3.12 |
 | License | GPL-3.0-only |
 
@@ -36,6 +36,7 @@ It does not train prediction models, select alpha factors, place orders, or repr
 - v1.1.0 adds a strict point-in-time interval adapter that checks daily industry coverage before hard industry constraints are enabled.
 - Run next-trading-day rolling backtests with dynamic risk caches, resumable checkpoints, and parameter sweeps.
 - v1.2.0 caches repeated rolling input tables in-process and slices them by date without changing optimization semantics.
+- v1.3.0 adds an isolated `stockdemo-compatible` execution engine for TWAP, next-day execution, `keep=0.8`, lots, cash, ST/limit filters, and stockdemo metric semantics; the legacy `native` backtest remains unchanged.
 - Emit target weights, risk summaries, constraint diagnostics, signal diagnostics, and hash-backed run manifests.
 
 ## Risk Factors
@@ -124,6 +125,23 @@ python scripts/run_rolling_experiment.py \
 ```
 
 See [references/risk-model.md](references/risk-model.md) and [references/backtest-contract.md](references/backtest-contract.md) for factor-form risk, dynamic rebuilding, cache signatures, and resumable checkpoints.
+
+## Stockdemo-compatible backtest
+
+The optimizer emits target weights, while the original stockdemo backtest generates orders from holdings, cash, lots, and tradability. v1.3.0 keeps that execution layer separate from Barra logic:
+
+```bash
+python scripts/run_stockdemo_compat_backtest.py \
+  --market-file /path/to/stockdemo_market.parquet \
+  --signal-file /path/to/frozen_signal.parquet \
+  --target-weights-file /path/to/rebalance_weights.parquet \
+  --benchmark-file /path/to/benchmark.parquet \
+  --start-date 20230104 --end-date 20260121 \
+  --portfolio both \
+  --output-dir outputs/stockdemo_compat
+```
+
+Use `--portfolio signal` for the Top200/`keep` baseline, `--portfolio target` for Barra target weights, or `both` for separate `signal_baseline/` and `risk_optimized/` outputs. The market table needs `date,ticker,open,close,pre_close,is_open,is_st`; a missing `twap` falls back to open as in stockdemo, and `adj_factor` is optional. See [references/stockdemo-compat.md](references/stockdemo-compat.md) for the complete contract.
 
 ## Validation
 
