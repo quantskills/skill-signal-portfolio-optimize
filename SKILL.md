@@ -69,6 +69,7 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 - Persist input-signed date checkpoints so interrupted rolling experiments can resume safely.
 - v1.2 caches repeated rolling input tables in-process and partitions them by normalized date; this is a performance optimization only and does not change signal, risk, or execution semantics.
 - v1.3 adds an isolated `stockdemo-compatible` order-level replay path. It does not change Barra calculations or the legacy `native` return backtest.
+- v1.3.1 can explicitly feed Stockdemo-executed closing holdings into the next rolling optimization; omitting the market flag preserves theoretical-drift behavior.
 - Fail closed on missing covariance coverage, invalid weights, infeasible constraints, or non-finite inputs.
 - Produce target weights, `optimization_summary.json`, and machine-readable diagnostics; do not place orders.
 
@@ -123,6 +124,8 @@ python scripts/run_rolling_experiment.py \
   --transaction-cost-bps 7 \
   --output-dir /path/to/rolling_output
 ```
+
+Add `--stockdemo-market-file /path/to/market.parquet` to this command only when actual next-day Stockdemo fills must become the next date current holdings. This mode writes `execution_feedback.parquet` and `stockdemo_compat/`; inspect `actual_cash_weight` because the optimizer normalizes the executed stock sleeve to one.
 
 To compare against the original stockdemo execution semantics without changing the
 optimizer, replay the frozen signal and/or the optimizer target weights with:
@@ -251,7 +254,7 @@ This is a transparent Barra-style implementation. It does not reproduce MSCI Bar
 - Require benchmark weights to sum to one within configured tolerance.
 - Repair small covariance asymmetry and negative eigenvalues, and disclose the repair in diagnostics.
 - Treat position, industry, market-cap, configurable style, turnover, tracking-error, and tradability limits as testable constraints.
-- Treat `candidate_weight_range` as a hard aggregate-weight range over the supplied candidate universe, not as a filter on benchmark or carried names.
+- Treat `candidate_weight_range` as a hard aggregate-weight range over the supplied candidate universe, not as a filter on benchmark or carried names. When a non-tradable outside-candidate holding is frozen, reduce only the candidate range to its attainable maximum and disclose configured and effective bounds.
 - Freeze a non-tradable asset at its current weight; fail if that current weight is unavailable. If market drift already pushed that frozen weight beyond a stock bound, preserve the executable freeze, disclose a frozen-bound exception, and keep the bound strict for every tradable asset.
 - Under schema versions 3 through 5, never assign a neutral score to a tradable optimization asset with a missing prediction; only a positive non-tradable frozen holding is exempt.
 - Never silently replace a failed optimization with equal weights.

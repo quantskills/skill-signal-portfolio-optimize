@@ -8,7 +8,7 @@ Convert one frozen cross-sectional stock signal into benchmark-relative long-onl
 | --- | --- |
 | Catalog status | `active` |
 | Validation level | `runnable` |
-| Implementation version | `1.3.0` |
+| Implementation version | `1.3.1` |
 | Python | CI uses 3.12 |
 | License | GPL-3.0-only |
 
@@ -125,6 +125,8 @@ python scripts/run_rolling_experiment.py \
 ```
 
 See [references/risk-model.md](references/risk-model.md) and [references/backtest-contract.md](references/backtest-contract.md) for factor-form risk, dynamic rebuilding, cache signatures, and resumable checkpoints.
+
+Add `--stockdemo-market-file /path/to/stockdemo_market.parquet` to the same command when the next optimization must consume holdings actually executed by Stockdemo rules instead of theoretically drifted targets. `--stockdemo-transaction` and `--stockdemo-initial-cash` override the legacy defaults. This mode additionally writes `execution_feedback.parquet` and `stockdemo_compat/`; cash is disclosed separately and risk constraints use actual stock holdings normalized by stock market value. Omitting the flag preserves the existing rolling behavior.
 
 ## Stockdemo-compatible backtest
 

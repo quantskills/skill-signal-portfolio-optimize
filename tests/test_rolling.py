@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import sys
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from portfolio_runtime.backtest import (  # noqa: E402
     backtest_targets,
     summarize_backtest,
 )
+from portfolio_runtime.config import DEFAULT_CONFIG  # noqa: E402
 from portfolio_runtime.errors import InputDataError  # noqa: E402
 from portfolio_runtime.rolling import ROLLING_OUTPUT_FILES, run_rolling_experiment  # noqa: E402
 
@@ -276,3 +278,108 @@ def test_date_table_cache_reuses_file_and_preserves_date_slices(tmp_path: Path) 
     assert second.to_dict() == {"A": 3.0}
     assert cache.statistics()["file_load_count"] == 1
     assert cache.statistics()["cache_hit_count"] == 1
+
+
+def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path) -> None:
+    dates = [20230102, 20230103, 20230104, 20230105]
+    rebalance_dates = dates[:-1]
+    tickers = ["000001.SZ", "000002.SZ"]
+    signal = pd.DataFrame(
+        [
+            {
+                "date": date,
+                "ticker": ticker,
+                "prediction": float(2 - ticker_index + date_index),
+            }
+            for date_index, date in enumerate(rebalance_dates)
+            for ticker_index, ticker in enumerate(tickers)
+        ]
+    )
+    benchmark = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "benchmark_weight": 0.5}
+            for date in rebalance_dates
+            for ticker in tickers
+        ]
+    )
+    returns = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "return": 0.001 * (index + 1)}
+            for date in dates
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    market = pd.DataFrame(
+        [
+            {
+                "date": date,
+                "ticker": ticker,
+                "open": 100.0 + 10.0 * index,
+                "close": (100.0 + 10.0 * index) * (1.0 + 0.001 * date_index),
+                "pre_close": 100.0 + 10.0 * index,
+                "twap": 100.0 + 10.0 * index,
+                "is_open": True,
+                "is_st": False,
+                "adj_factor": 1.0,
+            }
+            for date_index, date in enumerate(rebalance_dates)
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    signal_path = tmp_path / "signal.parquet"
+    benchmark_path = tmp_path / "benchmark.parquet"
+    returns_path = tmp_path / "returns.parquet"
+    market_path = tmp_path / "market.parquet"
+    covariance_path = tmp_path / "covariance.parquet"
+    config_path = tmp_path / "config.yaml"
+    signal.to_parquet(signal_path, index=False)
+    benchmark.to_parquet(benchmark_path, index=False)
+    returns.to_parquet(returns_path, index=False)
+    market.to_parquet(market_path, index=False)
+    pd.DataFrame(np.eye(2) * 0.10, index=tickers, columns=tickers).to_parquet(
+        covariance_path
+    )
+    config = deepcopy(DEFAULT_CONFIG)
+    config["constraints"].update(
+        {"max_weight": 0.80, "max_active_weight": 0.50}
+    )
+    config["baseline"]["top_n"] = 2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    output = tmp_path / "execution_output"
+    result = run_rolling_experiment(
+        config_path=config_path,
+        signal_file=signal_path,
+        covariance_root=covariance_path,
+        benchmark_file=benchmark_path,
+        asset_returns_file=returns_path,
+        stockdemo_market_file=market_path,
+        output_dir=output,
+    )
+
+    assert result["stockdemo_compat"]["status"] == "success"
+    assert result["stockdemo_compat"]["output_dir"] == str(
+        output / "stockdemo_compat"
+    )
+    feedback = pd.read_parquet(output / "execution_feedback.parquet")
+    assert feedback["target_date"].dropna().tolist() == ["20230102", "20230103"]
+    diagnostics = pd.read_parquet(output / "optimization_diagnostics.parquet")
+    assert diagnostics["current_state_source"].tolist() == [
+        "configured_initial_or_theoretical_drift",
+        "stockdemo_actual",
+        "stockdemo_actual",
+    ]
+    assert diagnostics["actual_cash_weight"].iloc[1:].notna().all()
+    stats = pd.read_csv(output / "stockdemo_compat" / "stats.csv")
+    assert stats["unrealized_pnl"].iloc[-1] == pytest.approx(
+        feedback["unrealized_pnl"].iloc[-1]
+    )
+    manifest = json.loads((output / "rolling_manifest.json").read_text())
+    assert manifest["execution_feedback"]["enabled"] is True
+    assert manifest["execution_feedback"]["summary"]["output_dir"] == str(
+        output / "stockdemo_compat"
+    )
+    stockdemo_summary = json.loads(
+        (output / "stockdemo_compat" / "summary.json").read_text()
+    )
+    assert stockdemo_summary["output_dir"] == str(output / "stockdemo_compat")

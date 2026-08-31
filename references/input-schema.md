@@ -26,7 +26,7 @@ Optional long-form CSV or Parquet:
 date | ticker
 ```
 
-Candidates must be a non-empty subset of the full signal on each requested date. When no candidate file is supplied, every full-signal ticker is a candidate for backward compatibility. The optimization universe is the union of candidates, positive benchmark weights, and positive current holdings; full-signal names outside that union are used only for calibration. `constraints.candidate_weight_range` optionally places an absolute lower and/or upper bound on the sum of candidate target weights.
+Candidates must be a non-empty subset of the full signal on each requested date. When no candidate file is supplied, every full-signal ticker is a candidate for backward compatibility. The optimization universe is the union of candidates, positive benchmark weights, and positive current holdings; full-signal names outside that union are used only for calibration. `constraints.candidate_weight_range` optionally places an absolute lower and/or upper bound on the sum of candidate target weights. If a positive non-tradable current holding lies outside the candidate set, the runtime reduces an otherwise unattainable candidate minimum/maximum to `1 - frozen_outside_candidate_weight` and reports both configured and effective ranges; no other constraint is relaxed.
 
 ## Risk input modes
 

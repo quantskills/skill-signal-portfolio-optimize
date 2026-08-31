@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep", type=float, default=0.8)
     parser.add_argument("--transaction", type=float, default=1.4)
     parser.add_argument("--initial-cash", type=float, default=100_000_000.0)
+    parser.add_argument(
+        "--include-final-next-execution",
+        action="store_true",
+        help="Retain the v1.3 window instead of the exact stockdemo end-date window.",
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser.parse_args()
 
@@ -82,6 +87,7 @@ def main() -> int:
         keep=args.keep,
         transaction=args.transaction,
         initial_cash=args.initial_cash,
+        exact_window=not args.include_final_next_execution,
     )
     try:
         market = load_stockdemo_market(

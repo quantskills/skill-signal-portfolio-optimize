@@ -8,7 +8,7 @@
 | --- | --- |
 | Catalog 状态 | `active` |
 | 验证等级 | `runnable` |
-| 实现版本 | `1.3.0` |
+| 实现版本 | `1.3.1` |
 | Python | CI 使用 3.12 |
 | 许可证 | GPL-3.0-only |
 
@@ -124,6 +124,8 @@ python scripts/run_rolling_experiment.py \
 ```
 
 动态风险建模、因子形式输入、缓存签名和断点续跑参数见 [references/risk-model.md](references/risk-model.md) 与 [references/backtest-contract.md](references/backtest-contract.md)。
+
+如需让下一日优化读取 Stockdemo 实际成交持仓，而不是上一日理论目标漂移权重，在同一命令中增加 `--stockdemo-market-file /path/to/stockdemo_market.parquet`。可用 `--stockdemo-transaction` 和 `--stockdemo-initial-cash` 覆盖原始参数。该模式额外写出 `execution_feedback.parquet` 和 `stockdemo_compat/`；现金单独披露，风险约束使用按股票市值归一化的实际持仓。默认不提供该参数时，旧滚动行为保持不变。
 
 ## Stockdemo 兼容回测
 

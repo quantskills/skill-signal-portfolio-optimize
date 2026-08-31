@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,13 @@ from .io import (
 )
 from .pipeline import OUTPUT_FILES as SINGLE_DATE_OUTPUT_FILES
 from .pipeline import build_optimization_universe, run_single_date
+from .stockdemo_compat import (
+    StockDemoExecutionConfig,
+    StockDemoPortfolioState,
+    advance_stockdemo_state,
+    load_stockdemo_market,
+    run_stockdemo_compat,
+)
 
 
 ROLLING_OUTPUT_FILES = (
@@ -351,6 +359,10 @@ def run_rolling_experiment(
     risk_industry_file: str | Path | None = None,
     dynamic_risk_cache_root: str | Path | None = None,
     checkpoint_root: str | Path | None = None,
+    stockdemo_market_file: str | Path | None = None,
+    stockdemo_transaction: float = 1.4,
+    stockdemo_initial_cash: float = 100_000_000.0,
+    stockdemo_missing_target_policy: str = "error",
 ) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     if exposure_file is not None and exposure_root is not None:
@@ -425,6 +437,62 @@ def run_rolling_experiment(
     if positions[dates[-1]] + 1 >= len(calendar):
         raise InputDataError("last rebalance date has no following execution date")
 
+    execution_config: StockDemoExecutionConfig | None = None
+    execution_market: pd.DataFrame | None = None
+    execution_by_date: dict[str, pd.DataFrame] = {}
+    execution_market_dates: list[str] = []
+    execution_market_positions: dict[str, int] = {}
+    execution_state: StockDemoPortfolioState | None = None
+    execution_feedback_rows: list[dict[str, Any]] = []
+    execution_market_fingerprint: str | None = None
+    if stockdemo_market_file is not None:
+        if len(dates) < 2:
+            raise InputDataError(
+                "stockdemo execution feedback requires at least two rebalance dates"
+            )
+        execution_config = StockDemoExecutionConfig(
+            transaction=float(stockdemo_transaction),
+            initial_cash=float(stockdemo_initial_cash),
+            exact_window=True,
+            missing_target_policy=stockdemo_missing_target_policy,
+        )
+        execution_config.validate()
+        execution_market = load_stockdemo_market(
+            stockdemo_market_file, start_date=dates[0], end_date=dates[-1]
+        )
+        execution_by_date = {
+            value: group.set_index("ticker")
+            for value, group in execution_market.groupby("date", sort=True)
+        }
+        execution_market_dates = sorted(execution_by_date)
+        execution_market_positions = {
+            value: index for index, value in enumerate(execution_market_dates)
+        }
+        missing_market_dates = [value for value in dates if value not in execution_market_positions]
+        if missing_market_dates:
+            raise InputDataError(
+                "rebalance dates are absent from stockdemo market: "
+                f"{missing_market_dates[:10]}"
+            )
+        execution_state = StockDemoPortfolioState.initial(execution_config.initial_cash)
+        market_path = Path(stockdemo_market_file).expanduser().resolve()
+        market_files = (
+            [market_path]
+            if market_path.is_file()
+            else sorted(market_path.glob("*.parquet"))
+            + sorted(market_path.glob("*.csv"))
+        )
+        execution_market_fingerprint = _canonical_hash(
+            [
+                {
+                    "path": str(path),
+                    "size": path.stat().st_size,
+                    "mtime_ns": path.stat().st_mtime_ns,
+                }
+                for path in market_files
+            ]
+        )
+
     initial = _initial_weights(
         dates[0], benchmark_file, initial_weights_file, table_cache=table_cache
     )
@@ -464,10 +532,54 @@ def run_rolling_experiment(
         "exposure_file_sha256": (
             None if exposure_file is None else sha256_file(exposure_file)
         ),
+        "stockdemo_market_fingerprint": execution_market_fingerprint,
+        "stockdemo_transaction": (
+            None if execution_config is None else execution_config.transaction
+        ),
     }
     try:
         for position, date in enumerate(dates, start=1):
-            if previous_target is not None and previous_date is not None:
+            feedback_cash_weight: float | None = None
+            if (
+                execution_state is not None
+                and execution_config is not None
+                and previous_target is not None
+                and previous_date is not None
+            ):
+                previous_market_position = execution_market_positions[previous_date]
+                current_market_position = execution_market_positions[date]
+                advance_dates = execution_market_dates[
+                    previous_market_position + 1 : current_market_position + 1
+                ]
+                if not advance_dates:
+                    raise InputDataError(
+                        f"no stockdemo execution date follows rebalance date {previous_date}"
+                    )
+                actual_weights = pd.Series(dtype=float)
+                for offset, market_date in enumerate(advance_dates):
+                    target = previous_target if offset == 0 else None
+                    snapshot, _, _, actual_weights = advance_stockdemo_state(
+                        state=execution_state,
+                        date=market_date,
+                        day=execution_by_date[market_date],
+                        fee_rate=execution_config.one_side_fee,
+                        target=target,
+                        missing_target_policy=execution_config.missing_target_policy,
+                    )
+                    execution_feedback_rows.append(
+                        {
+                            **snapshot,
+                            "target_date": previous_date if target is not None else None,
+                            "next_rebalance_date": date,
+                        }
+                    )
+                if actual_weights.empty:
+                    raise InputDataError(
+                        "stockdemo execution produced no stock holdings for optimizer feedback"
+                    )
+                current = actual_weights
+                feedback_cash_weight = float(execution_feedback_rows[-1]["cash_weight"])
+            elif previous_target is not None and previous_date is not None:
                 drift_dates = calendar[positions[previous_date] + 1 : positions[date] + 1]
                 current = drift_weights(previous_target, returns_wide, drift_dates)
             current_path = working / f"current-{date}.parquet"
@@ -702,6 +814,16 @@ def run_rolling_experiment(
                 date_output / "signal_diagnostics.json",
                 date_output / "optimization_summary.json",
             )
+            diagnostic.update(
+                {
+                    "current_state_source": (
+                        "stockdemo_actual"
+                        if feedback_cash_weight is not None
+                        else "configured_initial_or_theoretical_drift"
+                    ),
+                    "actual_cash_weight": feedback_cash_weight,
+                }
+            )
             diagnostic_rows.append(diagnostic)
             exposure_rows.extend(exposures)
             print(
@@ -723,6 +845,28 @@ def run_rolling_experiment(
             )
 
         rebalance_weights = pd.concat(weight_frames, ignore_index=True)
+        stockdemo_summary: dict[str, Any] | None = None
+        if execution_config is not None and execution_market is not None:
+            feedback = pd.DataFrame(execution_feedback_rows)
+            feedback.to_parquet(
+                temporary / "execution_feedback.parquet", index=False
+            )
+            optimized_targets = rebalance_weights.loc[
+                rebalance_weights["portfolio"].eq("risk_optimized"),
+                ["date", "ticker", "target_weight"],
+            ].copy()
+            stockdemo_summary = run_stockdemo_compat(
+                market=execution_market,
+                targets=optimized_targets,
+                output_dir=temporary / "stockdemo_compat",
+                config=execution_config,
+                portfolio_name="risk_optimized",
+            )
+            stockdemo_summary["output_dir"] = str(destination / "stockdemo_compat")
+            _write_json(
+                temporary / "stockdemo_compat" / "summary.json",
+                stockdemo_summary,
+            )
         benchmark_targets: list[pd.DataFrame] = []
         for date in dates:
             benchmark = load_weight_series(
@@ -834,6 +978,23 @@ def run_rolling_experiment(
                 pd.to_numeric(diagnostics["turnover_saved"], errors="coerce").sum()
             ),
             "cost_model": cost_resolution,
+            "execution_feedback": {
+                "enabled": execution_config is not None,
+                "engine": (
+                    None if execution_config is None else "stockdemo_compat"
+                ),
+                "observation_count": len(execution_feedback_rows),
+                "cash_weight_min": (
+                    None
+                    if not execution_feedback_rows
+                    else float(min(row["cash_weight"] for row in execution_feedback_rows))
+                ),
+                "cash_weight_max": (
+                    None
+                    if not execution_feedback_rows
+                    else float(max(row["cash_weight"] for row in execution_feedback_rows))
+                ),
+            },
             "input_cache": table_cache.statistics(),
             "risk_cache": (
                 {"enabled": False}
@@ -886,10 +1047,31 @@ def run_rolling_experiment(
             "cost_model_resolution": cost_resolution,
             "risk_form": risk_form,
             "execution_timing": (
-                "target formed on rebalance date t and applied before the asset return "
+                "target formed on t, executed by Stockdemo rules on the next market date, "
+                "and actual normalized stock holdings feed the next optimization"
+                if execution_config is not None
+                else "target formed on rebalance date t and applied before the asset return "
                 "on the next available trading date"
             ),
             "benchmark_method": "simulated_from_supplied_rebalance_weights",
+            "execution_feedback": {
+                "enabled": execution_config is not None,
+                "market_path": (
+                    None
+                    if stockdemo_market_file is None
+                    else str(Path(stockdemo_market_file).expanduser().resolve())
+                ),
+                "market_fingerprint": execution_market_fingerprint,
+                "config": (
+                    None if execution_config is None else asdict(execution_config)
+                ),
+                "stock_weight_normalization": (
+                    None
+                    if execution_config is None
+                    else "actual closing stock market values normalized to one; cash is disclosed separately"
+                ),
+                "summary": stockdemo_summary,
+            },
             "inputs": manifest_inputs,
             "covariance_inputs": covariance_inputs,
             "exposure_inputs": exposure_inputs,
@@ -906,7 +1088,14 @@ def run_rolling_experiment(
                 "reused_count": checkpoint_reused_count,
                 "built_count": checkpoint_built_count,
             },
-            "outputs": list(ROLLING_OUTPUT_FILES),
+            "outputs": [
+                *ROLLING_OUTPUT_FILES,
+                *(
+                    ["execution_feedback.parquet", "stockdemo_compat"]
+                    if execution_config is not None
+                    else []
+                ),
+            ],
         }
         manifest["output_sha256"] = {
             name: sha256_file(temporary / name)
@@ -931,4 +1120,5 @@ def run_rolling_experiment(
         "date_end": dates[-1],
         "output_dir": str(destination),
         "portfolios": metrics["portfolios"],
+        "stockdemo_compat": stockdemo_summary,
     }

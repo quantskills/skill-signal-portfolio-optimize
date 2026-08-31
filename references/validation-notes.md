@@ -4,7 +4,7 @@
 
 - Catalog status: `active`
 - Validation level: `runnable`
-- Current implementation version: `1.2.0` (v1.1.0 industry adapter plus rolling input cache); the comparison table below records the historical v1.0.0 experiment.
+- Current implementation version: `1.3.1` (v1.3 Stockdemo-compatible execution plus actual-holdings feedback); the comparison table below records the historical v1.0.0 experiment.
 - Validation claim: commands, examples, declarations, and automated tests are runnable
 - Excluded claim: this repository is not yet `verified` against a sealed holdout or independent reproduction package
 - Governance note: final community listing and validation require QuantSkills maintainer review
@@ -59,7 +59,7 @@ The evidence covers one signal family, one market interval, one rebalance schedu
 
 Industry constraints were disabled because verified interval-valid point-in-time industry history was unavailable. Current industry labels were not used as artificial history. Fundamental value, quality, growth, and leverage styles are also outside the current six-factor model.
 
-The backtest models close-to-close returns, next-trading-day target activation, and linear turnover cost. It does not model intraday execution, nonlinear market impact, borrow availability, or broker fills. Maximum drawdown in the version table is absolute portfolio drawdown; active drawdown is reported separately.
+The native backtest models close-to-close returns, next-trading-day target activation, and linear turnover cost. v1.3.1 optionally adds Stockdemo-compatible TWAP, lots, cash, ST/limit filters, and actual-holdings feedback, but still does not model order-book impact, partial broker fills, borrow availability, or live routing. Maximum drawdown in the version table is absolute portfolio drawdown; active drawdown is reported separately.
 
 ## Reproduction Requirements
 

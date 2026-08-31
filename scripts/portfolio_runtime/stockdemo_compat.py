@@ -20,6 +20,9 @@ from .errors import InputDataError
 from .io import normalize_date, normalize_ticker, read_table
 
 
+_MISSING_TARGET_POLICIES = {"error", "cash"}
+
+
 @dataclass(frozen=True)
 class StockDemoExecutionConfig:
     """Execution defaults copied from stockdemo/BackTest/config/backtestconfig.ini."""
@@ -33,6 +36,8 @@ class StockDemoExecutionConfig:
     initial_cash: float = 100_000_000.0
     locked_limit: float = 0.095
     periods_per_year: int = 252
+    exact_window: bool = True
+    missing_target_policy: str = "error"
 
     @property
     def one_side_fee(self) -> float:
@@ -59,6 +64,13 @@ class StockDemoExecutionConfig:
             raise InputDataError("initial_cash must be positive and finite")
         if not 0.0 < self.locked_limit < 1.0:
             raise InputDataError("locked_limit must be between zero and one")
+        if not isinstance(self.exact_window, bool):
+            raise InputDataError("exact_window must be boolean")
+        if self.missing_target_policy not in _MISSING_TARGET_POLICIES:
+            raise InputDataError(
+                "missing_target_policy must be one of: "
+                + ", ".join(sorted(_MISSING_TARGET_POLICIES))
+            )
 
 
 MARKET_REQUIRED = {
@@ -363,6 +375,12 @@ def _equal_target(
         return pd.Series(1.0 / len(selected), index=selected, dtype=float)
 
     current_pool = [ticker for ticker, volume in holdings.items() if volume > 0]
+    missing_holdings = pd.Index(current_pool).difference(day.index)
+    if len(missing_holdings):
+        raise InputDataError(
+            "stockdemo market is missing held ticker(s): "
+            f"{missing_holdings.tolist()[:10]}"
+        )
     current = day.reindex(current_pool)
     values = pd.to_numeric(current["ideal_trade_price"], errors="coerce") * pd.Series(
         holdings, dtype=float
@@ -373,7 +391,7 @@ def _equal_target(
         (current["is_open"] == True) & (current["zt"] == False)
     ].index.tolist()
     drop_out = current.loc[
-        current["is_st"].astype(bool) | ~current.index.isin(day.index)
+        current.index.isin(sellable) & current["is_st"].astype(bool)
     ].index.tolist()
     sellable = [ticker for ticker in sellable if ticker not in drop_out]
     unit = total_value * (1.0 - keep) - float(values.reindex(drop_out).sum())
@@ -384,10 +402,11 @@ def _equal_target(
         ).sort_values(ascending=True, kind="mergesort")
         cumulative = 0.0
         for ticker in sell_order.index:
-            if cumulative >= unit:
+            next_cumulative = cumulative + float(values.get(ticker, 0.0))
+            if next_cumulative >= unit:
                 break
             sell_tickers.append(ticker)
-            cumulative += float(values.get(ticker, 0.0))
+            cumulative = next_cumulative
     survivors = [ticker for ticker in current_pool if ticker not in sell_tickers]
     buy_num = max(longx - len(survivors), 0)
     buy_tickers = [ticker for ticker in ranked.index if ticker not in current_pool][:buy_num]
@@ -421,10 +440,30 @@ def _place_orders(
     cash: float,
     fee_rate: float,
     initial_value: float | None,
+    missing_target_policy: str = "error",
 ) -> tuple[float, list[dict[str, Any]], float, float]:
-    current_names = pd.Index(list(holdings), dtype="string")
-    target = target[target.index.isin(day.index)].astype(float)
+    target = target.astype(float)
     target = target[target.gt(0)]
+    missing_target = target.index.difference(day.index)
+    if missing_target_policy not in _MISSING_TARGET_POLICIES:
+        raise InputDataError(
+            "missing_target_policy must be one of: "
+            + ", ".join(sorted(_MISSING_TARGET_POLICIES))
+        )
+    if len(missing_target) and missing_target_policy == "error":
+        raise InputDataError(
+            "stockdemo market is missing positive target ticker(s): "
+            f"{missing_target.tolist()[:10]}"
+        )
+    if len(missing_target):
+        # Do not forward-fill a price or redistribute a signal without a market row.
+        target = target.drop(missing_target)
+    missing_holdings = pd.Index(holdings).difference(day.index)
+    if len(missing_holdings):
+        raise InputDataError(
+            "stockdemo market is missing held ticker(s): "
+            f"{missing_holdings.tolist()[:10]}"
+        )
     prices = day["ideal_trade_price"]
     total_value = float(cash)
     for ticker, volume in holdings.items():
@@ -462,7 +501,7 @@ def _place_orders(
         }
         row["amount"] = row["volume"] * row["trade_price"]
         row["transaction"] = row["amount"] * fee_rate
-        row["can_buy"] = bool(day.loc[ticker, "can_buy"]) and not bool(day.loc[ticker, "is_st"])
+        row["can_buy"] = bool(day.loc[ticker, "can_buy"])
         row["can_sell"] = bool(day.loc[ticker, "can_sell"])
         orders.append(row)
 
@@ -484,10 +523,6 @@ def _place_orders(
     for row in [item for item in orders if item["B/S"] == "buy" and item["can_buy"]]:
         volume = float(row["volume"])
         price = float(row["trade_price"])
-        while volume > 0 and volume * price * (1.0 + fee_rate) > cash + 1.0e-9:
-            volume -= _lot(row["ticker"])
-        if volume <= 0:
-            continue
         amount = volume * price
         fee = amount * fee_rate
         cash -= amount + fee
@@ -503,12 +538,120 @@ def _place_orders(
     return cash, executed, turnover_amount, fees
 
 
+@dataclass
+class StockDemoPortfolioState:
+    """Mutable holdings and cash carried between Stockdemo execution dates."""
+
+    cash: float
+    holdings: dict[str, float]
+    holding_adj: dict[str, float]
+    first_execution: bool = True
+
+    @classmethod
+    def initial(cls, initial_cash: float) -> "StockDemoPortfolioState":
+        return cls(cash=float(initial_cash), holdings={}, holding_adj={})
+
+
+def advance_stockdemo_state(
+    *,
+    state: StockDemoPortfolioState,
+    date: str,
+    day: pd.DataFrame,
+    fee_rate: float,
+    target: pd.Series | None = None,
+    missing_target_policy: str = "error",
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], pd.Series]:
+    """Apply one market day and return accounting plus normalized stock weights."""
+
+    _apply_corporate_action(state.holdings, state.holding_adj, day)
+    missing = pd.Index(state.holdings).difference(day.index)
+    if len(missing):
+        raise InputDataError(
+            "stockdemo market is missing held ticker(s): "
+            f"{missing.tolist()[:10]}"
+        )
+    pre_value = state.cash + sum(
+        float(volume) * float(day.loc[ticker, "ideal_trade_price"])
+        for ticker, volume in state.holdings.items()
+    )
+    orders: list[dict[str, Any]] = []
+    turnover_amount = 0.0
+    fees = 0.0
+    missing_target_tickers = pd.Index([], dtype=object)
+    missing_target_weight = 0.0
+    if target is not None:
+        positive_target = target.astype(float)
+        positive_target = positive_target[positive_target.gt(0)]
+        missing_target_tickers = positive_target.index.difference(day.index)
+        missing_target_weight = float(positive_target.reindex(missing_target_tickers, fill_value=0.0).sum())
+        state.cash, orders, turnover_amount, fees = _place_orders(
+            day=day,
+            target=target,
+            holdings=state.holdings,
+            holding_adj=state.holding_adj,
+            cash=state.cash,
+            fee_rate=fee_rate,
+            initial_value=state.cash if state.first_execution else None,
+            missing_target_policy=missing_target_policy,
+        )
+        state.first_execution = False
+    market_values = pd.Series(
+        {
+            ticker: float(volume) * float(day.loc[ticker, "balance_price"])
+            for ticker, volume in state.holdings.items()
+        },
+        dtype=float,
+    )
+    market_value = float(market_values.sum())
+    nav_value = float(state.cash + market_value)
+    if not np.isfinite(nav_value) or nav_value <= 0:
+        raise InputDataError("stockdemo execution produced non-positive portfolio NAV")
+    buy_amount = float(sum(order["amount"] for order in orders if order["B/S"] == "buy"))
+    sell_amount = float(sum(order["amount"] for order in orders if order["B/S"] == "sell"))
+    snapshot = {
+        "date": date,
+        "cash": float(state.cash),
+        "cash_weight": float(state.cash / nav_value),
+        "market_value": market_value,
+        "unrealized_pnl": nav_value,
+        "transaction_cost": fees,
+        "turnover": buy_amount / market_value if market_value > 0 else 0.0,
+        "gross_turnover": turnover_amount / max(pre_value, 1.0),
+        "buy_amount": buy_amount,
+        "sell_amount": sell_amount,
+        "holdings": len(state.holdings),
+        "missing_target_count": int(len(missing_target_tickers)),
+        "missing_target_weight": missing_target_weight,
+        "missing_target_tickers": ",".join(map(str, missing_target_tickers.tolist())),
+    }
+    transaction_rows = [{"date": date, **order} for order in orders]
+    holding_rows = [
+        {
+            "date": date,
+            "ticker": ticker,
+            "volume": float(volume),
+            "holding_period": 0,
+            "price_current": float(day.loc[ticker, "balance_price"]),
+            "adj_factor": float(
+                state.holding_adj.get(ticker, day.loc[ticker, "adj_factor"])
+            ),
+        }
+        for ticker, volume in state.holdings.items()
+    ]
+    if market_value <= 0:
+        normalized_weights = pd.Series(dtype=float, name="current_weight")
+    else:
+        normalized_weights = (market_values / market_value).rename("current_weight")
+    return snapshot, transaction_rows, holding_rows, normalized_weights
+
+
 def _stockdemo_metrics(stats: pd.DataFrame, periods_per_year: int) -> dict[str, float | int | str | None]:
     if stats.empty:
         raise InputDataError("stockdemo backtest produced no statistics")
     values = stats["unrealized_pnl"].astype(float)
     if len(values) < 2:
         return {
+            "metric_convention": "stockdemo_legacy",
             "observations": int(len(values)),
             "date_start": str(stats["date"].iloc[0]),
             "date_end": str(stats["date"].iloc[-1]),
@@ -525,6 +668,7 @@ def _stockdemo_metrics(stats: pd.DataFrame, periods_per_year: int) -> dict[str, 
     annual_volatility = float(simple_step.std(ddof=1) * math.sqrt((len(values) - 1) / years))
     drawdown = 1.0 - values / values.rolling(10000, min_periods=1).max()
     return {
+        "metric_convention": "stockdemo_legacy",
         "observations": int(len(values)),
         "date_start": str(stats["date"].iloc[0]),
         "date_end": str(stats["date"].iloc[-1]),
@@ -600,6 +744,14 @@ def run_stockdemo_compat(
             continue
         execution_map[market_dates[execution_position]] = source_date
     execution_dates = sorted(execution_map)
+    if config.exact_window:
+        source_end = max(source_dates)
+        execution_map = {
+            date: source_date
+            for date, source_date in execution_map.items()
+            if date <= source_end
+        }
+        execution_dates = sorted(execution_map)
     if not execution_dates:
         raise InputDataError("no market execution dates follow the supplied signal/target dates")
     if signal is not None:
@@ -616,47 +768,70 @@ def run_stockdemo_compat(
     transactions: list[dict[str, Any]] = []
     holding_rows: list[dict[str, Any]] = []
     first = True
-    for execution_date in execution_dates:
+    first_execution = execution_dates[0]
+    last_valuation = max(source_dates) if config.exact_window else execution_dates[-1]
+    valuation_dates = [
+        date for date in market_dates if first_execution <= date <= last_valuation
+    ]
+    for execution_date in valuation_dates:
         signal_date = execution_map.get(execution_date)
-        if signal_date is None:
-            continue
         day = by_date[execution_date]
         _apply_corporate_action(holdings, holding_adj, day)
-        if signal is not None:
-            target = _equal_target(
-                signal_by_date[signal_date],
-                day,
-                holdings,
-                longx=config.longx,
-                keep=config.keep,
-                first_day=first,
+        missing_before = pd.Index(holdings).difference(day.index)
+        if len(missing_before):
+            raise InputDataError(
+                "stockdemo market is missing held ticker(s): "
+                f"{missing_before.tolist()[:10]}"
             )
-            initial_value = cash if first else None
-        else:
-            target = target_by_date[signal_date]
-            initial_value = cash if first else None
         pre_value = cash + sum(
             float(volume) * float(day.loc[ticker, "ideal_trade_price"])
             for ticker, volume in holdings.items()
-            if ticker in day.index
         )
-        cash, day_orders, turnover_amount, fees = _place_orders(
-            day=day,
-            target=target,
-            holdings=holdings,
-            holding_adj=holding_adj,
-            cash=cash,
-            fee_rate=config.one_side_fee,
-            initial_value=initial_value,
-        )
+        day_orders: list[dict[str, Any]] = []
+        turnover_amount = 0.0
+        fees = 0.0
+        if signal_date is not None:
+            if signal is not None:
+                target = _equal_target(
+                    signal_by_date[signal_date],
+                    day,
+                    holdings,
+                    longx=config.longx,
+                    keep=config.keep,
+                    first_day=first,
+                )
+            else:
+                target = target_by_date[signal_date]
+            cash, day_orders, turnover_amount, fees = _place_orders(
+                day=day,
+                target=target,
+                holdings=holdings,
+                holding_adj=holding_adj,
+                cash=cash,
+                fee_rate=config.one_side_fee,
+                initial_value=cash if first else None,
+                missing_target_policy=config.missing_target_policy,
+            )
+            first = False
         for order in day_orders:
             transactions.append({"date": execution_date, **order})
+        missing_after = pd.Index(holdings).difference(day.index)
+        if len(missing_after):
+            raise InputDataError(
+                "stockdemo market is missing held ticker(s) during valuation: "
+                f"{missing_after.tolist()[:10]}"
+            )
         market_value = sum(
             float(volume) * float(day.loc[ticker, "balance_price"])
             for ticker, volume in holdings.items()
-            if ticker in day.index
         )
         nav_value = cash + market_value
+        buy_amount = float(
+            sum(order["amount"] for order in day_orders if order["B/S"] == "buy")
+        )
+        sell_amount = float(
+            sum(order["amount"] for order in day_orders if order["B/S"] == "sell")
+        )
         rows.append(
             {
                 "date": execution_date,
@@ -664,23 +839,26 @@ def run_stockdemo_compat(
                 "market_value": market_value,
                 "unrealized_pnl": nav_value,
                 "transaction_cost": fees,
-                "turnover": turnover_amount / max(pre_value, 1.0),
+                "turnover": buy_amount / market_value if market_value > 0 else 0.0,
+                "gross_turnover": turnover_amount / max(pre_value, 1.0),
+                "buy_amount": buy_amount,
+                "sell_amount": sell_amount,
                 "holdings": len(holdings),
             }
         )
         for ticker, volume in holdings.items():
-            if ticker in day.index:
-                holding_rows.append(
-                    {
-                        "date": execution_date,
-                        "ticker": ticker,
-                        "volume": volume,
-                        "holding_period": 0,
-                        "price_current": float(day.loc[ticker, "balance_price"]),
-                        "adj_factor": float(holding_adj.get(ticker, day.loc[ticker, "adj_factor"])),
-                    }
-                )
-        first = False
+            holding_rows.append(
+                {
+                    "date": execution_date,
+                    "ticker": ticker,
+                    "volume": volume,
+                    "holding_period": 0,
+                    "price_current": float(day.loc[ticker, "balance_price"]),
+                    "adj_factor": float(
+                        holding_adj.get(ticker, day.loc[ticker, "adj_factor"])
+                    ),
+                }
+            )
 
     stats = pd.DataFrame(rows)
     stats["nav"] = stats["unrealized_pnl"] / config.initial_cash
@@ -694,8 +872,21 @@ def run_stockdemo_compat(
         price_column = "close" if "close" in benchmark_frame else "benchmark"
         benchmark_frame[price_column] = pd.to_numeric(benchmark_frame[price_column], errors="coerce")
         benchmark_frame = benchmark_frame.sort_values("date")
-        benchmark_frame["benchmark_nav"] = benchmark_frame[price_column] / benchmark_frame[price_column].iloc[0]
-        stats = stats.merge(benchmark_frame[["date", "benchmark_nav"]], on="date", how="left")
+        benchmark_frame = benchmark_frame.loc[
+            benchmark_frame["date"].between(
+                str(stats["date"].min()), str(stats["date"].max())
+            )
+        ].copy()
+        if benchmark_frame.empty:
+            raise InputDataError("benchmark does not cover stockdemo valuation dates")
+        benchmark_frame["benchmark_nav"] = (
+            benchmark_frame[price_column] / benchmark_frame[price_column].iloc[0]
+        )
+        stats = stats.merge(
+            benchmark_frame[["date", "benchmark_nav"]], on="date", how="left"
+        )
+        if stats["benchmark_nav"].isna().any():
+            raise InputDataError("benchmark has missing stockdemo valuation date(s)")
         stats["active_nav"] = stats["nav"] / stats["benchmark_nav"]
     else:
         stats["benchmark_nav"] = np.nan

@@ -144,6 +144,41 @@ def test_frozen_holding_is_preserved_and_bound_exception_is_disclosed() -> None:
     assert result.constraints["frozen_bound_exceptions"][0]["ticker"] == "A"
 
 
+def test_candidate_range_is_reduced_by_frozen_outside_holding() -> None:
+    expected, score, covariance, benchmark, current, tradable, optimizer, constraints = _problem()
+    current = pd.Series([0.30, 0.30, 0.20, 0.20], index=expected.index)
+    tradable.loc["C"] = False
+    constraints["max_turnover"] = None
+    constraints["max_tracking_error"] = None
+    constraints["candidate_weight_range"] = {"min_weight": 1.0, "max_weight": 1.0}
+    candidate_mask = pd.Series([True, True, False, False], index=expected.index)
+
+    result = optimize_portfolio(
+        expected,
+        covariance,
+        benchmark,
+        current,
+        None,
+        None,
+        tradable,
+        optimizer,
+        constraints,
+        signal_score=score,
+        candidate_mask=candidate_mask,
+        cost_model={"linear_cost_bps": 7.0},
+    )
+
+    detail = result.constraints["candidate_weight_range"]
+    assert result.constraints["passed"]
+    assert result.weights[candidate_mask].sum() == pytest.approx(0.80, abs=1.0e-8)
+    assert detail["configured_min_weight"] == 1.0
+    assert detail["configured_max_weight"] == 1.0
+    assert detail["min_weight"] == pytest.approx(0.80)
+    assert detail["max_weight"] == pytest.approx(0.80)
+    assert detail["frozen_outside_candidate_weight"] == pytest.approx(0.20)
+    assert detail["adjusted_for_frozen_outside"] is True
+
+
 def test_factor_form_matches_dense_form() -> None:
     expected, score, covariance, benchmark, current, tradable, optimizer, constraints = _problem()
     exposures = pd.DataFrame(

@@ -9,6 +9,7 @@ from scipy.optimize import Bounds, LinearConstraint, NonlinearConstraint, linpro
 
 from .diagnostics import (
     constraint_report,
+    resolve_candidate_weight_range,
     resolve_industry_ranges,
     resolve_style_ranges,
 )
@@ -114,6 +115,10 @@ def _build_linear_system(
             raise OptimizationError(
                 "candidate_mask is required when candidate_weight_range is configured"
             )
+        candidate_range = resolve_candidate_weight_range(
+            candidate_range, candidate_mask, current, tradable
+        )
+        assert candidate_range is not None
         coefficients = candidate_mask.to_numpy(dtype=float)
         if not coefficients.any():
             raise OptimizationError("candidate_mask contains no candidate assets")

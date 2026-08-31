@@ -40,6 +40,14 @@ Orders are rounded to 100 shares, or 200 shares for tickers beginning with `688`
 
 Outputs are `stats.csv`, `transaction.csv`, `holdings.csv`, and `summary.json`. `summary.json` reports the stockdemo-style geometric annualized return, volatility, Sharpe ratio, maximum drawdown, average turnover, and total transaction cost.
 
+## Exact-window and rolling feedback
+
+By default the standalone runner follows the original source-date window: it values every market date from the first execution through the final source date and does not execute the final source date on a date outside that window. Use `--include-final-next-execution` only when an extended research window is intentional. The implementation preserves the original sell-before-buy sequence, lot rounding, possible negative residual cash, buy-side turnover convention, and legacy volatility formula. These conventions are recorded as `metric_convention: stockdemo_legacy`; do not mix the resulting Sharpe ratio with metrics calculated under another convention.
+
+`scripts/run_rolling_experiment.py --stockdemo-market-file ...` enables execution-aware feedback. The first optimization retains the configured initial-weight convention. Before each later optimization, the prior target executes on the next market date and the state advances through any intervening dates. Actual close holdings then replace theoretical drifted targets as `current_weight`. Because the optimizer remains a fully invested stock optimizer, actual stock market values are normalized to one; residual cash or leverage is written separately as `actual_cash_weight`. The final output adds `execution_feedback.parquet` and a strict replay under `stockdemo_compat/`.
+
+When a non-tradable holding remains outside the candidate set, its frozen weight reduces the attainable candidate allocation. An exact configured candidate weight such as 100% is automatically reduced to `1 - frozen_outside_candidate_weight`; diagnostics retain both configured and effective bounds. This adjustment does not relax any tradable stock, style, industry, tracking-error, or turnover constraint.
+
 ## Parity boundary
 
 Exact numerical parity requires the same frozen signal, market table, calendar, benchmark data, adjustment-factor convention, and date window as the original stockdemo run. The compatibility runner is an independent implementation with unit tests; parity should be established on a small fixture by comparing daily holdings, transactions, cash, and NAV against the original `TradingSystem` before interpreting a full-period result.

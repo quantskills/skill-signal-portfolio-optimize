@@ -16,7 +16,7 @@ signal_score | expected_return | tradable
 
 ## `constraint_diagnostics.json`
 
-Contains solver status, iterations, objective value, hard-constraint tolerances, turnover, candidate aggregate weight, and per-industry/style benchmark exposure, portfolio exposure, active exposure, lower/upper bounds, slack, binding status, and violations for both portfolios. `constraint_slacks` uses positive values for remaining capacity, zero for binding constraints, and negative values for violations. Raw and controllable stock-weight maxima are both recorded. A drifted non-tradable position outside a stock bound is held exactly and listed under `frozen_bound_exceptions`; the exception does not relax bounds for tradable assets.
+Contains solver status, iterations, objective value, hard-constraint tolerances, turnover, candidate aggregate weight, and per-industry/style benchmark exposure, portfolio exposure, active exposure, lower/upper bounds, slack, binding status, and violations for both portfolios. `constraint_slacks` uses positive values for remaining capacity, zero for binding constraints, and negative values for violations. Raw and controllable stock-weight maxima are both recorded. Candidate diagnostics record configured and effective aggregate bounds; a frozen non-tradable holding outside the candidate set reduces only the effective attainable candidate maximum. A drifted non-tradable position outside a stock bound is held exactly and listed under `frozen_bound_exceptions`; the exception does not relax bounds for tradable assets.
 
 Only `risk_optimized` must satisfy every configured optimizer constraint. Baseline violations are reported for comparison.
 
@@ -57,6 +57,8 @@ geometrically annualized excess return, realized tracking error, information rat
 active NAV, and maximum active drawdown. `optimization_diagnostics.parquet` includes scalar
 slacks for turnover, tracking error, stock limits, and candidate-weight bounds.
 `optimization_summary.json` aggregates constraint binding counts and ratios, signal-capture minimum/mean/maximum, signal utility loss, turnover, estimated cost, runtime, backend, risk form, and cache reuse.
+
+With `--stockdemo-market-file`, rolling output additionally contains `execution_feedback.parquet` and `stockdemo_compat/`. The feedback table records daily executed cash, cash weight, holdings, buy/sell amounts, costs, turnover, source target date, and the next rebalance that consumes the state. `optimization_diagnostics.parquet` identifies `current_state_source` and `actual_cash_weight`. The nested replay contains `stats.csv`, `transaction.csv`, `holdings.csv`, and `summary.json`.
 `rolling_manifest.json` records a SHA-256 entry for every resolved covariance and, when
 available, every resolved exposure file. It also records per-date risk source
 (`static_reused`, `dynamic_built`, or `dynamic_reused`), dynamic-cache counts, and checkpoint

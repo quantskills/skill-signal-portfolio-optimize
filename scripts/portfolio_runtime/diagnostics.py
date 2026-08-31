@@ -84,13 +84,52 @@ def resolve_style_ranges(
     }
 
 
+def resolve_candidate_weight_range(
+    specification: dict[str, float] | None,
+    candidate_mask: pd.Series,
+    current: pd.Series | None,
+    tradable: pd.Series,
+) -> dict[str, float | bool] | None:
+    """Resolve the candidate range after unavoidable outside holdings are frozen."""
+    if specification is None:
+        return None
+    frozen_outside_weight = 0.0
+    if current is not None:
+        aligned_candidate = candidate_mask.reindex(current.index)
+        aligned_tradable = tradable.reindex(current.index)
+        if aligned_candidate.isna().any() or aligned_tradable.isna().any():
+            raise ConfigError(
+                "candidate mask and tradability must cover all current holdings"
+            )
+        aligned_candidate = aligned_candidate.astype(bool)
+        aligned_tradable = aligned_tradable.astype(bool)
+        frozen_outside = ~aligned_tradable & ~aligned_candidate
+        frozen_outside_weight = float(current[frozen_outside].sum())
+    attainable_max = float(np.clip(1.0 - frozen_outside_weight, 0.0, 1.0))
+    configured_min = float(specification["min_weight"])
+    configured_max = float(specification["max_weight"])
+    effective_max = min(configured_max, attainable_max)
+    effective_min = min(configured_min, effective_max)
+    return {
+        "min_weight": effective_min,
+        "max_weight": effective_max,
+        "configured_min_weight": configured_min,
+        "configured_max_weight": configured_max,
+        "frozen_outside_candidate_weight": frozen_outside_weight,
+        "attainable_max_weight": attainable_max,
+        "adjusted_for_frozen_outside": bool(
+            effective_min != configured_min or effective_max != configured_max
+        ),
+    }
+
+
 def _range_detail(
     benchmark_exposure: float,
     portfolio_exposure: float,
     active_exposure: float,
-    specification: dict[str, float] | None,
+    specification: dict[str, Any] | None,
     tolerance: float,
-) -> dict[str, float | bool | None]:
+) -> dict[str, Any]:
     if specification is None:
         return {
             "benchmark_exposure": benchmark_exposure,
@@ -137,12 +176,25 @@ def _candidate_range_detail(
         }
     lower = float(specification["min_weight"])
     upper = float(specification["max_weight"])
+    configured_lower = float(specification.get("configured_min_weight", lower))
+    configured_upper = float(specification.get("configured_max_weight", upper))
     lower_slack = candidate_weight - lower
     upper_slack = upper - candidate_weight
     return {
         "portfolio_weight": candidate_weight,
         "min_weight": lower,
         "max_weight": upper,
+        "configured_min_weight": configured_lower,
+        "configured_max_weight": configured_upper,
+        "frozen_outside_candidate_weight": float(
+            specification.get("frozen_outside_candidate_weight", 0.0)
+        ),
+        "attainable_max_weight": float(
+            specification.get("attainable_max_weight", upper)
+        ),
+        "adjusted_for_frozen_outside": bool(
+            specification.get("adjusted_for_frozen_outside", False)
+        ),
         "lower_slack": lower_slack,
         "upper_slack": upper_slack,
         "binding": bool(lower_slack <= tolerance or upper_slack <= tolerance),
@@ -228,10 +280,16 @@ def constraint_report(
         if aligned_candidate.isna().any():
             raise ConfigError("candidate mask does not match portfolio weights")
         candidate_weight = float(weights[aligned_candidate.astype(bool)].sum())
+        effective_candidate_range = resolve_candidate_weight_range(
+            constraint_config.get("candidate_weight_range"),
+            aligned_candidate.astype(bool),
+            current,
+            tradable,
+        )
         report["candidate_weight"] = candidate_weight
         report["candidate_weight_range"] = _candidate_range_detail(
             candidate_weight,
-            constraint_config.get("candidate_weight_range"),
+            effective_candidate_range,
             tolerance,
         )
 

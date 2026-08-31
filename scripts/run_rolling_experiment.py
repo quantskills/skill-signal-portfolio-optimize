@@ -53,6 +53,29 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Persistent date/signature checkpoints used to resume rolling optimization.",
     )
+    parser.add_argument(
+        "--stockdemo-market-file",
+        type=Path,
+        help=(
+            "Enable execution-aware rolling state using Stockdemo-compatible "
+            "next-day order accounting."
+        ),
+    )
+    parser.add_argument(
+        "--stockdemo-transaction",
+        type=float,
+        default=1.4,
+        help="Stockdemo round-trip transaction setting in per-thousand units.",
+    )
+    parser.add_argument(
+        "--stockdemo-initial-cash", type=float, default=100_000_000.0
+    )
+    parser.add_argument(
+        "--stockdemo-missing-target-policy",
+        choices=("error", "cash"),
+        default="error",
+        help="Handle positive target tickers missing on execution day: error or leave in cash.",
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser.parse_args()
 
@@ -84,6 +107,10 @@ def main() -> int:
             risk_industry_file=args.risk_industry_file,
             dynamic_risk_cache_root=args.dynamic_risk_cache_root,
             checkpoint_root=args.checkpoint_root,
+            stockdemo_market_file=args.stockdemo_market_file,
+            stockdemo_transaction=args.stockdemo_transaction,
+            stockdemo_initial_cash=args.stockdemo_initial_cash,
+            stockdemo_missing_target_policy=args.stockdemo_missing_target_policy,
             output_dir=args.output_dir,
         )
     except PortfolioOptimizeError as exc:
