@@ -70,6 +70,7 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 - v1.2 caches repeated rolling input tables in-process and partitions them by normalized date; this is a performance optimization only and does not change signal, risk, or execution semantics.
 - v1.3 adds an isolated `stockdemo-compatible` order-level replay path. It does not change Barra calculations or the legacy `native` return backtest.
 - v1.3.1 can explicitly feed Stockdemo-executed closing holdings into the next rolling optimization; omitting the market flag preserves theoretical-drift behavior.
+- v1.3.2 uses `carry_forward` by default for legacy StockDemo parity, supports `terminal_writeoff` for confirmed terminal holdings, and keeps `error` as the fail-closed quality-check policy.
 - Fail closed on missing covariance coverage, invalid weights, infeasible constraints, or non-finite inputs.
 - Produce target weights, `optimization_summary.json`, and machine-readable diagnostics; do not place orders.
 
@@ -125,7 +126,7 @@ python scripts/run_rolling_experiment.py \
   --output-dir /path/to/rolling_output
 ```
 
-Add `--stockdemo-market-file /path/to/market.parquet` to this command only when actual next-day Stockdemo fills must become the next date current holdings. This mode writes `execution_feedback.parquet` and `stockdemo_compat/`; inspect `actual_cash_weight` because the optimizer normalizes the executed stock sleeve to one.
+Add `--stockdemo-market-file /path/to/market.parquet` to this command only when actual next-day Stockdemo fills must become the next date current holdings. Add `--stockdemo-twap-file /path/to/trade_price.parquet` when the legacy TWAP table must override the market alias, and use `--stockdemo-turnover-mode flex` (the default for the ba875fc8 baseline) or `normal` explicitly. This mode writes `execution_feedback.parquet` and `stockdemo_compat/`; inspect `actual_cash_weight` because the optimizer normalizes the executed stock sleeve to one.
 
 To compare against the original stockdemo execution semantics without changing the
 optimizer, replay the frozen signal and/or the optimizer target weights with:
@@ -141,9 +142,9 @@ python scripts/run_stockdemo_compat_backtest.py \
   --output-dir /path/to/stockdemo_compat_output
 ```
 
-Use `--portfolio signal` for the Top200/`keep=0.8` baseline and `--portfolio target` for
+Use `--portfolio signal` for the Top200/`keep=0.7` baseline and `--portfolio target` for
 an existing `risk_optimized` target-weight stream. The command uses TWAP (falling back to
-open when unavailable), next-day
+open when unavailable), or an optional legacy table supplied through `--twap-file`; `--turnover-mode flex` reproduces the ba875fc8 replacement rule. It uses next-day
 execution, 100/200-share lots, cash and fee accounting, ST/limit filters, and the
 stockdemo-style metric calculation. It requires the raw market fields documented in
 [references/stockdemo-compat.md](references/stockdemo-compat.md).

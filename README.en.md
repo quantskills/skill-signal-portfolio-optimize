@@ -8,7 +8,7 @@ Convert one frozen cross-sectional stock signal into benchmark-relative long-onl
 | --- | --- |
 | Catalog status | `active` |
 | Validation level | `runnable` |
-| Implementation version | `1.3.1` |
+| Implementation version | `1.3.3` |
 | Python | CI uses 3.12 |
 | License | GPL-3.0-only |
 
@@ -37,6 +37,8 @@ It does not train prediction models, select alpha factors, place orders, or repr
 - Run next-trading-day rolling backtests with dynamic risk caches, resumable checkpoints, and parameter sweeps.
 - v1.2.0 caches repeated rolling input tables in-process and slices them by date without changing optimization semantics.
 - v1.3.0 adds an isolated `stockdemo-compatible` execution engine for TWAP, next-day execution, `keep=0.8`, lots, cash, ST/limit filters, and stockdemo metric semantics; the legacy `native` backtest remains unchanged.
+- v1.3.2 adds explicit `terminal_writeoff` handling for confirmed terminal securities; explicit `carry_forward` is also available for legacy StockDemo parity, while `error` remains available for fail-closed quality checks.
+- v1.3.3 aligns Stockdemo-compatible defaults with `ba875fc8`: Top200, whole universe, TWAP, next-day execution, `transaction=1.4`, `keep=0.7`, daily rebalancing, and 7 bps linear cost; optimizer risk constraints remain independent.
 - Emit target weights, risk summaries, constraint diagnostics, signal diagnostics, and hash-backed run manifests.
 
 ## Risk Factors
@@ -128,6 +130,8 @@ See [references/risk-model.md](references/risk-model.md) and [references/backtes
 
 Add `--stockdemo-market-file /path/to/stockdemo_market.parquet` to the same command when the next optimization must consume holdings actually executed by Stockdemo rules instead of theoretically drifted targets. `--stockdemo-transaction` and `--stockdemo-initial-cash` override the legacy defaults. This mode additionally writes `execution_feedback.parquet` and `stockdemo_compat/`; cash is disclosed separately and risk constraints use actual stock holdings normalized by stock market value. Omitting the flag preserves the existing rolling behavior.
 
+The default missing-held policy is `carry_forward` for legacy StockDemo parity: a missing held ticker is valued at its last valid close and remains non-tradable. Pass `--stockdemo-missing-held-policy error` for data-quality checks. For confirmed terminal securities, pass `--stockdemo-missing-held-policy terminal_writeoff` together with the explicit terminal-event manifest; do not infer terminal events from gaps.
+
 ## Stockdemo-compatible backtest
 
 The optimizer emits target weights, while the original stockdemo backtest generates orders from holdings, cash, lots, and tradability. v1.3.0 keeps that execution layer separate from Barra logic:
@@ -143,7 +147,7 @@ python scripts/run_stockdemo_compat_backtest.py \
   --output-dir outputs/stockdemo_compat
 ```
 
-Use `--portfolio signal` for the Top200/`keep` baseline, `--portfolio target` for Barra target weights, or `both` for separate `signal_baseline/` and `risk_optimized/` outputs. The market table needs `date,ticker,open,close,pre_close,is_open,is_st`; a missing `twap` falls back to open as in stockdemo, and `adj_factor` is optional. See [references/stockdemo-compat.md](references/stockdemo-compat.md) for the complete contract.
+The default `--portfolio signal` runs the Top200/`keep` baseline; use `--portfolio target` for Barra target weights, or `both` for separate `signal_baseline/` and `risk_optimized/` outputs. The market table needs `date,ticker,open,close,pre_close,is_open,is_st`; a missing `twap` falls back to open as in stockdemo, and `adj_factor` is optional. `--turnover-mode flex` is the default ba875fc8 replacement rule, and `--twap-file` accepts the legacy wide `trade_price.parquet` table. See [references/stockdemo-compat.md](references/stockdemo-compat.md) for the complete contract.
 
 ## Validation
 

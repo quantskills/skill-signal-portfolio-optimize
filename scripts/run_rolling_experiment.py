@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stockdemo-twap-file",
+        type=Path,
+        help="Optional long or legacy wide TWAP/trade_price table for execution feedback.",
+    )
+    parser.add_argument(
         "--stockdemo-transaction",
         type=float,
         default=1.4,
@@ -71,10 +76,27 @@ def parse_args() -> argparse.Namespace:
         "--stockdemo-initial-cash", type=float, default=100_000_000.0
     )
     parser.add_argument(
+        "--stockdemo-turnover-mode",
+        choices=("normal", "flex"),
+        default="flex",
+        help="Top-N replacement rule used by Stockdemo execution feedback.",
+    )
+    parser.add_argument(
         "--stockdemo-missing-target-policy",
         choices=("error", "cash"),
         default="error",
         help="Handle positive target tickers missing on execution day: error or leave in cash.",
+    )
+    parser.add_argument(
+        "--stockdemo-missing-held-policy",
+        choices=("error", "carry_forward", "terminal_writeoff"),
+        default="carry_forward",
+        help="Handle held tickers absent from the execution market: fail, carry the last close, or use an explicit terminal write-off.",
+    )
+    parser.add_argument(
+        "--stockdemo-terminal-events-file",
+        type=Path,
+        help="JSON manifest containing explicit date/ticker terminal_events.",
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser.parse_args()
@@ -108,9 +130,13 @@ def main() -> int:
             dynamic_risk_cache_root=args.dynamic_risk_cache_root,
             checkpoint_root=args.checkpoint_root,
             stockdemo_market_file=args.stockdemo_market_file,
+            stockdemo_twap_file=args.stockdemo_twap_file,
             stockdemo_transaction=args.stockdemo_transaction,
             stockdemo_initial_cash=args.stockdemo_initial_cash,
+            stockdemo_turnover_mode=args.stockdemo_turnover_mode,
             stockdemo_missing_target_policy=args.stockdemo_missing_target_policy,
+            stockdemo_missing_held_policy=args.stockdemo_missing_held_policy,
+            stockdemo_terminal_events_file=args.stockdemo_terminal_events_file,
             output_dir=args.output_dir,
         )
     except PortfolioOptimizeError as exc:

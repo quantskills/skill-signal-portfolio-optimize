@@ -42,6 +42,7 @@ from .stockdemo_compat import (
     StockDemoExecutionConfig,
     StockDemoPortfolioState,
     advance_stockdemo_state,
+    load_terminal_events,
     load_stockdemo_market,
     run_stockdemo_compat,
 )
@@ -360,9 +361,13 @@ def run_rolling_experiment(
     dynamic_risk_cache_root: str | Path | None = None,
     checkpoint_root: str | Path | None = None,
     stockdemo_market_file: str | Path | None = None,
+    stockdemo_twap_file: str | Path | None = None,
     stockdemo_transaction: float = 1.4,
     stockdemo_initial_cash: float = 100_000_000.0,
+    stockdemo_turnover_mode: str = "flex",
     stockdemo_missing_target_policy: str = "error",
+    stockdemo_missing_held_policy: str = "carry_forward",
+    stockdemo_terminal_events_file: str | Path | None = None,
 ) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     if exposure_file is not None and exposure_root is not None:
@@ -445,6 +450,21 @@ def run_rolling_experiment(
     execution_state: StockDemoPortfolioState | None = None
     execution_feedback_rows: list[dict[str, Any]] = []
     execution_market_fingerprint: str | None = None
+    terminal_events: dict[str, frozenset[str]] | None = None
+    terminal_events_fingerprint: str | None = None
+    if stockdemo_terminal_events_file is not None:
+        terminal_events = load_terminal_events(stockdemo_terminal_events_file)
+        terminal_events_fingerprint = sha256_file(stockdemo_terminal_events_file)
+    if stockdemo_missing_held_policy == "terminal_writeoff":
+        if stockdemo_market_file is None:
+            raise InputDataError(
+                "stockdemo_missing_held_policy requires stockdemo_market_file"
+            )
+        if stockdemo_terminal_events_file is None:
+            raise InputDataError(
+                "stockdemo_missing_held_policy=terminal_writeoff requires "
+                "stockdemo_terminal_events_file"
+            )
     if stockdemo_market_file is not None:
         if len(dates) < 2:
             raise InputDataError(
@@ -453,12 +473,15 @@ def run_rolling_experiment(
         execution_config = StockDemoExecutionConfig(
             transaction=float(stockdemo_transaction),
             initial_cash=float(stockdemo_initial_cash),
+            turnover_mode=stockdemo_turnover_mode,
             exact_window=True,
             missing_target_policy=stockdemo_missing_target_policy,
+            missing_held_policy=stockdemo_missing_held_policy,
         )
         execution_config.validate()
         execution_market = load_stockdemo_market(
-            stockdemo_market_file, start_date=dates[0], end_date=dates[-1]
+            stockdemo_market_file, start_date=dates[0], end_date=dates[-1],
+            twap_file=stockdemo_twap_file,
         )
         execution_by_date = {
             value: group.set_index("ticker")
@@ -533,9 +556,19 @@ def run_rolling_experiment(
             None if exposure_file is None else sha256_file(exposure_file)
         ),
         "stockdemo_market_fingerprint": execution_market_fingerprint,
+        "stockdemo_twap_file": (
+            None
+            if stockdemo_twap_file is None
+            else str(Path(stockdemo_twap_file).expanduser().resolve())
+        ),
+        "stockdemo_turnover_mode": (
+            None if execution_config is None else execution_config.turnover_mode
+        ),
         "stockdemo_transaction": (
             None if execution_config is None else execution_config.transaction
         ),
+        "stockdemo_missing_held_policy": stockdemo_missing_held_policy,
+        "stockdemo_terminal_events_sha256": terminal_events_fingerprint,
     }
     try:
         for position, date in enumerate(dates, start=1):
@@ -565,6 +598,8 @@ def run_rolling_experiment(
                         fee_rate=execution_config.one_side_fee,
                         target=target,
                         missing_target_policy=execution_config.missing_target_policy,
+                        missing_held_policy=execution_config.missing_held_policy,
+                        terminal_events=terminal_events,
                     )
                     execution_feedback_rows.append(
                         {
@@ -861,6 +896,7 @@ def run_rolling_experiment(
                 output_dir=temporary / "stockdemo_compat",
                 config=execution_config,
                 portfolio_name="risk_optimized",
+                terminal_events=terminal_events,
             )
             stockdemo_summary["output_dir"] = str(destination / "stockdemo_compat")
             _write_json(
@@ -994,6 +1030,18 @@ def run_rolling_experiment(
                     if not execution_feedback_rows
                     else float(max(row["cash_weight"] for row in execution_feedback_rows))
                 ),
+                "terminal_writeoff_count": int(
+                    sum(row.get("terminal_writeoff_count", 0) for row in execution_feedback_rows)
+                ),
+                "terminal_writeoff_value": float(
+                    sum(row.get("terminal_writeoff_value", 0.0) for row in execution_feedback_rows)
+                ),
+                "carried_forward_count": int(
+                    sum(row.get("carried_forward_count", 0) for row in execution_feedback_rows)
+                ),
+                "carried_forward_value": float(
+                    sum(row.get("carried_forward_value", 0.0) for row in execution_feedback_rows)
+                ),
             },
             "input_cache": table_cache.statistics(),
             "risk_cache": (
@@ -1025,6 +1073,7 @@ def run_rolling_experiment(
             "exposures": exposure_file,
             "tradability": tradability_file,
             "initial_weights": initial_weights_file,
+            "stockdemo_terminal_events": stockdemo_terminal_events_file,
         }
         manifest_inputs = {
             name: {
@@ -1062,6 +1111,12 @@ def run_rolling_experiment(
                     else str(Path(stockdemo_market_file).expanduser().resolve())
                 ),
                 "market_fingerprint": execution_market_fingerprint,
+                "terminal_events_file": (
+                    None
+                    if stockdemo_terminal_events_file is None
+                    else str(Path(stockdemo_terminal_events_file).expanduser().resolve())
+                ),
+                "terminal_events_sha256": terminal_events_fingerprint,
                 "config": (
                     None if execution_config is None else asdict(execution_config)
                 ),

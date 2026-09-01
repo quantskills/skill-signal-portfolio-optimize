@@ -20,6 +20,7 @@ from portfolio_runtime.stockdemo_compat import (  # noqa: E402
     StockDemoExecutionConfig,
     load_stockdemo_market,
     load_stockdemo_signal,
+    load_terminal_events,
     load_target_weights,
     run_stockdemo_compat,
 )
@@ -37,11 +38,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-file", type=Path)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
-    parser.add_argument("--portfolio", choices=("signal", "target", "both"), default="both")
+    parser.add_argument("--portfolio", choices=("signal", "target", "both"), default="signal")
     parser.add_argument("--longx", type=int, default=200)
-    parser.add_argument("--keep", type=float, default=0.8)
+    parser.add_argument("--keep", type=float, default=0.7)
+    parser.add_argument(
+        "--turnover-mode",
+        choices=("normal", "flex"),
+        default="flex",
+        help="Top-N replacement rule; flex matches the registered ba875fc8 baseline.",
+    )
     parser.add_argument("--transaction", type=float, default=1.4)
     parser.add_argument("--initial-cash", type=float, default=100_000_000.0)
+    parser.add_argument(
+        "--twap-file",
+        type=Path,
+        help="Optional long or legacy wide TWAP/trade_price table used for execution.",
+    )
+    parser.add_argument(
+        "--missing-target-policy",
+        choices=("error", "cash"),
+        default="error",
+        help="Handle positive target tickers missing on execution day.",
+    )
+    parser.add_argument(
+        "--missing-held-policy",
+        choices=("error", "carry_forward", "terminal_writeoff"),
+        default="carry_forward",
+        help="Handle held tickers absent from the execution market: fail, carry the last close, or use an explicit terminal write-off.",
+    )
+    parser.add_argument(
+        "--terminal-events-file",
+        type=Path,
+        help="JSON manifest containing explicit date/ticker terminal_events.",
+    )
     parser.add_argument(
         "--include-final-next-execution",
         action="store_true",
@@ -85,13 +114,22 @@ def main() -> int:
     config = StockDemoExecutionConfig(
         longx=args.longx,
         keep=args.keep,
+        turnover_mode=args.turnover_mode,
         transaction=args.transaction,
         initial_cash=args.initial_cash,
         exact_window=not args.include_final_next_execution,
+        missing_target_policy=args.missing_target_policy,
+        missing_held_policy=args.missing_held_policy,
     )
     try:
+        terminal_events = (
+            None
+            if args.terminal_events_file is None
+            else load_terminal_events(args.terminal_events_file)
+        )
         market = load_stockdemo_market(
-            args.market_file, start_date=source_start, end_date=execution_end
+            args.market_file, start_date=source_start, end_date=execution_end,
+            twap_file=args.twap_file,
         )
         benchmark = _load_benchmark(args.benchmark_file, source_start, execution_end)
         output = args.output_dir.expanduser().resolve()
@@ -110,6 +148,7 @@ def main() -> int:
                 output_dir=output / "signal_baseline" if args.portfolio == "both" else output,
                 config=config,
                 portfolio_name="signal_baseline",
+                terminal_events=terminal_events,
             )
         if args.portfolio in {"target", "both"}:
             if args.target_weights_file is None:
@@ -125,6 +164,7 @@ def main() -> int:
                 output_dir=output / "risk_optimized" if args.portfolio == "both" else output,
                 config=config,
                 portfolio_name=args.target_portfolio,
+                terminal_events=terminal_events,
             )
         output.mkdir(parents=True, exist_ok=True)
         (output / "summary.json").write_text(

@@ -8,7 +8,7 @@
 | --- | --- |
 | Catalog 状态 | `active` |
 | 验证等级 | `runnable` |
-| 实现版本 | `1.3.1` |
+| 实现版本 | `1.3.3` |
 | Python | CI 使用 3.12 |
 | 许可证 | GPL-3.0-only |
 
@@ -36,6 +36,8 @@
 - 支持下一交易日生效的滚动回测、动态风险缓存、断点续跑和参数扫描。
 - v1.2.0 在滚动进程内缓存并按日期切片重复输入表，减少重复 Parquet 读取；不改变优化语义。
 - v1.3.0 增加独立的 `stockdemo-compatible` 交易执行器，复现 TWAP、次日执行、`keep=0.8`、交易手数、现金、ST/涨跌停过滤和原始指标口径；旧 `native` 回测保持不变。
+- v1.3.2 对已确认的终止证券增加显式 `terminal_writeoff` 处理；同时支持显式 `carry_forward` 以复现旧 StockDemo 对暂时缺失持仓的估值语义，`carry_forward` 为兼容基线默认值，`error` 可用于质量检查，终止事件仍必须显式声明策略。
+- v1.3.3 将 Stockdemo 兼容默认值对齐 `ba875fc8`：Top200、全市场、TWAP、次日执行、`transaction=1.4`、`keep=0.7`、每日调仓和 7 bps 线性成本；优化器风险约束保持独立。
 - 输出目标权重、风险摘要、约束诊断、信号诊断和带输入哈希的运行清单。
 
 ## 风险因子
@@ -125,7 +127,7 @@ python scripts/run_rolling_experiment.py \
 
 动态风险建模、因子形式输入、缓存签名和断点续跑参数见 [references/risk-model.md](references/risk-model.md) 与 [references/backtest-contract.md](references/backtest-contract.md)。
 
-如需让下一日优化读取 Stockdemo 实际成交持仓，而不是上一日理论目标漂移权重，在同一命令中增加 `--stockdemo-market-file /path/to/stockdemo_market.parquet`。可用 `--stockdemo-transaction` 和 `--stockdemo-initial-cash` 覆盖原始参数。该模式额外写出 `execution_feedback.parquet` 和 `stockdemo_compat/`；现金单独披露，风险约束使用按股票市值归一化的实际持仓。默认不提供该参数时，旧滚动行为保持不变。
+如需让下一日优化读取 Stockdemo 实际成交持仓，而不是上一日理论目标漂移权重，在同一命令中增加 `--stockdemo-market-file /path/to/stockdemo_market.parquet`。可用 `--stockdemo-transaction` 和 `--stockdemo-initial-cash` 覆盖原始参数。该模式额外写出 `execution_feedback.parquet` 和 `stockdemo_compat/`；现金单独披露，风险约束使用按股票市值归一化的实际持仓。默认不提供该参数时，旧滚动行为保持不变。行情缺失持仓时，基线复现可显式传入 `--stockdemo-missing-held-policy carry_forward`，按上一有效收盘价估值并保持不可交易；质量检查使用 `error`。若行情中存在已确认的终止证券，才传入 `--stockdemo-missing-held-policy terminal_writeoff` 和 `--stockdemo-terminal-events-file /path/to/asset_returns_with_terminal_writeoff_manifest.json`，禁止把任意数据缺口静默当作退市。
 
 ## Stockdemo 兼容回测
 
@@ -142,7 +144,7 @@ python scripts/run_stockdemo_compat_backtest.py \
   --output-dir outputs/stockdemo_compat
 ```
 
-`--portfolio signal` 运行严格 Top200/`keep` 基线，`--portfolio target` 执行指定的 Barra 目标权重，`both` 会分别写入 `signal_baseline/` 和 `risk_optimized/`。行情至少需要 `date,ticker,open,close,pre_close,is_open,is_st`；`twap` 缺失时按 `stockdemo` 回退到开盘价，可选 `adj_factor` 会按原规则调整成交和估值价格。完整字段和复现边界见 [references/stockdemo-compat.md](references/stockdemo-compat.md)。
+`--portfolio signal` 运行严格 Top200/`keep` 基线，`--portfolio target` 执行指定的 Barra 目标权重，`both` 会分别写入 `signal_baseline/` 和 `risk_optimized/`。行情至少需要 `date,ticker,open,close,pre_close,is_open,is_st`；`twap` 缺失时按 `stockdemo` 回退到开盘价，可选 `adj_factor` 会按原规则调整成交和估值价格；`--turnover-mode flex` 默认复现 ba875fc8 的低换手替换逻辑，`--twap-file` 可传入旧版宽表 `trade_price.parquet`。完整字段和复现边界见 [references/stockdemo-compat.md](references/stockdemo-compat.md)。
 
 ## 验证
 

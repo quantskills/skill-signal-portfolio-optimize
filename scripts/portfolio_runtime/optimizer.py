@@ -854,7 +854,9 @@ def optimize_portfolio(
             tradable=tradable,
             optimizer_config=optimizer_config,
             constraint_config=constraint_config,
-            linear_cost_bps=float((cost_model or {"linear_cost_bps": 0.0})["linear_cost_bps"]),
+            # Keep direct optimizer calls aligned with the ba875fc8 one-way
+            # transaction-cost convention when no override is supplied.
+            linear_cost_bps=float((cost_model or {"linear_cost_bps": 7.0})["linear_cost_bps"]),
         )
 
     backend = optimizer_config["solver_backend"]

@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,8 @@ from .io import normalize_date, normalize_ticker, read_table
 
 
 _MISSING_TARGET_POLICIES = {"error", "cash"}
+_MISSING_HELD_POLICIES = {"error", "carry_forward", "terminal_writeoff"}
+_TURNOVER_MODES = {"normal", "flex"}
 
 
 @dataclass(frozen=True)
@@ -32,12 +34,17 @@ class StockDemoExecutionConfig:
     trade_price_type: str = "twap"
     buy_sell_shift: int = 1
     transaction: float = 1.4
-    keep: float = 0.8
+    # ba875fc8's single-factor baseline retains 70% of the existing holdings
+    # when replacing names in the daily Top200 portfolio.
+    keep: float = 0.7
+    # ba875fc8 uses factor-backtest's flex replacement rule.
+    turnover_mode: str = "flex"
     initial_cash: float = 100_000_000.0
     locked_limit: float = 0.095
     periods_per_year: int = 252
     exact_window: bool = True
     missing_target_policy: str = "error"
+    missing_held_policy: str = "carry_forward"
 
     @property
     def one_side_fee(self) -> float:
@@ -58,6 +65,11 @@ class StockDemoExecutionConfig:
             raise InputDataError("stockdemo_compat currently requires buy_sell_shift=1")
         if not 0.0 <= self.keep <= 1.0:
             raise InputDataError("keep must be between zero and one")
+        if self.turnover_mode not in _TURNOVER_MODES:
+            raise InputDataError(
+                "turnover_mode must be one of: "
+                + ", ".join(sorted(_TURNOVER_MODES))
+            )
         if not np.isfinite(self.transaction) or self.transaction < 0:
             raise InputDataError("transaction must be finite and non-negative")
         if not np.isfinite(self.initial_cash) or self.initial_cash <= 0:
@@ -70,6 +82,11 @@ class StockDemoExecutionConfig:
             raise InputDataError(
                 "missing_target_policy must be one of: "
                 + ", ".join(sorted(_MISSING_TARGET_POLICIES))
+            )
+        if self.missing_held_policy not in _MISSING_HELD_POLICIES:
+            raise InputDataError(
+                "missing_held_policy must be one of: "
+                + ", ".join(sorted(_MISSING_HELD_POLICIES))
             )
 
 
@@ -193,12 +210,16 @@ def load_stockdemo_market(
     *,
     start_date: object,
     end_date: object,
+    twap_file: str | Path | None = None,
 ) -> pd.DataFrame:
     """Load and normalize the raw market table required by stockdemo execution."""
 
     start = normalize_date(start_date)
     end = normalize_date(end_date)
     frame = _read_market_slice(path, start, end).copy()
+    twap_overlay: pd.DataFrame | None = None
+    if twap_file is not None:
+        twap_overlay = _load_twap_overlay(twap_file, start, end)
     # The unified long store includes both numeric ``ticker`` and exchange-
     # qualified ``symbol``. Frozen model signals use the qualified symbol.
     if "symbol" in frame.columns:
@@ -232,6 +253,15 @@ def load_stockdemo_market(
         raise InputDataError("stockdemo market has no rows in requested date range")
     if frame.duplicated(["date", "ticker"]).any():
         raise InputDataError("stockdemo market contains duplicate date-ticker rows")
+    if twap_overlay is not None:
+        # Legacy BackTestData_pq stores TWAP in a wide numeric-ticker matrix,
+        # while the unified market table uses exchange-qualified symbols.
+        frame["_ticker_code"] = frame["ticker"].map(_ticker_code)
+        overlay = twap_overlay.rename(columns={"ticker": "_ticker_code"})
+        frame = frame.drop(columns=["twap"], errors="ignore").merge(
+            overlay, on=["date", "_ticker_code"], how="left", validate="one_to_one"
+        )
+        frame = frame.drop(columns=["_ticker_code"])
     for column in ("open", "close", "pre_close"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     if "twap" not in frame:
@@ -271,6 +301,45 @@ def load_stockdemo_market(
     frame["can_buy"] = frame["is_open"] & ~frame["zt"]
     frame["can_sell"] = frame["is_open"] & ~frame["dt"]
     return frame.sort_values(["date", "ticker"], kind="stable").reset_index(drop=True)
+
+
+
+def _ticker_code(value: object) -> str:
+    """Return the six-digit numeric code used by legacy wide market tables."""
+
+    ticker = normalize_ticker(value)
+    code = ticker.split(".", 1)[0]
+    return code.zfill(6) if code.isdigit() else code
+
+
+def _load_twap_overlay(path: str | Path, start: str, end: str) -> pd.DataFrame:
+    """Load a long or legacy wide TWAP table as date/code/value rows."""
+
+    frame = _read_many(path).copy()
+    value_column = _first_column(frame, ("twap", "TWAP", "trade_price", "tradePrice"))
+    if {"date", "ticker"}.issubset(frame.columns) and value_column is not None:
+        result = frame[["date", "ticker", value_column]].rename(
+            columns={value_column: "twap"}
+        )
+    else:
+        if "date" not in frame.columns:
+            # pd.read_parquet preserves the unnamed date index in BackTestData_pq.
+            frame = frame.reset_index().rename(columns={frame.index.name or "index": "date"})
+        if "date" not in frame.columns:
+            raise InputDataError("TWAP table must contain a date index or date column")
+        frame["date"] = frame["date"].map(normalize_date)
+        frame = frame.loc[frame["date"].between(start, end)].copy()
+        result = frame.melt(id_vars=["date"], var_name="ticker", value_name="twap")
+    result["date"] = result["date"].map(normalize_date)
+    result = result.loc[result["date"].between(start, end)].copy()
+    result["ticker"] = result["ticker"].map(_ticker_code)
+    result["twap"] = pd.to_numeric(result["twap"], errors="coerce")
+    result = result.dropna(subset=["twap"])
+    if result.duplicated(["date", "ticker"]).any():
+        raise InputDataError("TWAP table contains duplicate date-ticker rows")
+    if result["twap"].le(0).any() or not np.isfinite(result["twap"]).all():
+        raise InputDataError("TWAP table contains non-positive or non-finite values")
+    return result[["date", "ticker", "twap"]]
 
 
 def load_stockdemo_signal(path: str | Path) -> pd.DataFrame:
@@ -358,7 +427,13 @@ def _equal_target(
     longx: int,
     keep: float,
     first_day: bool,
+    turnover_mode: str = "flex",
 ) -> pd.Series:
+    if turnover_mode not in _TURNOVER_MODES:
+        raise InputDataError(
+            "turnover_mode must be one of: "
+            + ", ".join(sorted(_TURNOVER_MODES))
+        )
     usable = signal.index.intersection(day.index)
     signal = signal.loc[usable].dropna()
     signal = signal.loc[
@@ -397,8 +472,10 @@ def _equal_target(
     unit = total_value * (1.0 - keep) - float(values.reindex(drop_out).sum())
     sell_tickers = list(drop_out)
     if unit > 0 and sellable:
+        # StockDemo keeps names filtered from the buy universe as NaN. NaN
+        # sorts last, so a locked name is not incorrectly sold first.
         sell_order = pd.Series(
-            {ticker: float(signal.get(ticker, -np.inf)) for ticker in sellable}
+            {ticker: float(signal.get(ticker, np.nan)) for ticker in sellable}
         ).sort_values(ascending=True, kind="mergesort")
         cumulative = 0.0
         for ticker in sell_order.index:
@@ -409,7 +486,11 @@ def _equal_target(
             cumulative = next_cumulative
     survivors = [ticker for ticker in current_pool if ticker not in sell_tickers]
     buy_num = max(longx - len(survivors), 0)
-    buy_tickers = [ticker for ticker in ranked.index if ticker not in current_pool][:buy_num]
+    if turnover_mode == "flex":
+        # Match skill-factor-backtest: sold current names may be reselected.
+        buy_tickers = [ticker for ticker in ranked.index if ticker not in survivors][:buy_num]
+    else:
+        buy_tickers = [ticker for ticker in ranked.index if ticker not in current_pool][:buy_num]
     selected = survivors + buy_tickers
     if not selected:
         raise InputDataError("stockdemo keep logic produced an empty target")
@@ -467,7 +548,7 @@ def _place_orders(
     prices = day["ideal_trade_price"]
     total_value = float(cash)
     for ticker, volume in holdings.items():
-        if ticker in day.index:
+        if ticker in day.index and np.isfinite(float(prices[ticker])):
             total_value += float(volume) * float(prices[ticker])
     if initial_value is not None:
         total_value = initial_value
@@ -546,10 +627,171 @@ class StockDemoPortfolioState:
     holdings: dict[str, float]
     holding_adj: dict[str, float]
     first_execution: bool = True
+    last_balance_price: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def initial(cls, initial_cash: float) -> "StockDemoPortfolioState":
         return cls(cash=float(initial_cash), holdings={}, holding_adj={})
+
+
+def load_terminal_events(path: str | Path) -> dict[str, frozenset[str]]:
+    """Load explicit terminal/write-off events from a terminal-return manifest."""
+
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise InputDataError(f"terminal events file does not exist: {source}")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InputDataError(f"cannot read terminal events file {source}: {exc}") from exc
+    events = payload.get("terminal_events") if isinstance(payload, dict) else None
+    if not isinstance(events, list):
+        raise InputDataError("terminal events file must contain a terminal_events list")
+    result: dict[str, set[str]] = {}
+    for event in events:
+        if not isinstance(event, dict) or not {"date", "ticker", "return"}.issubset(event):
+            raise InputDataError("terminal event must contain date, ticker, and return")
+        value = float(event["return"])
+        if not np.isfinite(value) or value != -1.0:
+            raise InputDataError("terminal event return must be exactly -1.0")
+        date = normalize_date(event["date"])
+        ticker = normalize_ticker(event["ticker"])
+        result.setdefault(date, set()).add(ticker)
+    return {date: frozenset(tickers) for date, tickers in result.items()}
+
+
+def _writeoff_missing_holdings(
+    *,
+    holdings: dict[str, float],
+    holding_adj: dict[str, float],
+    last_balance_price: dict[str, float],
+    day: pd.DataFrame,
+    date: str,
+    policy: str,
+    terminal_events: Mapping[str, Iterable[str]] | None,
+) -> tuple[pd.Index, float]:
+    """Remove only explicitly terminal holdings and account for their zero value."""
+
+    missing = pd.Index(holdings).difference(day.index)
+    if not len(missing):
+        return pd.Index([], dtype=object), 0.0
+    if policy not in _MISSING_HELD_POLICIES:
+        raise InputDataError(
+            "missing_held_policy must be one of: "
+            + ", ".join(sorted(_MISSING_HELD_POLICIES))
+        )
+    permitted = pd.Index([] if terminal_events is None else terminal_events.get(date, ()))
+    unresolved = missing.difference(permitted)
+    if policy == "error" or len(unresolved):
+        names = unresolved.tolist() if len(unresolved) else missing.tolist()
+        raise InputDataError(
+            "stockdemo market is missing held ticker(s): "
+            f"{names[:10]}"
+        )
+    writeoff_value = 0.0
+    for ticker in missing:
+        ticker_key = str(ticker)
+        previous_price = last_balance_price.get(ticker_key)
+        if (
+            previous_price is None
+            or not np.isfinite(float(previous_price))
+            or float(previous_price) <= 0
+        ):
+            raise InputDataError(
+                "cannot value terminal write-off for held ticker without a prior close: "
+                f"{ticker_key}"
+            )
+        writeoff_value += float(holdings[ticker_key]) * float(previous_price)
+        holdings.pop(ticker_key, None)
+        holding_adj.pop(ticker_key, None)
+        last_balance_price.pop(ticker_key, None)
+    return missing, float(writeoff_value)
+
+
+def _carry_forward_missing_holdings(
+    *,
+    holdings: Mapping[str, float],
+    holding_adj: Mapping[str, float],
+    last_balance_price: Mapping[str, float],
+    day: pd.DataFrame,
+    date: str,
+    policy: str,
+) -> tuple[pd.DataFrame, pd.Index, float]:
+    """Add non-tradable synthetic rows for held tickers absent from the feed.
+
+    The legacy StockDemo balance path keeps a missing held name at its last
+    valid close. The synthetic row makes that behavior explicit while still
+    preventing the name from being selected or traded on the missing date.
+    """
+
+    if policy not in _MISSING_HELD_POLICIES:
+        raise InputDataError(
+            "missing_held_policy must be one of: "
+            + ", ".join(sorted(_MISSING_HELD_POLICIES))
+        )
+    missing = pd.Index(holdings).difference(day.index)
+    if policy != "carry_forward" or not len(missing):
+        return day, pd.Index([], dtype=object), 0.0
+
+    rows: list[dict[str, Any]] = []
+    carried_value = 0.0
+    for ticker in missing:
+        ticker_key = str(ticker)
+        previous_price = last_balance_price.get(ticker_key)
+        if (
+            previous_price is None
+            or not np.isfinite(float(previous_price))
+            or float(previous_price) <= 0
+        ):
+            raise InputDataError(
+                "cannot carry forward held ticker without a prior close: "
+                f"{ticker_key}"
+            )
+        previous_adj = holding_adj.get(ticker_key, 1.0)
+        if (
+            previous_adj is None
+            or not np.isfinite(float(previous_adj))
+            or float(previous_adj) <= 0
+        ):
+            raise InputDataError(
+                "cannot carry forward held ticker with invalid adjustment factor: "
+                f"{ticker_key}"
+            )
+        price = float(previous_price)
+        adj_factor = float(previous_adj)
+        row = {column: np.nan for column in day.columns}
+        row.update(
+            {
+                "date": date,
+                "ticker": ticker_key,
+                # Raw price columns are informational for this synthetic row;
+                # adjusted prices drive sizing and valuation below.
+                "open": np.nan,
+                "close": np.nan,
+                "pre_close": np.nan,
+                "twap": np.nan,
+                "is_open": False,
+                "is_st": False,
+                "adj_factor": adj_factor,
+                # Missing feed prices stay missing for order sizing; only the
+                # last close is used for mark-to-market valuation.
+                "ideal_trade_price": np.nan,
+                "trade_price": np.nan,
+                "balance_price": price,
+                "zt": False,
+                "dt": False,
+                "can_buy": False,
+                "can_sell": False,
+            }
+        )
+        rows.append(row)
+        carried_value += float(holdings[ticker_key]) * price
+
+    synthetic = pd.DataFrame(rows).set_index("ticker")
+    synthetic = synthetic.reindex(columns=day.columns)
+    synthetic.index.name = day.index.name
+    combined = pd.concat([day, synthetic], axis=0)
+    return combined, missing, float(carried_value)
 
 
 def advance_stockdemo_state(
@@ -560,18 +802,33 @@ def advance_stockdemo_state(
     fee_rate: float,
     target: pd.Series | None = None,
     missing_target_policy: str = "error",
+    missing_held_policy: str = "carry_forward",
+    terminal_events: Mapping[str, Iterable[str]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], pd.Series]:
     """Apply one market day and return accounting plus normalized stock weights."""
 
+    day, carried_forward_tickers, carried_forward_value = _carry_forward_missing_holdings(
+        holdings=state.holdings,
+        holding_adj=state.holding_adj,
+        last_balance_price=state.last_balance_price,
+        day=day,
+        date=date,
+        policy=missing_held_policy,
+    )
     _apply_corporate_action(state.holdings, state.holding_adj, day)
-    missing = pd.Index(state.holdings).difference(day.index)
-    if len(missing):
-        raise InputDataError(
-            "stockdemo market is missing held ticker(s): "
-            f"{missing.tolist()[:10]}"
-        )
+    terminal_writeoff_tickers, terminal_writeoff_value = _writeoff_missing_holdings(
+        holdings=state.holdings,
+        holding_adj=state.holding_adj,
+        last_balance_price=state.last_balance_price,
+        day=day,
+        date=date,
+        policy=missing_held_policy,
+        terminal_events=terminal_events,
+    )
     pre_value = state.cash + sum(
         float(volume) * float(day.loc[ticker, "ideal_trade_price"])
+        if np.isfinite(float(day.loc[ticker, "ideal_trade_price"]))
+        else 0.0
         for ticker, volume in state.holdings.items()
     )
     orders: list[dict[str, Any]] = []
@@ -603,6 +860,8 @@ def advance_stockdemo_state(
         dtype=float,
     )
     market_value = float(market_values.sum())
+    for ticker in state.holdings:
+        state.last_balance_price[str(ticker)] = float(day.loc[ticker, "balance_price"])
     nav_value = float(state.cash + market_value)
     if not np.isfinite(nav_value) or nav_value <= 0:
         raise InputDataError("stockdemo execution produced non-positive portfolio NAV")
@@ -623,6 +882,12 @@ def advance_stockdemo_state(
         "missing_target_count": int(len(missing_target_tickers)),
         "missing_target_weight": missing_target_weight,
         "missing_target_tickers": ",".join(map(str, missing_target_tickers.tolist())),
+        "terminal_writeoff_count": int(len(terminal_writeoff_tickers)),
+        "terminal_writeoff_value": float(terminal_writeoff_value),
+        "terminal_writeoff_tickers": ",".join(map(str, terminal_writeoff_tickers.tolist())),
+        "carried_forward_count": int(len(carried_forward_tickers)),
+        "carried_forward_value": float(carried_forward_value),
+        "carried_forward_tickers": ",".join(map(str, carried_forward_tickers.tolist())),
     }
     transaction_rows = [{"date": date, **order} for order in orders]
     holding_rows = [
@@ -690,10 +955,15 @@ def run_stockdemo_compat(
     targets: pd.DataFrame | None = None,
     benchmark: pd.DataFrame | None = None,
     portfolio_name: str = "signal",
+    terminal_events: Mapping[str, Iterable[str]] | None = None,
 ) -> dict[str, Any]:
     """Run signal or target-weight execution using stockdemo accounting rules."""
 
     config.validate()
+    if config.missing_held_policy == "terminal_writeoff" and terminal_events is None:
+        raise InputDataError(
+            "terminal_events are required when missing_held_policy=terminal_writeoff"
+        )
     if (signal is None) == (targets is None):
         raise InputDataError("provide exactly one of signal or targets")
     required_market = MARKET_REQUIRED | {
@@ -767,6 +1037,7 @@ def run_stockdemo_compat(
     rows: list[dict[str, Any]] = []
     transactions: list[dict[str, Any]] = []
     holding_rows: list[dict[str, Any]] = []
+    last_balance_prices: dict[str, float] = {}
     first = True
     first_execution = execution_dates[0]
     last_valuation = max(source_dates) if config.exact_window else execution_dates[-1]
@@ -776,15 +1047,28 @@ def run_stockdemo_compat(
     for execution_date in valuation_dates:
         signal_date = execution_map.get(execution_date)
         day = by_date[execution_date]
+        day, carried_forward_tickers, carried_forward_value = _carry_forward_missing_holdings(
+            holdings=holdings,
+            holding_adj=holding_adj,
+            last_balance_price=last_balance_prices,
+            day=day,
+            date=execution_date,
+            policy=config.missing_held_policy,
+        )
         _apply_corporate_action(holdings, holding_adj, day)
-        missing_before = pd.Index(holdings).difference(day.index)
-        if len(missing_before):
-            raise InputDataError(
-                "stockdemo market is missing held ticker(s): "
-                f"{missing_before.tolist()[:10]}"
-            )
+        terminal_writeoff_tickers, terminal_writeoff_value = _writeoff_missing_holdings(
+            holdings=holdings,
+            holding_adj=holding_adj,
+            last_balance_price=last_balance_prices,
+            day=day,
+            date=execution_date,
+            policy=config.missing_held_policy,
+            terminal_events=terminal_events,
+        )
         pre_value = cash + sum(
             float(volume) * float(day.loc[ticker, "ideal_trade_price"])
+            if np.isfinite(float(day.loc[ticker, "ideal_trade_price"]))
+            else 0.0
             for ticker, volume in holdings.items()
         )
         day_orders: list[dict[str, Any]] = []
@@ -799,6 +1083,7 @@ def run_stockdemo_compat(
                     longx=config.longx,
                     keep=config.keep,
                     first_day=first,
+                    turnover_mode=config.turnover_mode,
                 )
             else:
                 target = target_by_date[signal_date]
@@ -825,6 +1110,8 @@ def run_stockdemo_compat(
             float(volume) * float(day.loc[ticker, "balance_price"])
             for ticker, volume in holdings.items()
         )
+        for ticker in holdings:
+            last_balance_prices[str(ticker)] = float(day.loc[ticker, "balance_price"])
         nav_value = cash + market_value
         buy_amount = float(
             sum(order["amount"] for order in day_orders if order["B/S"] == "buy")
@@ -844,6 +1131,12 @@ def run_stockdemo_compat(
                 "buy_amount": buy_amount,
                 "sell_amount": sell_amount,
                 "holdings": len(holdings),
+                "terminal_writeoff_count": int(len(terminal_writeoff_tickers)),
+                "terminal_writeoff_value": float(terminal_writeoff_value),
+                "terminal_writeoff_tickers": ",".join(map(str, terminal_writeoff_tickers.tolist())),
+                "carried_forward_count": int(len(carried_forward_tickers)),
+                "carried_forward_value": float(carried_forward_value),
+                "carried_forward_tickers": ",".join(map(str, carried_forward_tickers.tolist())),
             }
         )
         for ticker, volume in holdings.items():

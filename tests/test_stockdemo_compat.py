@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from portfolio_runtime.config import DEFAULT_CONFIG
 from portfolio_runtime.errors import InputDataError
 from portfolio_runtime.stockdemo_compat import (
     _equal_target,
@@ -19,8 +20,25 @@ from portfolio_runtime.stockdemo_compat import (
     StockDemoPortfolioState,
     advance_stockdemo_state,
     load_stockdemo_market,
+    load_terminal_events,
     run_stockdemo_compat,
 )
+
+
+def test_defaults_match_ba875_single_factor_execution() -> None:
+    config = StockDemoExecutionConfig()
+
+    assert config.longx == 200
+    assert config.stock_pool == "whole"
+    assert config.trade_price_type == "twap"
+    assert config.buy_sell_shift == 1
+    assert config.transaction == pytest.approx(1.4)
+    assert config.keep == pytest.approx(0.7)
+    assert config.turnover_mode == "flex"
+    assert config.missing_held_policy == "carry_forward"
+    assert config.initial_cash == pytest.approx(100_000_000.0)
+    assert DEFAULT_CONFIG["baseline"]["top_n"] == 200
+    assert DEFAULT_CONFIG["cost_model"]["linear_cost_bps"] == pytest.approx(7.0)
 
 
 def _market() -> pd.DataFrame:
@@ -281,3 +299,232 @@ def test_missing_positive_target_can_remain_in_cash(tmp_path: Path) -> None:
     assert snapshot["missing_target_tickers"] == "000099.SZ"
     assert all(row["ticker"] != "000099.SZ" for row in transactions)
     assert snapshot["cash"] == pytest.approx(499_650.0)
+
+
+
+def test_carry_forward_preserves_missing_holding_and_valuation(tmp_path: Path) -> None:
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    market = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230104
+    )
+    state = StockDemoPortfolioState.initial(1_000_000.0)
+    first_day = market.loc[market["date"].eq("20230102")].set_index("ticker")
+    first_snapshot, _, _, _ = advance_stockdemo_state(
+        state=state,
+        date="20230102",
+        day=first_day,
+        fee_rate=0.0007,
+        target=pd.Series({"000001.SZ": 1.0}),
+    )
+    missing_day = market.loc[
+        market["date"].eq("20230103") & market["ticker"].ne("000001.SZ")
+    ].set_index("ticker")
+
+    snapshot, transactions, holding_rows, weights = advance_stockdemo_state(
+        state=state,
+        date="20230103",
+        day=missing_day,
+        fee_rate=0.0007,
+        missing_held_policy="carry_forward",
+    )
+
+    assert snapshot["carried_forward_count"] == 1
+    assert snapshot["carried_forward_tickers"] == "000001.SZ"
+    assert snapshot["carried_forward_value"] > 0
+    assert snapshot["unrealized_pnl"] == pytest.approx(first_snapshot["unrealized_pnl"])
+    assert transactions == []
+    assert state.holdings["000001.SZ"] > 0
+    assert holding_rows[0]["ticker"] == "000001.SZ"
+    assert weights.index.tolist() == ["000001.SZ"]
+
+
+def test_terminal_manifest_loads_and_normalizes(tmp_path: Path) -> None:
+    manifest = tmp_path / "terminal_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "terminal_events": [
+                    {"date": "2023-01-04", "ticker": "000001.SZ", "return": -1.0},
+                    {"date": 20230104, "ticker": "000002.SZ", "return": -1},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    events = load_terminal_events(manifest)
+    assert events == {"20230104": frozenset({"000001.SZ", "000002.SZ"})}
+
+
+def test_terminal_writeoff_removes_only_declared_missing_holding(tmp_path: Path) -> None:
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    market = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230104
+    )
+    state = StockDemoPortfolioState.initial(1_000_000.0)
+    advance_stockdemo_state(
+        state=state,
+        date="20230102",
+        day=market.loc[market["date"].eq("20230102")].set_index("ticker"),
+        fee_rate=0.0007,
+        target=pd.Series({"000001.SZ": 0.5, "000002.SZ": 0.5}),
+    )
+    advance_stockdemo_state(
+        state=state,
+        date="20230103",
+        day=market.loc[market["date"].eq("20230103")].set_index("ticker"),
+        fee_rate=0.0007,
+    )
+    day = market.loc[
+        market["date"].eq("20230104") & market["ticker"].ne("000001.SZ")
+    ].set_index("ticker")
+    snapshot, _, holding_rows, weights = advance_stockdemo_state(
+        state=state,
+        date="20230104",
+        day=day,
+        fee_rate=0.0007,
+        missing_held_policy="terminal_writeoff",
+        terminal_events={"20230104": {"000001.SZ"}},
+    )
+    assert snapshot["terminal_writeoff_count"] == 1
+    assert snapshot["terminal_writeoff_tickers"] == "000001.SZ"
+    assert snapshot["terminal_writeoff_value"] > 0
+    assert "000001.SZ" not in state.holdings
+    assert "000001.SZ" not in {row["ticker"] for row in holding_rows}
+    assert set(weights.index) == {"000002.SZ"}
+
+
+def test_undeclared_missing_holding_still_fails(tmp_path: Path) -> None:
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    market = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230104
+    )
+    state = StockDemoPortfolioState.initial(1_000_000.0)
+    advance_stockdemo_state(
+        state=state,
+        date="20230102",
+        day=market.loc[market["date"].eq("20230102")].set_index("ticker"),
+        fee_rate=0.0007,
+        target=pd.Series({"000001.SZ": 0.5, "000002.SZ": 0.5}),
+    )
+    with pytest.raises(InputDataError, match="missing held ticker"):
+        advance_stockdemo_state(
+            state=state,
+            date="20230103",
+            day=market.loc[
+                market["date"].eq("20230103") & market["ticker"].ne("000001.SZ")
+            ].set_index("ticker"),
+            missing_held_policy="error",
+            fee_rate=0.0007,
+        )
+
+
+
+
+def test_stockdemo_replay_accepts_manifest_terminal_event(tmp_path: Path) -> None:
+    market_path = tmp_path / "market.parquet"
+    source = _market().loc[
+        ~((_market()["date"] == 20230104) & (_market()["ticker"] == "000001.SZ"))
+    ].copy()
+    source.to_parquet(market_path, index=False)
+    market = load_stockdemo_market(market_path, start_date=20230102, end_date=20230104)
+    targets = pd.DataFrame(
+        {
+            "date": [20230102, 20230103],
+            "ticker": ["000001.SZ", "000001.SZ"],
+            "target_weight": [1.0, 1.0],
+        }
+    )
+    summary = run_stockdemo_compat(
+        market=market,
+        targets=targets,
+        output_dir=tmp_path / "output",
+        config=StockDemoExecutionConfig(
+            longx=1,
+            initial_cash=1_000_000.0,
+            exact_window=False,
+            missing_target_policy="cash",
+            missing_held_policy="terminal_writeoff",
+        ),
+        terminal_events={"20230104": {"000001.SZ"}},
+    )
+    stats = pd.read_csv(tmp_path / "output" / "stats.csv")
+    terminal = stats.loc[stats["date"].eq(20230104)].iloc[0]
+    assert terminal["terminal_writeoff_count"] == 1
+    assert terminal["terminal_writeoff_tickers"] == "000001.SZ"
+    assert summary["metrics"]["observations"] == 2
+
+
+
+def test_flex_turnover_mode_matches_factor_backtest_rule() -> None:
+    tickers = ["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"]
+    day = pd.DataFrame(
+        {
+            "ideal_trade_price": [0.05, 0.03, 0.02, 0.01],
+            "is_open": [True] * 4,
+            "zt": [False] * 4,
+            "dt": [False] * 4,
+            "is_st": [False] * 4,
+        },
+        index=tickers,
+    )
+    holdings = {ticker: 100.0 for ticker in tickers[:3]}
+    signal = pd.Series({ticker: score for ticker, score in zip(tickers, [4.0, 3.0, 2.0, 1.0])})
+
+    flex = _equal_target(
+        signal, day, holdings, longx=3, keep=0.7, first_day=False, turnover_mode="flex"
+    )
+    normal = _equal_target(
+        signal, day, holdings, longx=3, keep=0.7, first_day=False, turnover_mode="normal"
+    )
+
+    assert set(flex.index) == {"000001.SZ", "000002.SZ", "000003.SZ"}
+    assert set(normal.index) == {"000001.SZ", "000002.SZ", "000004.SZ"}
+
+
+def test_missing_signal_is_sorted_last_for_keep_budget() -> None:
+    tickers = ["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"]
+    day = pd.DataFrame(
+        {
+            "ideal_trade_price": [1.0] * 4,
+            "is_open": [True] * 4,
+            "zt": [False] * 4,
+            "dt": [False] * 4,
+            "is_st": [False] * 4,
+        },
+        index=tickers,
+    )
+    holdings = {ticker: 100.0 for ticker in tickers[:3]}
+    # 000001 is absent from the executable signal universe, as it would be
+    # when the stock is locked down on the execution date.
+    signal = pd.Series({"000002.SZ": 1.0, "000003.SZ": 2.0, "000004.SZ": 3.0})
+
+    target = _equal_target(
+        signal, day, holdings, longx=3, keep=0.2, first_day=False, turnover_mode="flex"
+    )
+
+    assert "000001.SZ" in target.index
+    assert "000004.SZ" in target.index
+
+
+def test_legacy_wide_twap_overlay_overrides_market_alias(tmp_path: Path) -> None:
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    twap_path = tmp_path / "trade_price.parquet"
+    pd.DataFrame(
+        {
+            "000001": [101.0],
+            "000002": [111.0],
+            "688001": [121.0],
+        },
+        index=pd.Index([20230102], name=None),
+    ).to_parquet(twap_path)
+
+    loaded = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230102, twap_file=twap_path
+    )
+    row = loaded.loc[loaded["ticker"].eq("000001.SZ")].iloc[0]
+    assert row["twap"] == pytest.approx(101.0)
+    assert row["trade_price"] == pytest.approx(101.0)

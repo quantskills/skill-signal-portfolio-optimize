@@ -119,6 +119,22 @@ date? | ticker | tradable
 
 Accepted true values are `true`, `1`, `yes`, and `y`; false values are `false`, `0`, `no`, and `n`. A false value freezes the asset at its current weight.
 
+## Terminal event manifest (optional)
+
+Only for confirmed terminal holdings that disappear from the execution market, supply the manifest produced alongside derived rolling returns:
+
+```json
+{
+  "terminal_events": [
+    {"date": "20230710", "ticker": "300392.SZ", "return": -1.0}
+  ]
+}
+```
+
+For legacy StockDemo parity, `carry_forward` records missing held tickers and values them at their last valid close without treating the gap as a return or making them tradable.
+
+The event date is the first missing execution date. Events are normalized to `YYYYMMDD` and exchange-qualified tickers; any return other than exactly `-1.0` is rejected. This manifest does not fill market rows or alter raw returns. It is accepted only with the explicit Stockdemo policy `terminal_writeoff`; under `error` ordinary missing held tickers remain fatal, while the default `carry_forward` does not infer a terminal event.
+
 ## Rolling asset returns
 
 Required by the rolling runner:

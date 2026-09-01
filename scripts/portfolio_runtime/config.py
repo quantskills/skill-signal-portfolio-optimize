@@ -39,7 +39,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "minimum_signal_capture": 0.995,
         "stability_penalty": 1.0e-8,
     },
-    "cost_model": {"linear_cost_bps": 0.0},
+    # ba875fc8 uses transaction=1.4 per-thousand round-trip, which is
+    # 7 bps for the one-way turnover cost used by the optimizer.
+    "cost_model": {"linear_cost_bps": 7.0},
     "constraints": {
         "max_weight": 0.20,
         "max_active_weight": 0.15,
@@ -53,7 +55,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "weight_sum_tolerance": 1.0e-8,
         "constraint_tolerance": 1.0e-6,
     },
-    "baseline": {"top_n": 5},
+    "baseline": {"top_n": 200},
 }
 
 
