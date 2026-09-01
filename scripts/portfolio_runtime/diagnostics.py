@@ -25,7 +25,7 @@ def expand_limits(
                 parts.append(f"missing {sorted(missing)}")
             if extra:
                 parts.append(f"unknown {sorted(extra)}")
-            raise ConfigError(f"{label} mapping does not match inputs: {"; ".join(parts)}")
+            raise ConfigError(f"{label} mapping does not match inputs: {'; '.join(parts)}")
         return {name: float(specification[name]) for name in names}
     return {name: float(specification) for name in names}
 
