@@ -1,14 +1,16 @@
-schema_version: 5
+schema_version: 6
 
 signal:
   type: rank_score
   higher_is_better: true
   winsorize_mad: 5.0
   zscore: true
-  rank_transform: normal_score
+  rank_transform: uniform
   rank_power: 1.0
   annualized_alpha_scale: 0.05
-  missing_prediction_policy: error_except_frozen
+  missing_prediction_policy: role_aware
+  minimum_daily_signal_count_ratio: 0.80
+  maximum_prior_candidate_missing_ratio: 0.10
 
 covariance:
   risk_form: factor_model
@@ -18,19 +20,20 @@ covariance:
   symmetry_tolerance: 1.0e-10
 
 optimizer:
-  objective_mode: lexicographic_signal_cost
+  objective_mode: blended_minimum_variance
   solver_backend: clarabel_socp
-  risk_aversion: 5.0
-  turnover_penalty: 0.001
+  risk_aversion: 1.0
+  turnover_penalty: 0.0
   smoothing_epsilon: 1.0e-8
-  max_iterations: 4000
-  ftol: 1.0e-9
+  max_iterations: 500
+  ftol: 1.0e-8
   minimum_signal_capture: 0.995
   stability_penalty: 1.0e-8
   warm_start: true
   conic_cache_size: 8
   fallback_policy: error
   max_cutting_planes: 100
+  blend_strength: 0.10
 
 cost_model:
   linear_cost_bps: 7.0
@@ -38,25 +41,15 @@ cost_model:
 constraints:
   max_weight: 0.02
   max_active_weight: 0.02
-  max_turnover: 0.30
-  max_tracking_error: 0.06
+  max_turnover: null
+  max_tracking_error: null
   sector_active_limit: null
   factor_active_limit: null
   industry_active_range: null
-  style_active_ranges:
-    SIZE:
-      enabled: true
-      target_active: 0.00
-      tolerance: 0.05
-    BETA:
-      enabled: false
-    MOMENTUM:
-      enabled: false
-    RESVOL:
-      enabled: false
-    NLSIZE:
-      enabled: false
-  candidate_weight_range: null
+  style_active_ranges: null
+  candidate_weight_range:
+    min_weight: 0.95
+    max_weight: 1.0
   weight_sum_tolerance: 1.0e-8
   constraint_tolerance: 1.0e-6
 

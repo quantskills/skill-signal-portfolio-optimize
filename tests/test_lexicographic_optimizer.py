@@ -272,7 +272,21 @@ def test_secondary_accepts_primary_turnover_within_final_tolerance() -> None:
     assert final_turnover <= constraints["max_turnover"] + constraints["constraint_tolerance"]
 
 
-def test_auto_backend_is_selected_before_solve_without_fallback() -> None:
-    assert select_lexicographic_backend("auto") == "scipy_highs_lexicographic"
-    with pytest.raises(OptimizationError, match="CLARABEL"):
-        select_lexicographic_backend("cvxpy")
+
+def test_auto_backend_selection_matches_available_dependencies() -> None:
+    try:
+        import cvxpy as cp
+
+        has_clarabel = "CLARABEL" in set(cp.installed_solvers())
+    except ImportError:
+        has_clarabel = False
+
+    if has_clarabel:
+        assert select_lexicographic_backend("auto") == "cvxpy_clarabel"
+        assert select_lexicographic_backend("clarabel_socp") == "cvxpy_clarabel"
+    else:
+        assert select_lexicographic_backend("auto") == "scipy_highs_lexicographic"
+        with pytest.raises(OptimizationError, match="CLARABEL"):
+            select_lexicographic_backend("clarabel_socp")
+        with pytest.raises(OptimizationError, match="fallback_policy is error"):
+            select_lexicographic_backend("auto", fallback_policy="error")

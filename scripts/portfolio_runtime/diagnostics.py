@@ -235,6 +235,7 @@ def constraint_report(
     constraint_config: dict[str, Any],
     *,
     candidate_mask: pd.Series | None = None,
+    exit_only_mask: pd.Series | None = None,
 ) -> dict[str, Any]:
     tolerance = float(constraint_config["constraint_tolerance"])
     weight_sum_tolerance = float(constraint_config["weight_sum_tolerance"])
@@ -264,6 +265,8 @@ def constraint_report(
             np.sqrt(max(as_portfolio_risk(covariance).variance(active.to_numpy(dtype=float)), 0.0))
         ),
         "maximum_frozen_weight_deviation": None,
+        "maximum_exit_only_weight_increase": None,
+        "exit_only_asset_count": 0,
         "industry_exposures": {},
         "style_exposures": {},
         "candidate_weight": None,
@@ -320,6 +323,20 @@ def constraint_report(
                             "max_active_weight": max_active_weight,
                         }
                     )
+
+    if exit_only_mask is not None:
+        aligned_exit_only = exit_only_mask.reindex(weights.index)
+        if aligned_exit_only.isna().any():
+            raise ConfigError("exit-only mask does not match portfolio weights")
+        aligned_exit_only = aligned_exit_only.astype(bool)
+        report["exit_only_asset_count"] = int(aligned_exit_only.sum())
+        if aligned_exit_only.any():
+            if current is None:
+                raise ConfigError("exit-only constraints require current weights")
+            increases = weights[aligned_exit_only] - current[aligned_exit_only]
+            report["maximum_exit_only_weight_increase"] = float(
+                max(float(increases.max()), 0.0)
+            )
 
     sector_ranges: dict[str, dict[str, float]] = {}
     if sectors is not None:
@@ -381,6 +398,11 @@ def constraint_report(
         )
     if report["maximum_frozen_weight_deviation"] is not None:
         violation("tradability_freeze", report["maximum_frozen_weight_deviation"])
+    if report["maximum_exit_only_weight_increase"] is not None:
+        violation(
+            "exit_only_no_increase",
+            report["maximum_exit_only_weight_increase"],
+        )
 
     candidate_detail = report["candidate_weight_range"]
     if (
@@ -447,6 +469,11 @@ def constraint_report(
             None
             if report["maximum_frozen_weight_deviation"] is None
             else tolerance - report["maximum_frozen_weight_deviation"]
+        ),
+        "exit_only_no_increase": (
+            None
+            if report["maximum_exit_only_weight_increase"] is None
+            else tolerance - report["maximum_exit_only_weight_increase"]
         ),
     }
     report["passed"] = not report["violations"]

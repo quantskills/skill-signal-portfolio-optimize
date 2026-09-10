@@ -1,3 +1,3 @@
 """Core runtime for single-signal portfolio optimization."""
 
-__version__ = "1.3.3"
+__version__ = "1.7.0"

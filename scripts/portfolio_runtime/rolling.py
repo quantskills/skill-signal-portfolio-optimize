@@ -30,14 +30,17 @@ from .io import (
     DateTableCache,
     load_candidate_universe,
     load_signal,
-    load_tradability,
     load_weight_series,
     normalize_date,
     read_table,
     sha256_file,
 )
 from .pipeline import OUTPUT_FILES as SINGLE_DATE_OUTPUT_FILES
-from .pipeline import build_optimization_universe, run_single_date
+from .pipeline import (
+    build_optimization_universe,
+    resolve_optimization_tradability,
+    run_single_date,
+)
 from .stockdemo_compat import (
     StockDemoExecutionConfig,
     StockDemoPortfolioState,
@@ -178,6 +181,341 @@ def _select_rebalance_dates(
     return selected
 
 
+
+def _preflight_signal_coverage(
+    *,
+    signal_file: str | Path,
+    candidate_file: str | Path | None,
+    dates: list[str],
+    signal_config: dict[str, Any],
+    table_cache: DateTableCache,
+) -> dict[str, Any]:
+    """Reject candidate gaps and abrupt full-signal loss before risk construction."""
+    minimum_count_ratio = float(
+        signal_config["minimum_daily_signal_count_ratio"]
+    )
+    maximum_prior_missing_ratio = float(
+        signal_config["maximum_prior_candidate_missing_ratio"]
+    )
+    counts: dict[str, int] = {}
+    minimum_observed_count_ratio = 1.0
+    maximum_observed_prior_missing_ratio = 0.0
+    previous_signal_count: int | None = None
+    previous_candidates: pd.Index | None = None
+
+    for date in dates:
+        signal = load_signal(signal_file, date, table_cache=table_cache)
+        candidates = (
+            signal.index
+            if candidate_file is None
+            else load_candidate_universe(candidate_file, date, table_cache=table_cache)
+        )
+        missing_candidates = candidates.difference(signal.index)
+        if len(missing_candidates):
+            raise InputDataError(
+                "rolling signal preflight found candidate ticker(s) without prediction "
+                f"on {date}: {list(missing_candidates[:10])}"
+            )
+
+        count = int(len(signal))
+        counts[date] = count
+        if previous_signal_count is not None:
+            count_ratio = count / previous_signal_count
+            minimum_observed_count_ratio = min(
+                minimum_observed_count_ratio, count_ratio
+            )
+            if count_ratio < minimum_count_ratio:
+                raise InputDataError(
+                    "rolling signal preflight found abrupt cross-section loss on "
+                    f"{date}: {count} predictions versus {previous_signal_count} "
+                    f"on the prior rebalance date (ratio={count_ratio:.6f}, "
+                    f"minimum={minimum_count_ratio:.6f})"
+                )
+
+        if previous_candidates is not None and len(previous_candidates):
+            missing_prior = previous_candidates.difference(signal.index)
+            prior_missing_ratio = len(missing_prior) / len(previous_candidates)
+            maximum_observed_prior_missing_ratio = max(
+                maximum_observed_prior_missing_ratio, prior_missing_ratio
+            )
+            if prior_missing_ratio > maximum_prior_missing_ratio:
+                raise InputDataError(
+                    "rolling signal preflight found too many prior candidates without "
+                    f"prediction on {date}: {len(missing_prior)}/{len(previous_candidates)} "
+                    f"(ratio={prior_missing_ratio:.6f}, "
+                    f"maximum={maximum_prior_missing_ratio:.6f}); "
+                    f"examples={list(missing_prior[:10])}"
+                )
+
+        previous_signal_count = count
+        previous_candidates = candidates
+
+    return {
+        "status": "passed",
+        "date_count": len(dates),
+        "first_date": dates[0],
+        "last_date": dates[-1],
+        "minimum_configured_daily_signal_count_ratio": minimum_count_ratio,
+        "minimum_observed_daily_signal_count_ratio": minimum_observed_count_ratio,
+        "maximum_configured_prior_candidate_missing_ratio": (
+            maximum_prior_missing_ratio
+        ),
+        "maximum_observed_prior_candidate_missing_ratio": (
+            maximum_observed_prior_missing_ratio
+        ),
+        "minimum_signal_count": min(counts.values()),
+        "maximum_signal_count": max(counts.values()),
+    }
+
+def _risk_period_key(date: str, frequency: str) -> str:
+    if frequency == "daily":
+        return date
+    if frequency == "monthly":
+        return date[:6]
+    if frequency == "weekly":
+        iso = pd.Timestamp(date).isocalendar()
+        return f"{int(iso.year):04d}W{int(iso.week):02d}"
+    raise InputDataError(
+        "risk_refresh_frequency must be daily, weekly, or monthly"
+    )
+
+
+def _risk_model_date_for(
+    date: str, dates: list[str], frequency: str
+) -> str:
+    if frequency == "daily":
+        return date
+    period = _risk_period_key(date, frequency)
+    for candidate in dates:
+        if _risk_period_key(candidate, frequency) == period:
+            return candidate
+    raise InputDataError(
+        f"no risk model date available for {frequency} period {period}"
+    )
+
+
+def _period_model_universes(
+    signal_file: str | Path,
+    candidate_file: str | Path | None,
+    benchmark_file: str | Path,
+    dates: list[str],
+    table_cache: DateTableCache,
+    *,
+    frequency: str,
+) -> dict[str, pd.Index]:
+    universes: dict[str, set[str]] = {}
+    for date in dates:
+        candidates = (
+            load_signal(
+                signal_file, date, table_cache=table_cache
+            ).index
+            if candidate_file is None
+            else load_candidate_universe(
+                candidate_file, date, table_cache=table_cache
+            )
+        )
+        benchmark = load_weight_series(
+            benchmark_file,
+            date,
+            "benchmark_weight",
+            "benchmark",
+            table_cache=table_cache,
+        )
+        period = _risk_period_key(date, frequency)
+        universes.setdefault(period, set()).update(
+            str(value) for value in candidates
+        )
+        universes[period].update(
+            str(value) for value in benchmark.index
+        )
+    return {
+        period: pd.Index(sorted(values), name="ticker")
+        for period, values in universes.items()
+    }
+
+
+def _monthly_model_universes(
+    signal_file: str | Path,
+    candidate_file: str | Path | None,
+    benchmark_file: str | Path,
+    dates: list[str],
+    table_cache: DateTableCache,
+) -> dict[str, pd.Index]:
+    """Compatibility wrapper for existing monthly callers and tests."""
+    return _period_model_universes(
+        signal_file,
+        candidate_file,
+        benchmark_file,
+        dates,
+        table_cache,
+        frequency="monthly",
+    )
+
+
+def _preflight_periodic_risk_coverage(
+    dynamic_cache: DynamicRiskModelCache,
+    *,
+    planned_universes: dict[str, pd.Index],
+    benchmark_file: str | Path,
+    dates: list[str],
+    tolerance: float,
+    table_cache: DateTableCache,
+    frequency: str,
+) -> dict[str, Any]:
+    """Reject periodic benchmark risk gaps before optimization."""
+    model_dates: dict[str, str] = {}
+    for date in dates:
+        model_dates.setdefault(
+            _risk_period_key(date, frequency), date
+        )
+
+    rows: list[dict[str, Any]] = []
+    for period, model_date in model_dates.items():
+        requested = planned_universes[period]
+        coverage = dynamic_cache.model_universe_coverage(
+            model_date, requested
+        )
+        benchmark = load_weight_series(
+            benchmark_file,
+            model_date,
+            "benchmark_weight",
+            "benchmark",
+            table_cache=table_cache,
+        )
+        hard_required = pd.Index(
+            sorted(
+                benchmark[
+                    benchmark.abs() > tolerance
+                ].index
+            ),
+            name="ticker",
+        )
+        hard_coverage = coverage.reindex(hard_required)
+        missing = hard_coverage.loc[
+            ~hard_coverage["available"].fillna(False)
+        ]
+        if not missing.empty:
+            details = [
+                f"{ticker}({row['missing_reasons'] or 'not_requested'})"
+                for ticker, row in missing.iterrows()
+            ]
+            raise InputDataError(
+                f"{frequency} risk preflight cannot cover benchmark "
+                f"as of {model_date}: {details[:10]}"
+            )
+        row = {
+            "period": period,
+            "frequency": frequency,
+            "model_date": model_date,
+            "requested_asset_count": int(len(coverage)),
+            "available_asset_count": int(
+                coverage["available"].sum()
+            ),
+            "excluded_planned_asset_count": int(
+                (~coverage["available"]).sum()
+            ),
+            "benchmark_asset_count": int(len(hard_required)),
+        }
+        if frequency == "monthly":
+            row["month"] = period
+        if frequency == "weekly":
+            row["week"] = period
+        rows.append(row)
+
+    return {
+        "status": "passed",
+        "frequency": frequency,
+        "model_count": len(rows),
+        "first_model_date": rows[0]["model_date"],
+        "last_model_date": rows[-1]["model_date"],
+        "maximum_excluded_planned_asset_count": max(
+            row["excluded_planned_asset_count"] for row in rows
+        ),
+        "models": rows,
+    }
+
+
+def _preflight_monthly_risk_coverage(
+    dynamic_cache: DynamicRiskModelCache,
+    *,
+    planned_universes: dict[str, pd.Index],
+    benchmark_file: str | Path,
+    dates: list[str],
+    tolerance: float,
+    table_cache: DateTableCache,
+) -> dict[str, Any]:
+    """Compatibility wrapper for existing monthly callers and tests."""
+    return _preflight_periodic_risk_coverage(
+        dynamic_cache,
+        planned_universes=planned_universes,
+        benchmark_file=benchmark_file,
+        dates=dates,
+        tolerance=tolerance,
+        table_cache=table_cache,
+        frequency="monthly",
+    )
+
+
+def _initialize_period_model_universe(
+    dynamic_cache: DynamicRiskModelCache,
+    *,
+    model_date: str,
+    planned_universe: pd.Index,
+    benchmark: pd.Series,
+    current: pd.Series,
+    tolerance: float,
+    frequency: str,
+) -> pd.Index:
+    held = pd.Index(
+        current[current.abs() > tolerance].index,
+        name="ticker",
+    )
+    requested = planned_universe.union(held)
+    available = dynamic_cache.available_model_universe(
+        model_date, requested
+    )
+    hard_required = pd.Index(
+        sorted(
+            set(
+                benchmark[
+                    benchmark.abs() > tolerance
+                ].index
+            )
+            | set(held)
+        ),
+        name="ticker",
+    )
+    missing = hard_required.difference(available)
+    if len(missing):
+        raise InputDataError(
+            f"{frequency} risk model cannot cover benchmark or "
+            f"carried holding(s) as of {model_date}: "
+            f"{list(missing[:10])}"
+        )
+    return available
+
+
+def _initialize_monthly_model_universe(
+    dynamic_cache: DynamicRiskModelCache,
+    *,
+    model_date: str,
+    planned_universe: pd.Index,
+    benchmark: pd.Series,
+    current: pd.Series,
+    tolerance: float,
+) -> pd.Index:
+    """Compatibility wrapper for existing monthly callers and tests."""
+    return _initialize_period_model_universe(
+        dynamic_cache,
+        model_date=model_date,
+        planned_universe=planned_universe,
+        benchmark=benchmark,
+        current=current,
+        tolerance=tolerance,
+        frequency="monthly",
+    )
+
+
 def _initial_weights(
     first_date: str,
     benchmark_file: str | Path,
@@ -220,6 +558,16 @@ def _diagnostic_rows(
         "objective_mode": solver.get("objective_mode"),
         "solver_iterations": solver.get("iterations"),
         "objective_value": solver.get("objective_value"),
+        "solver_wall_seconds": solver.get("solver_wall_seconds"),
+        "problem_compile_seconds": solver.get("problem_compile_seconds"),
+        "problem_cache_hit": bool(solver.get("problem_cache_hit", False)),
+        "problem_cache_key": solver.get("problem_cache_key"),
+        "problem_is_dpp": solver.get("problem_is_dpp"),
+        "warm_start_requested": solver.get("warm_start_requested"),
+        "risk_operator_rows": solver.get("risk_operator_rows"),
+        "tracking_error_constraint_form": solver.get(
+            "tracking_error_constraint_form"
+        ),
         "primary_signal_utility": optimization_summary.get("primary_signal_utility"),
         "signal_utility_floor": optimization_summary.get("signal_utility_floor"),
         "signal_utility_solver_floor": optimization_summary.get(
@@ -236,6 +584,14 @@ def _diagnostic_rows(
         "estimated_transaction_cost": optimization_summary.get("estimated_transaction_cost"),
         "turnover_saved": optimization_summary.get("turnover_saved"),
         "risk_form": optimization_summary.get("risk_form"),
+        "blend_strength": optimization_summary.get("blend_strength"),
+        "anchor_asset_count": optimization_summary.get("anchor_asset_count"),
+        "anchor_predicted_volatility": optimization_summary.get("anchor_predicted_volatility"),
+        "minimum_variance_predicted_volatility": optimization_summary.get("minimum_variance_predicted_volatility"),
+        "optimized_predicted_volatility": optimization_summary.get("optimized_predicted_volatility"),
+        "predicted_risk_reduction": optimization_summary.get("predicted_risk_reduction"),
+        "anchor_reallocation": optimization_summary.get("anchor_reallocation"),
+        "maximum_anchor_weight_deviation": optimization_summary.get("maximum_anchor_weight_deviation"),
         "backend_fallback_used": bool(solver.get("backend_fallback_used", False)),
         "binding_constraints": json.dumps(
             optimization_summary.get("binding_constraints", []), sort_keys=True
@@ -257,6 +613,13 @@ def _diagnostic_rows(
         "candidate_asset_count": signal_payload["candidate_asset_count"],
         "optimization_asset_count": signal_payload["optimization_asset_count"],
         "prediction_coverage": signal_payload["optimization_prediction_coverage"],
+        "missing_security_policy": signal_payload.get("missing_security_policy"),
+        "synthetic_nontradable_asset_count": signal_payload.get(
+            "synthetic_nontradable_asset_count", 0
+        ),
+        "excluded_missing_candidate_count": signal_payload.get(
+            "excluded_missing_candidate_count", 0
+        ),
         "candidate_target_weight": signal_payload["portfolio_candidate_weight"][
             "risk_optimized"
         ],
@@ -353,6 +716,8 @@ def run_rolling_experiment(
     start_date: object | None = None,
     end_date: object | None = None,
     rebalance_every: int = 1,
+    risk_refresh_frequency: str = "daily",
+    missing_security_policy: str = "auto",
     transaction_cost_bps: float | None = None,
     risk_model_config: str | Path | None = None,
     risk_returns_file: str | Path | None = None,
@@ -370,6 +735,22 @@ def run_rolling_experiment(
     stockdemo_terminal_events_file: str | Path | None = None,
 ) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
+    if risk_refresh_frequency not in {"daily", "weekly", "monthly"}:
+        raise InputDataError(
+            "risk_refresh_frequency must be daily, weekly, or monthly"
+        )
+    if missing_security_policy not in {"auto", "error", "freeze_last"}:
+        raise InputDataError(
+            "missing_security_policy must be auto, error, or freeze_last"
+        )
+    effective_missing_security_policy = missing_security_policy
+    if missing_security_policy == "auto":
+        effective_missing_security_policy = (
+            "freeze_last"
+            if stockdemo_market_file is not None
+            and stockdemo_missing_held_policy == "carry_forward"
+            else "error"
+        )
     if exposure_file is not None and exposure_root is not None:
         raise InputDataError("configure only one of exposure_file and exposure_root")
     dynamic_required = {
@@ -421,6 +802,37 @@ def run_rolling_experiment(
         rebalance_every=rebalance_every,
         table_cache=table_cache,
     )
+    signal_preflight = _preflight_signal_coverage(
+        signal_file=signal_file,
+        candidate_file=candidate_file,
+        dates=dates,
+        signal_config=portfolio_config["signal"],
+        table_cache=table_cache,
+    )
+    planned_period_model_universes: dict[str, pd.Index] = {}
+    period_model_universes: dict[str, pd.Index] = {}
+    risk_preflight: dict[str, Any] = {"status": "not_applicable"}
+    if (
+        risk_refresh_frequency in {"weekly", "monthly"}
+        and dynamic_cache is not None
+    ):
+        planned_period_model_universes = _period_model_universes(
+            signal_file,
+            candidate_file,
+            benchmark_file,
+            dates,
+            table_cache,
+            frequency=risk_refresh_frequency,
+        )
+        risk_preflight = _preflight_periodic_risk_coverage(
+            dynamic_cache,
+            planned_universes=planned_period_model_universes,
+            benchmark_file=benchmark_file,
+            dates=dates,
+            tolerance=tolerance,
+            table_cache=table_cache,
+            frequency=risk_refresh_frequency,
+        )
     asset_returns = load_asset_returns(str(asset_returns_file))
     if end_date is not None:
         requested_end = normalize_date(end_date)
@@ -474,13 +886,16 @@ def run_rolling_experiment(
             transaction=float(stockdemo_transaction),
             initial_cash=float(stockdemo_initial_cash),
             turnover_mode=stockdemo_turnover_mode,
-            exact_window=True,
+            exact_window=False,
             missing_target_policy=stockdemo_missing_target_policy,
             missing_held_policy=stockdemo_missing_held_policy,
         )
         execution_config.validate()
+        final_execution_date = calendar[positions[dates[-1]] + 1]
         execution_market = load_stockdemo_market(
-            stockdemo_market_file, start_date=dates[0], end_date=dates[-1],
+            stockdemo_market_file,
+            start_date=dates[0],
+            end_date=final_execution_date,
             twap_file=stockdemo_twap_file,
         )
         execution_by_date = {
@@ -548,6 +963,8 @@ def run_rolling_experiment(
             None if candidate_file is None else sha256_file(candidate_file)
         ),
         "benchmark_sha256": sha256_file(benchmark_file),
+        "risk_refresh_frequency": risk_refresh_frequency,
+        "missing_security_policy": effective_missing_security_policy,
         "tradability_sha256": (
             None if tradability_file is None else sha256_file(tradability_file)
         ),
@@ -631,6 +1048,13 @@ def run_rolling_experiment(
             covariance_path: Path | None = None
             factor_covariance_path: Path | None = None
             specific_variance_path: Path | None = None
+            monthly_candidate_excluded_count = 0
+            missing_candidate_excluded_count = 0
+            synthetic_nontradable_count = 0
+            model_universe: pd.Index | None = None
+            risk_model_date = _risk_model_date_for(
+                date, dates, risk_refresh_frequency
+            )
             if dynamic_cache is not None:
                 candidates = (
                     load_signal(signal_file, date, table_cache=table_cache).index
@@ -641,24 +1065,100 @@ def run_rolling_experiment(
                     benchmark_file, date, "benchmark_weight", "benchmark",
                     table_cache=table_cache,
                 )
-                universe = build_optimization_universe(
-                    candidates, benchmark, current, tolerance
+                (
+                    candidates,
+                    universe,
+                    _,
+                    synthetic_nontradable,
+                    excluded_missing_candidates,
+                ) = resolve_optimization_tradability(
+                    candidates=candidates,
+                    benchmark=benchmark,
+                    current=current,
+                    tolerance=tolerance,
+                    tradability_file=tradability_file,
+                    requested_date=date,
+                    missing_security_policy=effective_missing_security_policy,
+                    table_cache=table_cache,
                 )
+                missing_candidate_excluded_count = len(excluded_missing_candidates)
+                synthetic_nontradable_count = len(synthetic_nontradable)
                 dynamic_cache.validate_positive_current_holdings(
                     date, current, tolerance
                 )
-                if tradability_file is not None:
-                    load_tradability(tradability_file, date, universe, table_cache=table_cache)
-                static_covariance = _optional_covariance_path(covariance_root, date)
+                if risk_refresh_frequency in {"weekly", "monthly"}:
+                    period = _risk_period_key(
+                        date, risk_refresh_frequency
+                    )
+                    if period not in period_model_universes:
+                        period_model_universes[period] = (
+                            _initialize_period_model_universe(
+                                dynamic_cache,
+                                model_date=risk_model_date,
+                                planned_universe=(
+                                    planned_period_model_universes[period]
+                                ),
+                                benchmark=benchmark,
+                                current=current,
+                                tolerance=tolerance,
+                                frequency=risk_refresh_frequency,
+                            )
+                        )
+                    model_universe = period_model_universes[period]
+                    excluded_candidates = candidates.difference(
+                        model_universe
+                    )
+                    monthly_candidate_excluded_count = len(
+                        excluded_candidates
+                    )
+                    candidates = candidates.intersection(model_universe)
+                    if candidates.empty:
+                        raise InputDataError(
+                            f"{risk_refresh_frequency} risk model leaves "
+                            f"no eligible candidates on {date}"
+                        )
+                    hard_required = pd.Index(
+                        sorted(
+                            set(
+                                benchmark[
+                                    benchmark.abs() > tolerance
+                                ].index
+                            )
+                            | set(
+                                current[
+                                    current.abs() > tolerance
+                                ].index
+                            )
+                        ),
+                        name="ticker",
+                    )
+                    missing_hard_required = (
+                        hard_required.difference(model_universe)
+                    )
+                    if len(missing_hard_required):
+                        raise InputDataError(
+                            f"fixed {risk_refresh_frequency} risk model "
+                            "does not cover benchmark or carried "
+                            f"holding(s) on {date}: "
+                            f"{list(missing_hard_required[:10])}"
+                        )
+                universe = build_optimization_universe(
+                    candidates, benchmark, current, tolerance
+                )
+                static_covariance = _optional_covariance_path(covariance_root, risk_model_date)
                 if exposure_file is not None:
                     static_exposure = Path(exposure_file).expanduser().resolve()
                 else:
-                    static_exposure = _optional_exposure_path(exposure_root, date)
+                    static_exposure = _optional_exposure_path(exposure_root, risk_model_date)
+                if model_universe is None:
+                    model_universe = universe
                 resolved = dynamic_cache.resolve(
                     date=date,
                     universe=universe,
                     static_covariance_file=static_covariance,
                     static_exposure_file=static_exposure,
+                    model_date=risk_model_date,
+                    model_universe=model_universe,
                 )
                 date_exposure_file = resolved.exposure_file
                 if risk_form == "asset_covariance":
@@ -672,15 +1172,15 @@ def run_rolling_experiment(
             else:
                 date_exposure_file = exposure_file
                 if exposure_root is not None:
-                    date_exposure_file = resolve_exposure_path(exposure_root, date)
+                    date_exposure_file = resolve_exposure_path(exposure_root, risk_model_date)
                 if risk_form == "asset_covariance":
-                    covariance_path = resolve_covariance_path(covariance_root, date)
+                    covariance_path = resolve_covariance_path(covariance_root, risk_model_date)
                 else:
                     factor_covariance_path = resolve_factor_covariance_path(
-                        factor_covariance_root, date
+                        factor_covariance_root, risk_model_date
                     )
                     specific_variance_path = resolve_specific_variance_path(
-                        specific_variance_root, date
+                        specific_variance_root, risk_model_date
                     )
                 risk_fingerprint = _canonical_hash(
                     {
@@ -709,6 +1209,7 @@ def run_rolling_experiment(
                 covariance_inputs.append(
                     {
                         "date": date,
+                        "model_date": risk_model_date,
                         "path": str(covariance_path),
                         "sha256": sha256_file(covariance_path),
                         "source": risk_source,
@@ -718,6 +1219,7 @@ def run_rolling_experiment(
                 exposure_inputs.append(
                     {
                         "date": date,
+                        "model_date": risk_model_date,
                         "path": str(date_exposure_file),
                         "sha256": sha256_file(date_exposure_file),
                     }
@@ -726,6 +1228,7 @@ def run_rolling_experiment(
                 factor_risk_inputs.append(
                     {
                         "date": date,
+                        "model_date": risk_model_date,
                         "factor_covariance_path": str(factor_covariance_path),
                         "factor_covariance_sha256": sha256_file(factor_covariance_path),
                         "specific_variance_path": str(specific_variance_path),
@@ -736,9 +1239,17 @@ def run_rolling_experiment(
             risk_resolutions.append(
                 {
                     "date": date,
+                    "model_date": risk_model_date,
+                    "refresh_frequency": risk_refresh_frequency,
                     "source": risk_source,
                     "fingerprint": risk_fingerprint,
                     "asset_count": risk_asset_count,
+                    "model_universe_asset_count": (
+                        None if model_universe is None else int(len(model_universe))
+                    ),
+                    "monthly_candidate_excluded_count": monthly_candidate_excluded_count,
+                    "missing_candidate_excluded_count": missing_candidate_excluded_count,
+                    "synthetic_nontradable_count": synthetic_nontradable_count,
                     "risk_form": risk_form,
                     "covariance_file": (
                         None if covariance_path is None else str(covariance_path)
@@ -757,6 +1268,13 @@ def run_rolling_experiment(
             signature_payload = {
                 **base_signature_inputs,
                 "date": date,
+                "risk_model_date": risk_model_date,
+                "risk_refresh_frequency": risk_refresh_frequency,
+                "effective_candidate_sha256": (
+                    None
+                    if dynamic_cache is None
+                    else _canonical_hash(candidates.tolist())
+                ),
                 "current_weights_sha256": sha256_file(current_path),
                 "risk_fingerprint": risk_fingerprint,
                 "risk_form": risk_form,
@@ -803,6 +1321,9 @@ def run_rolling_experiment(
                         config_path=config_path,
                         signal_file=signal_file,
                         candidate_file=candidate_file,
+                        candidate_universe=(
+                            candidates if dynamic_cache is not None else None
+                        ),
                         covariance_file=covariance_path,
                         factor_covariance_file=factor_covariance_path,
                         specific_variance_file=specific_variance_path,
@@ -812,6 +1333,7 @@ def run_rolling_experiment(
                         sector_file=sector_file,
                         exposure_file=date_exposure_file,
                         tradability_file=tradability_file,
+                        missing_security_policy=effective_missing_security_policy,
                         requested_date=date,
                         output_dir=build_output,
                         table_cache=table_cache,
@@ -857,6 +1379,13 @@ def run_rolling_experiment(
                         else "configured_initial_or_theoretical_drift"
                     ),
                     "actual_cash_weight": feedback_cash_weight,
+                    "monthly_candidate_excluded_count": (
+                        monthly_candidate_excluded_count
+                    ),
+                    "missing_candidate_excluded_count": (
+                        missing_candidate_excluded_count
+                    ),
+                    "synthetic_nontradable_count": synthetic_nontradable_count,
                 }
             )
             diagnostic_rows.append(diagnostic)
@@ -870,6 +1399,11 @@ def run_rolling_experiment(
                         "position": position,
                         "total": len(dates),
                         "risk_source": risk_source,
+                        "monthly_candidate_excluded_count": (
+                            monthly_candidate_excluded_count
+                        ),
+                        "missing_candidate_excluded_count": missing_candidate_excluded_count,
+                        "synthetic_nontradable_count": synthetic_nontradable_count,
                         "checkpoint_reused": reusable,
                     },
                     ensure_ascii=True,
@@ -877,6 +1411,37 @@ def run_rolling_experiment(
                 ),
                 file=sys.stderr,
                 flush=True,
+            )
+
+        if (
+            execution_state is not None
+            and execution_config is not None
+            and previous_target is not None
+            and previous_date is not None
+        ):
+            previous_market_position = execution_market_positions[previous_date]
+            final_market_position = previous_market_position + 1
+            if final_market_position >= len(execution_market_dates):
+                raise InputDataError(
+                    f"no stockdemo execution date follows final rebalance date {previous_date}"
+                )
+            final_execution_date = execution_market_dates[final_market_position]
+            snapshot, _, _, _ = advance_stockdemo_state(
+                state=execution_state,
+                date=final_execution_date,
+                day=execution_by_date[final_execution_date],
+                fee_rate=execution_config.one_side_fee,
+                target=previous_target,
+                missing_target_policy=execution_config.missing_target_policy,
+                missing_held_policy=execution_config.missing_held_policy,
+                terminal_events=terminal_events,
+            )
+            execution_feedback_rows.append(
+                {
+                    **snapshot,
+                    "target_date": previous_date,
+                    "next_rebalance_date": None,
+                }
             )
 
         rebalance_weights = pd.concat(weight_frames, ignore_index=True)
@@ -973,6 +1538,22 @@ def run_rolling_experiment(
             pd.to_numeric(diagnostics["primary_signal_utility"], errors="coerce")
             - pd.to_numeric(diagnostics["final_signal_utility"], errors="coerce")
         ).dropna()
+        solver_wall_values = pd.to_numeric(
+            diagnostics.get("solver_wall_seconds", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        compile_values = pd.to_numeric(
+            diagnostics.get("problem_compile_seconds", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        cache_eligible = diagnostics.get(
+            "problem_cache_key", pd.Series(index=diagnostics.index, dtype=object)
+        ).notna()
+        cache_hits = diagnostics.get(
+            "problem_cache_hit", pd.Series(False, index=diagnostics.index)
+        ).fillna(False).astype(bool)
+        cache_eligible_count = int(cache_eligible.sum())
+        cache_hit_count = int((cache_eligible & cache_hits).sum())
         rolling_optimization_summary = {
             "objective_mode": portfolio_config["optimizer"]["objective_mode"],
             "risk_form": risk_form,
@@ -982,6 +1563,28 @@ def run_rolling_experiment(
             "rebalance_count": len(dates),
             "all_constraints_passed": bool(diagnostics["constraints_passed"].all()),
             "fallback_count": int(diagnostics["backend_fallback_used"].sum()),
+            "solver_performance": {
+                "total_solver_wall_seconds": (
+                    None
+                    if solver_wall_values.empty
+                    else float(solver_wall_values.sum())
+                ),
+                "mean_solver_wall_seconds": (
+                    None
+                    if solver_wall_values.empty
+                    else float(solver_wall_values.mean())
+                ),
+                "total_problem_compile_seconds": (
+                    None if compile_values.empty else float(compile_values.sum())
+                ),
+                "cache_eligible_count": cache_eligible_count,
+                "cache_hit_count": cache_hit_count,
+                "cache_hit_ratio": (
+                    None
+                    if cache_eligible_count == 0
+                    else float(cache_hit_count / cache_eligible_count)
+                ),
+            },
             "binding_constraint_counts": binding_counts,
             "binding_constraint_ratios": {
                 name: float(count / len(dates)) for name, count in binding_counts.items()
@@ -1035,6 +1638,18 @@ def run_rolling_experiment(
                 ),
                 "terminal_writeoff_value": float(
                     sum(row.get("terminal_writeoff_value", 0.0) for row in execution_feedback_rows)
+                ),
+                "terminal_target_removed_count": int(
+                    sum(
+                        row.get("terminal_target_removed_count", 0)
+                        for row in execution_feedback_rows
+                    )
+                ),
+                "terminal_target_removed_weight": float(
+                    sum(
+                        row.get("terminal_target_removed_weight", 0.0)
+                        for row in execution_feedback_rows
+                    )
                 ),
                 "carried_forward_count": int(
                     sum(row.get("carried_forward_count", 0) for row in execution_feedback_rows)
@@ -1095,6 +1710,10 @@ def run_rolling_experiment(
             "transaction_cost_bps": float(effective_cost_bps),
             "cost_model_resolution": cost_resolution,
             "risk_form": risk_form,
+            "risk_refresh_frequency": risk_refresh_frequency,
+            "missing_security_policy": effective_missing_security_policy,
+            "signal_preflight": signal_preflight,
+            "risk_preflight": risk_preflight,
             "execution_timing": (
                 "target formed on t, executed by Stockdemo rules on the next market date, "
                 "and actual normalized stock holdings feed the next optimization"

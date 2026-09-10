@@ -20,6 +20,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rank_power": 1.0,
         "annualized_alpha_scale": 0.05,
         "missing_prediction_policy": "neutral",
+        "minimum_daily_signal_count_ratio": 0.80,
+        "maximum_prior_candidate_missing_ratio": 0.10,
     },
     "covariance": {
         "risk_form": "asset_covariance",
@@ -38,6 +40,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ftol": 1.0e-10,
         "minimum_signal_capture": 0.995,
         "stability_penalty": 1.0e-8,
+        "warm_start": True,
+        "conic_cache_size": 8,
+        "fallback_policy": "scipy_highs",
+        "max_cutting_planes": 100,
+        "blend_strength": 0.10,
     },
     # ba875fc8 uses transaction=1.4 per-thousand round-trip, which is
     # 7 bps for the one-way turnover cost used by the optimizer.
@@ -215,8 +222,8 @@ def _candidate_weight_range(value: Any) -> dict[str, float] | None:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    if config["schema_version"] not in {1, 2, 3, 4, 5}:
-        raise ConfigError("schema_version must equal 1, 2, 3, 4, or 5")
+    if config["schema_version"] not in {1, 2, 3, 4, 5, 6, 7}:
+        raise ConfigError("schema_version must equal 1, 2, 3, 4, 5, 6, or 7")
 
     signal = config["signal"]
     if signal["type"] not in {"rank_score", "expected_return"}:
@@ -253,18 +260,28 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if signal["missing_prediction_policy"] not in {
         "neutral",
         "error_except_frozen",
+        "role_aware",
     }:
         raise ConfigError(
-            "signal.missing_prediction_policy must be neutral or error_except_frozen"
+            "signal.missing_prediction_policy must be neutral, "
+            "error_except_frozen, or role_aware"
         )
     if (
-        config["schema_version"] in {3, 4, 5}
-        and signal["missing_prediction_policy"] != "error_except_frozen"
+        config["schema_version"] in {3, 4, 5, 6, 7}
+        and signal["missing_prediction_policy"]
+        not in {"error_except_frozen", "role_aware"}
     ):
         raise ConfigError(
-            "schema_version 3, 4, or 5 requires signal.missing_prediction_policy "
-            "error_except_frozen"
+            "schema_version 3, 4, 5, 6, or 7 requires signal.missing_prediction_policy "
+            "error_except_frozen or role_aware"
         )
+    for key in (
+        "minimum_daily_signal_count_ratio",
+        "maximum_prior_candidate_missing_ratio",
+    ):
+        signal[key] = _finite_number(signal[key], f"signal.{key}", minimum=0.0)
+        if signal[key] > 1.0:
+            raise ConfigError(f"signal.{key} must not exceed 1")
 
     covariance = config["covariance"]
     if covariance["risk_form"] not in {"asset_covariance", "factor_model"}:
@@ -292,14 +309,29 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "mean_variance",
         "score_max_te",
         "lexicographic_signal_cost",
+        "signal_preserving_minimum_variance",
+        "blended_minimum_variance",
     }:
         raise ConfigError(
-            "optimizer.objective_mode must be mean_variance, score_max_te, or "
-            "lexicographic_signal_cost"
+            "optimizer.objective_mode must be mean_variance, score_max_te, "
+            "lexicographic_signal_cost, blended_minimum_variance, or signal_preserving_minimum_variance"
         )
-    if optimizer["solver_backend"] not in {"scipy_slsqp", "scipy_highs", "cvxpy", "auto"}:
+    if optimizer["solver_backend"] not in {
+        "scipy_slsqp",
+        "scipy_highs",
+        "cvxpy",
+        "clarabel_socp",
+        "auto",
+    }:
         raise ConfigError(
-            "optimizer.solver_backend must be scipy_slsqp, scipy_highs, cvxpy, or auto"
+            "optimizer.solver_backend must be scipy_slsqp, scipy_highs, cvxpy, "
+            "clarabel_socp, or auto"
+        )
+    if not isinstance(optimizer["warm_start"], bool):
+        raise ConfigError("optimizer.warm_start must be boolean")
+    if optimizer["fallback_policy"] not in {"error", "scipy_highs"}:
+        raise ConfigError(
+            "optimizer.fallback_policy must be error or scipy_highs"
         )
     for key in (
         "risk_aversion",
@@ -329,6 +361,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     iterations = optimizer["max_iterations"]
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
         raise ConfigError("optimizer.max_iterations must be a positive integer")
+    for key in ("conic_cache_size", "max_cutting_planes"):
+        value = optimizer[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ConfigError(
+                f"optimizer.{key} must be a non-negative integer"
+            )
+    if optimizer["max_cutting_planes"] == 0:
+        raise ConfigError("optimizer.max_cutting_planes must be positive")
+    optimizer["blend_strength"] = _finite_number(
+        optimizer["blend_strength"], "optimizer.blend_strength", minimum=0.0
+    )
+    if optimizer["blend_strength"] > 1.0:
+        raise ConfigError("optimizer.blend_strength must not exceed 1")
 
     constraints = config["constraints"]
     for key in ("max_weight", "max_active_weight", "weight_sum_tolerance", "constraint_tolerance"):
@@ -386,6 +431,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError(
                 "score-based optimizer objectives require constraints.max_tracking_error"
             )
+    if (
+        optimizer["objective_mode"]
+        == "signal_preserving_minimum_variance"
+        and signal["type"] != "rank_score"
+    ):
+        raise ConfigError(
+            "signal-preserving optimization requires signal.type rank_score"
+        )
+
 
     if (
         config["schema_version"] == 5
@@ -395,6 +449,99 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             "schema_version 5 requires optimizer.objective_mode "
             "lexicographic_signal_cost"
         )
+
+    if config["schema_version"] == 6:
+        if optimizer["objective_mode"] != "blended_minimum_variance":
+            raise ConfigError(
+                "schema_version 6 requires optimizer.objective_mode "
+                "blended_minimum_variance"
+            )
+        if optimizer["solver_backend"] not in {
+            "cvxpy",
+            "clarabel_socp",
+            "auto",
+        }:
+            raise ConfigError(
+                "schema_version 6 requires a CVXPY/Clarabel solver backend"
+            )
+        if optimizer["fallback_policy"] != "error":
+            raise ConfigError(
+                "schema_version 6 requires optimizer.fallback_policy error"
+            )
+        prohibited = {
+            "max_turnover": constraints["max_turnover"],
+            "max_tracking_error": constraints["max_tracking_error"],
+            "sector_active_limit": constraints["sector_active_limit"],
+            "factor_active_limit": constraints["factor_active_limit"],
+            "industry_active_range": constraints["industry_active_range"],
+            "style_active_ranges": constraints["style_active_ranges"],
+        }
+        enabled = sorted(
+            name for name, value in prohibited.items()
+            if value is not None
+        )
+        if enabled:
+            raise ConfigError(
+                "schema_version 6 uses soft factor risk and does not allow "
+                "hard risk/turnover constraints: " + ", ".join(enabled)
+            )
+        candidate_range = constraints["candidate_weight_range"]
+        if (
+            candidate_range is None
+            or candidate_range["min_weight"] < 0.95
+        ):
+            raise ConfigError(
+                "schema_version 6 requires "
+                "candidate_weight_range.min_weight >= 0.95"
+            )
+
+    if config["schema_version"] == 7:
+        if (
+            optimizer["objective_mode"]
+            != "signal_preserving_minimum_variance"
+        ):
+            raise ConfigError(
+                "schema_version 7 requires optimizer.objective_mode "
+                "signal_preserving_minimum_variance"
+            )
+        if optimizer["solver_backend"] not in {
+            "cvxpy",
+            "clarabel_socp",
+            "auto",
+        }:
+            raise ConfigError(
+                "schema_version 7 requires a CVXPY/Clarabel solver backend"
+            )
+        if optimizer["fallback_policy"] != "error":
+            raise ConfigError(
+                "schema_version 7 requires optimizer.fallback_policy error"
+            )
+        prohibited = {
+            "max_turnover": constraints["max_turnover"],
+            "max_tracking_error": constraints["max_tracking_error"],
+            "sector_active_limit": constraints["sector_active_limit"],
+            "factor_active_limit": constraints["factor_active_limit"],
+            "industry_active_range": constraints["industry_active_range"],
+            "style_active_ranges": constraints["style_active_ranges"],
+        }
+        enabled = sorted(
+            name for name, value in prohibited.items()
+            if value is not None
+        )
+        if enabled:
+            raise ConfigError(
+                "schema_version 7 uses soft active risk and does not allow "
+                "hard risk/turnover constraints: " + ", ".join(enabled)
+            )
+        candidate_range = constraints["candidate_weight_range"]
+        if (
+            candidate_range is None
+            or candidate_range["min_weight"] < 0.95
+        ):
+            raise ConfigError(
+                "schema_version 7 requires "
+                "candidate_weight_range.min_weight >= 0.95"
+            )
 
     config["cost_model"]["linear_cost_bps"] = _finite_number(
         config["cost_model"]["linear_cost_bps"],

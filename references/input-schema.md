@@ -62,7 +62,7 @@ Required long-form CSV or Parquet:
 date | ticker | benchmark_weight
 ```
 
-Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe. In schema versions 3 through 5 they must have a full-signal prediction unless they are positive, non-tradable frozen current holdings; schema versions 1 and 2 retain neutral-fill compatibility.
+Weights must be non-negative and sum to one within `constraints.weight_sum_tolerance`. Positive-weight benchmark constituents automatically join the optimization universe. In schema versions 3 through 6, `signal.missing_prediction_policy: role_aware` keeps candidates strict, makes missing tradable holdings outside the candidate set exit-only, assigns neutral alpha only to benchmark-only non-holdings, and keeps missing non-tradable holdings frozen. `error_except_frozen` remains available for stricter checks; schema versions 1 and 2 retain neutral-fill compatibility.
 
 ## Current weights
 
@@ -118,6 +118,8 @@ date? | ticker | tradable
 ```
 
 Accepted true values are `true`, `1`, `yes`, and `y`; false values are `false`, `0`, `no`, and `n`. A false value freezes the asset at its current weight.
+
+Missing rows are distinct from explicit `tradable=false`. The default `--missing-security-policy error` fails closed. `freeze_last` is intended for execution feedback that already carries a missing holding at its last observed value: candidate names without a record are excluded, while benchmark/current names remain in the optimization universe as synthetic non-tradable assets and are fixed at current weight. The rolling default `auto` selects this behavior only with StockDemo `carry_forward`; otherwise it resolves to `error`. This policy does not infer a terminal event or manufacture a return.
 
 ## Terminal event manifest (optional)
 

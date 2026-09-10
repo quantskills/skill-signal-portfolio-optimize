@@ -42,6 +42,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
     parser.add_argument("--rebalance-every", type=int, default=1)
+    parser.add_argument(
+        "--risk-refresh-frequency",
+        choices=("daily", "weekly", "monthly"),
+        default="daily",
+        help="Refresh dynamic risk parameters daily, weekly, or monthly.",
+    )
+    parser.add_argument(
+        "--missing-security-policy",
+        choices=("auto", "error", "freeze_last"),
+        default="auto",
+        help=(
+            "Handle optimization names absent from tradability. auto uses "
+            "freeze_last only with StockDemo carry_forward feedback; otherwise "
+            "it fails closed."
+        ),
+    )
     parser.add_argument("--transaction-cost-bps", type=float)
     parser.add_argument("--risk-model-config", type=Path)
     parser.add_argument("--risk-returns-file", type=Path)
@@ -122,6 +138,8 @@ def main() -> int:
             start_date=args.start_date,
             end_date=args.end_date,
             rebalance_every=args.rebalance_every,
+            risk_refresh_frequency=args.risk_refresh_frequency,
+            missing_security_policy=args.missing_security_policy,
             transaction_cost_bps=args.transaction_cost_bps,
             risk_model_config=args.risk_model_config,
             risk_returns_file=args.risk_returns_file,

@@ -10,11 +10,12 @@ import numpy as np
 import pandas as pd
 
 from .errors import InputDataError
-from .io import normalize_ticker
+from .io import normalize_date, normalize_ticker
 from .risk_model import (
     OUTPUT_FILES,
     RiskModelContext,
     build_risk_model_from_context,
+    latest_valid_market_cap,
     load_risk_model_context,
 )
 
@@ -118,6 +119,83 @@ class DynamicRiskModelCache:
         )
         return fingerprint, universe_hash
 
+    def model_universe_coverage(
+        self, date: str, universe: pd.Index
+    ) -> pd.DataFrame:
+        """Explain risk-panel eligibility for every requested asset."""
+        normalized_date = normalize_date(date)
+        normalized = _normalized_universe(universe)
+        coverage = pd.DataFrame(index=normalized)
+        coverage.index.name = "ticker"
+        coverage["has_return_panel"] = normalized.isin(self.context.returns.columns)
+        coverage["has_market_cap_panel"] = normalized.isin(
+            self.context.market_cap.columns
+        )
+        coverage["has_valid_asof_market_cap"] = False
+        common = normalized[
+            coverage["has_return_panel"].to_numpy()
+            & coverage["has_market_cap_panel"].to_numpy()
+        ]
+        if len(common):
+            cap = latest_valid_market_cap(
+                self.context.market_cap, normalized_date, common
+            )
+            coverage.loc[common, "has_valid_asof_market_cap"] = (
+                cap.notna() & np.isfinite(cap) & cap.gt(0)
+            ).to_numpy()
+
+        coverage["has_asof_industry"] = True
+        if self.context.config["industry_mode"] != "disabled":
+            history = self.context.industry_history
+            if history is None:
+                coverage["has_asof_industry"] = False
+            else:
+                asof = (
+                    history.loc[
+                        history["in_date"].le(normalized_date)
+                        & history["out_date_normalized"].ge(normalized_date),
+                        ["ticker", "industry"],
+                    ]
+                    .drop_duplicates("ticker")
+                    .set_index("ticker")["industry"]
+                )
+                coverage["has_asof_industry"] = (
+                    asof.reindex(normalized).notna().to_numpy()
+                )
+
+        required = [
+            "has_return_panel",
+            "has_market_cap_panel",
+            "has_valid_asof_market_cap",
+            "has_asof_industry",
+        ]
+        coverage["available"] = coverage[required].all(axis=1)
+        reason_names = {
+            "has_return_panel": "missing_return_panel",
+            "has_market_cap_panel": "missing_market_cap_panel",
+            "has_valid_asof_market_cap": "invalid_asof_market_cap",
+            "has_asof_industry": "missing_asof_industry",
+        }
+        coverage["missing_reasons"] = [
+            ",".join(
+                reason_names[column]
+                for column in required
+                if not bool(row[column])
+            )
+            for _, row in coverage.iterrows()
+        ]
+        return coverage
+
+    def available_model_universe(
+        self, date: str, universe: pd.Index
+    ) -> pd.Index:
+        """Return names with valid risk-panel inputs as of a monthly model date."""
+        coverage = self.model_universe_coverage(date, universe)
+        result = coverage.index[coverage["available"].to_numpy()]
+        if result.empty:
+            raise InputDataError(f"monthly risk model universe has no usable assets at {date}")
+        return pd.Index(result, name="ticker")
+
     def validate_positive_current_holdings(
         self, date: str, current: pd.Series, tolerance: float
     ) -> None:
@@ -135,12 +213,9 @@ class DynamicRiskModelCache:
                 "positive current holding(s) missing risk panels: "
                 f"{list(missing[:10])}"
             )
-        cap_dates = self.context.market_cap.index[
-            self.context.market_cap.index <= date
-        ]
-        if cap_dates.empty:
-            raise InputDataError(f"market cap has no as-of row through {date}")
-        cap = self.context.market_cap.loc[cap_dates[-1]].reindex(held)
+        cap = latest_valid_market_cap(
+            self.context.market_cap, normalize_date(date), held
+        )
         invalid = cap.isna() | ~np.isfinite(cap) | cap.le(0)
         if invalid.any():
             raise InputDataError(
@@ -191,12 +266,28 @@ class DynamicRiskModelCache:
         universe: pd.Index,
         static_covariance_file: Path | None,
         static_exposure_file: Path | None,
+        model_date: str | None = None,
+        model_universe: pd.Index | None = None,
     ) -> ResolvedRiskModel:
         normalized = _normalized_universe(universe)
-        fingerprint, universe_hash = self.fingerprint(date, normalized)
+        requested_model_date = date if model_date is None else str(model_date)
+        build_universe = (
+            normalized
+            if model_universe is None
+            else _normalized_universe(model_universe)
+        )
+        missing_from_model = normalized.difference(build_universe)
+        if len(missing_from_model):
+            raise InputDataError(
+                "monthly risk model universe does not cover optimization ticker(s): "
+                f"{list(missing_from_model[:10])}"
+            )
+        fingerprint, universe_hash = self.fingerprint(
+            requested_model_date, build_universe
+        )
         if static_covariance_file is not None and static_exposure_file is not None:
             if risk_files_cover_universe(
-                static_covariance_file, static_exposure_file, normalized
+                static_covariance_file, static_exposure_file, build_universe
             ):
                 self.static_reused_count += 1
                 return ResolvedRiskModel(
@@ -211,12 +302,12 @@ class DynamicRiskModelCache:
                 )
 
         directory = (
-            self.cache_root / f"date={date}" / f"universe={fingerprint[:16]}"
+            self.cache_root / f"date={requested_model_date}" / f"universe={fingerprint[:16]}"
         )
         if self._validate_complete_dynamic_cache(
             directory,
-            date=date,
-            universe=normalized,
+            date=requested_model_date,
+            universe=build_universe,
             fingerprint=fingerprint,
         ):
             self.dynamic_reused_count += 1
@@ -224,13 +315,15 @@ class DynamicRiskModelCache:
         else:
             build_risk_model_from_context(
                 context=self.context,
-                target_universe=normalized,
-                requested_date=date,
+                target_universe=build_universe,
+                requested_date=requested_model_date,
                 output_dir=directory,
                 manifest_metadata={
                     "cache_mode": "dynamic_exact_universe",
                     "dynamic_cache_fingerprint": fingerprint,
                     "universe_sha256": universe_hash,
+                    "requested_model_date": requested_model_date,
+                    "model_universe_asset_count": int(len(build_universe)),
                 },
             )
             self.dynamic_built_count += 1

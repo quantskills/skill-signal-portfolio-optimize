@@ -15,15 +15,82 @@ For `score_max_te`, minimize negative standardized signal score plus turnover co
 requiring an explicit tracking-error limit. This mode does not interpret a LightGBM rank or
 single-factor score as an annualized expected return.
 
-Use CVXPY with Clarabel when a quadratic tracking-error constraint is present and OSQP for a
-pure quadratic program. When CVXPY is unavailable, `score_max_te` uses SciPy HiGHS with exact
-L1 turnover auxiliaries. Frank-Wolfe linear oracles first find a tracking-error-feasible anchor.
-Valid supporting hyperplanes then provide an outer objective bound, while protected scalar bisection from a strictly feasible
-anchor to the covariance-ellipsoid boundary provides an inner feasible bound. The solver stops
-only when their disclosed objective gap reaches the greater of configured `ftol` and `1e-4`, using `optimizer.max_iterations` as the certified cutting-plane budget.
-This objective certificate does not relax any hard-constraint tolerance. `mean_variance`
-uses a SciPy HiGHS risk-feasible linear oracle with deterministic conditional gradient as the compatibility backend. Never switch backend after a
-reported solver failure.
+
+The recommended `clarabel_socp` backend writes tracking error as the second-order-cone
+constraint `norm(R * (w-b), 2) <= max_tracking_error`. For asset covariance, `R`
+is a covariance square root. For factor risk `Sigma = X F X' + D`, the runtime
+stacks `sqrt(F) * X'` and `sqrt(D)` directly, so the solver never constructs the
+dense `N x N` asset covariance. The same representation is used in the quadratic
+risk term of `mean_variance`.
+
+Clarabel `optimal_inaccurate` results are accepted only when returned weights are finite and pass the runtime's independent hard-constraint, weight-sum, and signal-capture checks; the accepted status and any clipped numerical mass are recorded in diagnostics.
+
+CVXPY problems are DPP-compatible and cached in-process by exact risk and linear-
+constraint structure. On a cache hit, the runtime updates the signal, benchmark,
+current-state bounds, and right-hand sides, preserves the preceding solution, and
+requests a warm start. A universe, exposure, covariance, or constraint-matrix change
+creates a new cache entry. `conic_cache_size` bounds retained structures.
+
+The shipped fast examples set `fallback_policy: error`: missing Clarabel or a failed conic solve is
+reported instead of starting a potentially long compatibility solve. Set
+`fallback_policy: scipy_highs` with `solver_backend: auto` only when that behavior is
+intentional. The `score_max_te` fallback uses exact L1 turnover auxiliaries, a risk-
+feasible anchor, and auditable HiGHS ellipsoid cuts. `max_cutting_planes` is a hard
+budget; exhausting it is an explicit error. `mean_variance` uses the existing SciPy
+compatibility path. Every returned portfolio is independently checked against all
+hard constraints.
+
+## Schema 7 signal-preserving active-risk objective
+
+Schema 7 keeps the executable equal-weight Top-N portfolio as anchor a. For
+signal score s and benchmark b, define active signal utility as
+U(w) = transpose(s) * (w-b). The optimizer requires:
+
+    U(w) >= U(a) - (1-minimum_signal_capture) * abs(U(a))
+
+It then minimizes benchmark-relative factor risk plus exact L1 turnover:
+
+    0.5 * risk_aversion * (w-b)' Sigma (w-b)
+      + turnover_penalty * sum(abs(w-current))
+
+The shipped example uses minimum_signal_capture 0.97 and turnover_penalty
+0.00035. Because the L1 term is twice one-way turnover, 0.00035 represents a
+7 bps one-way cost. The result reports anchor and final signal utility, signal
+capture ratio, active-risk reduction, anchor reallocation, and solver timing.
+Schema 7 keeps the schema 6 candidate, stock, execution, and fail-closed
+requirements, but does not use blend_strength.
+
+## Schema 6 conservative anchor blend
+
+Schema 6 is the recommended alpha-preserving mode. Let `a` be the executable
+equal-weight Top-N signal portfolio and let `m` be the minimum-total-variance
+portfolio over the same anchor support, subject to long-only, full-investment,
+stock-bound, frozen-position, exit-only, and candidate-weight constraints. The
+reported target is:
+
+```text
+w = (1 - blend_strength) * a + blend_strength * m
+```
+
+The default `blend_strength` is `0.10`. Setting it to zero reproduces the
+executable signal anchor exactly; values such as `0.10` and `0.20` provide
+an explicit, interpretable risk budget. The endpoint minimizes `w' Sigma w`,
+not benchmark-relative tracking error. The signal determines Top-N membership
+but is deliberately not reused to rank or concentrate names inside that set.
+
+Both endpoints satisfy the same convex position and execution constraints, so
+their blend remains feasible. The final portfolio is nevertheless checked
+independently. It must not have higher predicted total volatility than the
+anchor beyond numerical tolerance. Diagnostics report anchor, endpoint, and
+final predicted volatility, risk reduction, reallocated weight, maximum
+single-name deviation, and blend strength.
+
+Schema 6 rejects hard tracking-error, turnover, industry-neutrality, and
+style-neutrality constraints. Style and industry still affect the endpoint
+through the factor risk model. Realized turnover remains governed by the
+execution policy, such as StockDemo-compatible `keep=0.7`. This keeps the
+optimizer focused on a modest risk adjustment instead of allowing risk
+constraints to dominate the upstream alpha portfolio.
 
 ## Schema 5 lexicographic objective
 
@@ -35,7 +102,7 @@ U(w) >= U_star - (1-c) * abs(U_star)
 
 This definition remains directionally correct when `U_star` is zero or negative. The numerical SciPy inequality uses a disclosed tolerance no greater than `constraints.constraint_tolerance` below this theoretical floor; the actual value is `min(constraint_tolerance, max(100*ftol, 1e-6))`, and the final result is checked against the declared constraint tolerance. Stage 2 minimizes exact one-way linear cost `0.5 * sum(abs(w-current)) * bps / 10000` plus `stability_penalty * sum((w-reference)^2)`. The strictly positive quadratic term selects a unique deterministic portfolio. Without current weights, use the benchmark as the first-period reference and do not apply turnover or trading cost.
 
-Select CVXPY with Clarabel before solving only when both are installed; otherwise select the SciPy two-stage backend. Its primary stage reports a certified HiGHS outer-inner gap with an absolute tolerance of `max(ftol, 1e-4)`. The secondary stage solves one HiGHS linear relaxation of the convex objective, then performs an exact line search analytically truncated at the tracking-error boundary. Its conservative gap is the final feasible objective minus the convex linear-relaxation lower bound. Report a solve failure without switching backend. Write unsupported duals and KKT residuals as `null` with a reason.
+Clarabel solves both lexicographic stages against one cached hard-constraint structure. Stage 1 updates the score parameter and maximizes utility; Stage 2 adds a parameterized utility floor and minimizes cost plus stability while warm-starting from Stage 1. The explicit SciPy fallback retains its certified HiGHS outer-inner primary gap and conservative secondary lower bound, but the primary cutting-plane search is limited by `max_cutting_planes`. Report a solve failure without switching backend. Write unsupported duals and KKT residuals as `null` with a reason.
 
 ## Signal calibration
 
@@ -63,7 +130,7 @@ Each exposure accepts either `target_active+tolerance` or `min_active+max_active
 
 The exact L1 turnover auxiliary bound reserves `constraints.constraint_tolerance` below the configured maximum before HiGHS solves the linear system; final diagnostics still use the declared maximum plus that same tolerance.
 
-The optimization universe is the union of signal names, positive-weight benchmark constituents, and positive current holdings. Names without a signal receive zero expected return; the equal-weight signal baseline still selects only signaled names.
+The optimization universe is the union of candidates, positive-weight benchmark constituents, and positive current holdings. Under `role_aware`, candidates without a signal are errors; a tradable current-only holding without a signal is constrained not to increase, a benchmark-only non-holding receives neutral alpha, and a non-tradable holding remains frozen. These roles are written to diagnostics rather than being treated as interchangeable neutral fills.
 
 ## Covariance repair
 

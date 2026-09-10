@@ -14,7 +14,7 @@ from .diagnostics import (
     resolve_style_ranges,
 )
 from .errors import OptimizationError
-from .risk import PortfolioRisk
+from .risk import PortfolioRisk, as_portfolio_risk
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,8 @@ def _build_linear_system(
     candidate_mask: pd.Series | None,
     tradable: pd.Series,
     config: dict[str, Any],
+    *,
+    exit_only_mask: pd.Series | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Bounds, bool]:
     n_assets = len(benchmark)
     with_turnover = config["max_turnover"] is not None
@@ -61,6 +63,20 @@ def _build_linear_system(
         frozen_values = current.to_numpy(dtype=float)[frozen]
         lower[:n_assets][frozen] = frozen_values
         upper[:n_assets][frozen] = frozen_values
+
+    if exit_only_mask is not None:
+        if current is None:
+            raise OptimizationError("exit-only constraints require current weights")
+        aligned_exit_only = exit_only_mask.reindex(benchmark.index)
+        if aligned_exit_only.isna().any():
+            raise OptimizationError("exit_only_mask is missing optimization assets")
+        exit_only = aligned_exit_only.to_numpy(dtype=bool)
+        if np.any(exit_only & frozen):
+            raise OptimizationError("exit-only assets must be tradable")
+        upper[:n_assets][exit_only] = np.minimum(
+            upper[:n_assets][exit_only],
+            current.to_numpy(dtype=float)[exit_only],
+        )
 
     if np.any(lower[:n_assets] > upper[:n_assets] + config["constraint_tolerance"]):
         raise OptimizationError("position, active-weight, and frozen-position bounds conflict")
@@ -224,6 +240,7 @@ def _optimize_scipy(
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
     candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
@@ -231,13 +248,14 @@ def _optimize_scipy(
     initial_weights: np.ndarray | None = None,
 ) -> OptimizationResult:
     n_assets = len(expected_return)
-    sigma = covariance.to_numpy(dtype=float)
+    sigma = as_portfolio_risk(covariance).dense().to_numpy(dtype=float)
     mu = expected_return.to_numpy(dtype=float)
     benchmark_values = benchmark.to_numpy(dtype=float)
     current_values = None if current is None else current.to_numpy(dtype=float)
 
     full_a_eq, full_b_eq, full_a_ub, full_b_ub, full_bounds, with_turnover = _build_linear_system(
-        benchmark, current, sectors, exposures, candidate_mask, tradable, constraint_config
+        benchmark, current, sectors, exposures, candidate_mask, tradable, constraint_config,
+        exit_only_mask=exit_only_mask,
     )
     initial = _preferred_benchmark_start(
         benchmark,
@@ -265,6 +283,7 @@ def _optimize_scipy(
             candidate_mask,
             tradable,
             reduced_config,
+            exit_only_mask=exit_only_mask,
         )
         initial = np.asarray(initial[:n_assets], dtype=float)
     else:
@@ -428,6 +447,7 @@ def _optimize_scipy(
         tradable,
         constraint_config,
         candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
     )
     if not report["passed"]:
         details = ", ".join(item["constraint"] for item in report["violations"])
@@ -459,16 +479,18 @@ def _optimize_score_highs(
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
     candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
 ) -> OptimizationResult:
     """Solve score/TE with certified outer LP and inner feasible bounds."""
     n_assets = len(expected_return)
-    sigma = covariance.to_numpy(dtype=float)
+    sigma = as_portfolio_risk(covariance).dense().to_numpy(dtype=float)
     benchmark_values = benchmark.to_numpy(dtype=float)
     a_eq, b_eq, base_a_ub, base_b_ub, bounds, with_turnover = _build_linear_system(
-        benchmark, current, sectors, exposures, candidate_mask, tradable, constraint_config
+        benchmark, current, sectors, exposures, candidate_mask, tradable, constraint_config,
+        exit_only_mask=exit_only_mask,
     )
     objective = np.zeros(len(bounds.lb), dtype=float)
     objective[:n_assets] = -objective_signal.to_numpy(dtype=float)
@@ -479,6 +501,9 @@ def _optimize_score_highs(
     limit = None if max_tracking_error is None else float(max_tracking_error)
     tolerance = float(constraint_config["constraint_tolerance"])
     iteration_budget = int(optimizer_config["max_iterations"])
+    cutting_plane_budget = int(
+        optimizer_config.get("max_cutting_planes", iteration_budget)
+    )
     cutting_planes = 0
     total_highs_iterations = 0
     risk_anchor_iterations = 0
@@ -558,7 +583,7 @@ def _optimize_score_highs(
         best_feasible = anchor.copy()
         best_objective = float(objective @ best_feasible)
         objective_tolerance = max(float(optimizer_config["ftol"]), 1.0e-5)
-        for _ in range(iteration_budget):
+        for _ in range(cutting_plane_budget):
             outside = tighten_turnover(result.x)
             outside_active = outside[:n_assets] - benchmark_values
             outside_variance = float(outside_active @ sigma @ outside_active)
@@ -643,6 +668,7 @@ def _optimize_score_highs(
         tradable,
         constraint_config,
         candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
     )
     if not report["passed"]:
         details = ", ".join(item["constraint"] for item in report["violations"])
@@ -658,7 +684,7 @@ def _optimize_score_highs(
         "message": str(result.message),
         "iterations": cutting_planes + 1,
         "cutting_planes": cutting_planes,
-        "cutting_plane_budget": iteration_budget,
+        "cutting_plane_budget": cutting_plane_budget,
         "highs_iterations_total": total_highs_iterations,
         "objective_value": float(objective @ final_decision),
         "objective_lower_bound": float(result.fun),
@@ -676,16 +702,6 @@ def _optimize_score_highs(
     return OptimizationResult(weights=weights, solver=solver, constraints=report)
 
 
-def _import_cvxpy() -> Any:
-    try:
-        import cvxpy as cp
-    except ImportError as exc:
-        raise OptimizationError(
-            "CVXPY backend is unavailable; install the dependencies from requirements.txt"
-        ) from exc
-    return cp
-
-
 def _optimize_cvxpy(
     expected_return: pd.Series,
     objective_signal: pd.Series,
@@ -695,82 +711,57 @@ def _optimize_cvxpy(
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
     candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
+    *,
+    signal_score: pd.Series | None = None,
+    signal_floor: float | None = None,
 ) -> OptimizationResult:
-    cp = _import_cvxpy()
+    from .conic_optimizer import solve_clarabel_socp
+
     n_assets = len(expected_return)
-    sigma = covariance.to_numpy(dtype=float)
     benchmark_values = benchmark.to_numpy(dtype=float)
     a_eq, b_eq, a_ub, b_ub, bounds, with_turnover = _build_linear_system(
-        benchmark, current, sectors, exposures, candidate_mask, tradable, constraint_config
+        benchmark,
+        current,
+        sectors,
+        exposures,
+        candidate_mask,
+        tradable,
+        constraint_config,
+        exit_only_mask=exit_only_mask,
     )
-    dimension = len(bounds.lb)
-    decision = cp.Variable(dimension)
-    weights_expression = decision[:n_assets]
-    constraints: list[Any] = [
-        a_eq @ decision == b_eq,
-        decision >= bounds.lb,
-        decision <= bounds.ub,
-    ]
-    if len(a_ub):
-        constraints.append(a_ub @ decision <= b_ub)
-
-    active = weights_expression - benchmark_values
-    if optimizer_config["objective_mode"] == "mean_variance":
-        objective = -expected_return.to_numpy(dtype=float) @ weights_expression
-        objective += 0.5 * float(optimizer_config["risk_aversion"]) * cp.quad_form(
-            active, cp.psd_wrap(sigma)
-        )
-    else:
-        objective = -objective_signal.to_numpy(dtype=float) @ weights_expression
-
-    turnover_penalty = float(optimizer_config["turnover_penalty"])
-    if current is not None and turnover_penalty > 0:
-        objective += turnover_penalty * cp.norm1(
-            weights_expression - current.to_numpy(dtype=float)
-        )
-
-    max_tracking_error = constraint_config["max_tracking_error"]
-    if max_tracking_error is not None:
-        constraints.append(
-            cp.quad_form(active, cp.psd_wrap(sigma))
-            <= float(max_tracking_error) ** 2
-        )
-
-    problem = cp.Problem(cp.Minimize(objective), constraints)
-    installed = set(cp.installed_solvers())
-    solver_name = "CLARABEL" if max_tracking_error is not None else "OSQP"
-    if solver_name not in installed:
-        raise OptimizationError(
-            f"CVXPY solver {solver_name} is unavailable; installed solvers: {sorted(installed)}"
-        )
-    solve_options: dict[str, Any]
-    if solver_name == "CLARABEL":
-        solve_options = {
-            "max_iter": int(optimizer_config["max_iterations"]),
-            "tol_gap_abs": float(optimizer_config["ftol"]),
-            "tol_feas": max(float(optimizer_config["ftol"]), 1.0e-10),
-        }
-    else:
-        solve_options = {
-            "max_iter": int(optimizer_config["max_iterations"]),
-            "eps_abs": float(optimizer_config["ftol"]),
-            "eps_rel": float(optimizer_config["ftol"]),
-            "polishing": True,
-        }
-    try:
-        problem.solve(solver=solver_name, warm_start=False, verbose=False, **solve_options)
-    except Exception as exc:
-        raise OptimizationError(f"CVXPY {solver_name} failed: {exc}") from exc
-    if problem.status != cp.OPTIMAL or decision.value is None:
-        raise OptimizationError(
-            f"CVXPY {solver_name} did not return an exact optimum: {problem.status}"
-        )
+    requested_backend = str(optimizer_config["solver_backend"])
+    solved = solve_clarabel_socp(
+        expected_return=expected_return.to_numpy(dtype=float),
+        objective_signal=objective_signal.to_numpy(dtype=float),
+        risk_input=covariance,
+        benchmark=benchmark_values,
+        current=None if current is None else current.to_numpy(dtype=float),
+        a_eq=a_eq,
+        b_eq=b_eq,
+        a_ub=a_ub,
+        b_ub=b_ub,
+        lower_bounds=bounds.lb,
+        upper_bounds=bounds.ub,
+        with_turnover_auxiliary=with_turnover,
+        optimizer_config=optimizer_config,
+        signal_score=(
+            None if signal_score is None else signal_score.to_numpy(dtype=float)
+        ),
+        signal_floor=signal_floor,
+        max_tracking_error=constraint_config["max_tracking_error"],
+        reported_backend=(
+            "cvxpy"
+            if requested_backend == "cvxpy"
+            else "cvxpy_clarabel_socp"
+        ),
+    )
 
     weights = pd.Series(
-        np.asarray(decision.value[:n_assets], dtype=float),
+        np.asarray(solved.decision[:n_assets], dtype=float),
         index=expected_return.index,
         name="target_weight",
     )
@@ -784,26 +775,403 @@ def _optimize_cvxpy(
         tradable,
         constraint_config,
         candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
     )
     if not report["passed"]:
         details = ", ".join(item["constraint"] for item in report["violations"])
         raise OptimizationError(
             f"CVXPY result violates independently checked constraints: {details}"
         )
-    solver_stats = problem.solver_stats
-    solver = {
-        "backend": "cvxpy",
-        "solver": solver_name,
-        "objective_mode": optimizer_config["objective_mode"],
-        "success": True,
-        "status": str(problem.status),
-        "message": str(problem.status),
-        "iterations": int(solver_stats.num_iters or 0),
-        "objective_value": float(problem.value),
-        "used_turnover_auxiliary_variables": with_turnover,
-    }
-    return OptimizationResult(weights=weights, solver=solver, constraints=report)
+    return OptimizationResult(
+        weights=weights,
+        solver=solved.solver,
+        constraints=report,
+    )
 
+
+
+def _execution_aware_anchor(
+    anchor_weights: pd.Series,
+    current: pd.Series | None,
+    tradable: pd.Series,
+    *,
+    tolerance: float,
+) -> pd.Series:
+    index = anchor_weights.index
+    anchor = anchor_weights.reindex(index)
+    aligned_tradable = tradable.reindex(index)
+    if anchor.isna().any() or not np.isfinite(anchor).all():
+        raise OptimizationError("anchor_weights contains missing or non-finite values")
+    if (anchor < -tolerance).any():
+        raise OptimizationError("anchor_weights contains negative values")
+    if aligned_tradable.isna().any():
+        raise OptimizationError("tradable is missing anchor assets")
+
+    if current is None:
+        if (~aligned_tradable.astype(bool)).any():
+            raise OptimizationError(
+                "current weights are required to build an anchor with non-tradable assets"
+            )
+        frozen_weights = pd.Series(0.0, index=index)
+    else:
+        aligned_current = current.reindex(index)
+        if aligned_current.isna().any() or not np.isfinite(aligned_current).all():
+            raise OptimizationError("current contains missing or non-finite values")
+        frozen_weights = aligned_current.where(~aligned_tradable.astype(bool), 0.0)
+
+    frozen_total = float(frozen_weights.sum())
+    if frozen_total > 1.0 + tolerance:
+        raise OptimizationError("frozen anchor weight exceeds full investment")
+    residual = max(1.0 - frozen_total, 0.0)
+    eligible = aligned_tradable.astype(bool) & (anchor > 0.0)
+    eligible_mass = float(anchor[eligible].sum())
+    if residual > tolerance and eligible_mass <= tolerance:
+        raise OptimizationError("anchor has no tradable positive-weight assets")
+
+    result = frozen_weights.copy()
+    if residual > tolerance:
+        result.loc[eligible] = anchor.loc[eligible] * (residual / eligible_mass)
+    result.name = "target_weight"
+    return result
+
+def _optimize_signal_preserving_minimum_variance(
+    expected_return: pd.Series,
+    covariance: pd.DataFrame | PortfolioRisk,
+    benchmark: pd.Series,
+    current: pd.Series | None,
+    sectors: pd.Series | None,
+    exposures: pd.DataFrame | None,
+    tradable: pd.Series,
+    optimizer_config: dict[str, Any],
+    constraint_config: dict[str, Any],
+    *,
+    linear_cost_bps: float,
+    signal_score: pd.Series | None,
+    anchor_weights: pd.Series | None,
+    candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
+) -> OptimizationResult:
+    """Minimize active risk while preserving most of the signal utility."""
+    if signal_score is None:
+        raise OptimizationError(
+            "signal_preserving_minimum_variance requires signal_score"
+        )
+    if anchor_weights is None:
+        raise OptimizationError(
+            "signal_preserving_minimum_variance requires anchor_weights"
+        )
+    if candidate_mask is None:
+        raise OptimizationError(
+            "signal_preserving_minimum_variance requires a candidate_mask"
+        )
+
+    from .lexicographic import (
+        signal_capture_ratio,
+        signal_utility,
+        signal_utility_floor,
+    )
+
+    index = expected_return.index
+    score = signal_score.reindex(index)
+    if score.isna().any() or not np.isfinite(score).all():
+        raise OptimizationError(
+            "signal_score contains missing or non-finite values"
+        )
+    benchmark = benchmark.reindex(index)
+    anchor = _execution_aware_anchor(
+        anchor_weights.reindex(index),
+        current,
+        tradable,
+        tolerance=float(constraint_config["constraint_tolerance"]),
+    )
+    anchor_report = constraint_report(
+        anchor,
+        benchmark,
+        current,
+        covariance,
+        sectors,
+        exposures,
+        tradable,
+        constraint_config,
+        candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
+    )
+    if not anchor_report["passed"]:
+        details = ", ".join(
+            item["constraint"] for item in anchor_report["violations"]
+        )
+        raise OptimizationError(
+            "executable signal anchor violates configured constraints: "
+            + details
+        )
+
+    anchor_utility = signal_utility(anchor, benchmark, score)
+    minimum_capture = float(optimizer_config["minimum_signal_capture"])
+    utility_floor = signal_utility_floor(
+        anchor_utility, minimum_capture
+    )
+    absolute_signal_floor = utility_floor + float(score @ benchmark)
+
+    endpoint_optimizer = dict(optimizer_config)
+    endpoint_optimizer["objective_mode"] = (
+        "signal_preserving_minimum_variance"
+    )
+    endpoint = _optimize_cvxpy(
+        pd.Series(0.0, index=index),
+        score,
+        covariance,
+        benchmark,
+        current,
+        sectors,
+        exposures,
+        candidate_mask,
+        exit_only_mask,
+        tradable,
+        endpoint_optimizer,
+        constraint_config,
+        signal_score=score,
+        signal_floor=absolute_signal_floor,
+    )
+    weights = endpoint.weights
+    final_utility = signal_utility(weights, benchmark, score)
+    tolerance = max(
+        float(constraint_config["constraint_tolerance"]), 1.0e-9
+    )
+    if final_utility < utility_floor - tolerance:
+        raise OptimizationError(
+            "signal-preserving result violates minimum signal capture"
+        )
+
+    report = constraint_report(
+        weights,
+        benchmark,
+        current,
+        covariance,
+        sectors,
+        exposures,
+        tradable,
+        constraint_config,
+        candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
+    )
+    if not report["passed"]:
+        details = ", ".join(
+            item["constraint"] for item in report["violations"]
+        )
+        raise OptimizationError(
+            "signal-preserving result violates hard constraints: " + details
+        )
+
+    risk = as_portfolio_risk(covariance)
+    benchmark_values = benchmark.to_numpy(dtype=float)
+    anchor_active = anchor.to_numpy(dtype=float) - benchmark_values
+    optimized_active = weights.to_numpy(dtype=float) - benchmark_values
+    anchor_volatility = float(
+        np.sqrt(max(risk.variance(anchor_active), 0.0))
+    )
+    optimized_volatility = float(
+        np.sqrt(max(risk.variance(optimized_active), 0.0))
+    )
+    turnover = (
+        None
+        if current is None
+        else float(0.5 * (weights - current).abs().sum())
+    )
+    estimated_cost = (
+        None
+        if turnover is None
+        else float(turnover * linear_cost_bps / 10000.0)
+    )
+    solver = dict(endpoint.solver)
+    solver.update(
+        {
+            "objective_mode": "signal_preserving_minimum_variance",
+            "inner_objective_mode": "active_minimum_variance",
+            "minimum_signal_capture": minimum_capture,
+            "primary_signal_utility": anchor_utility,
+            "anchor_signal_utility": anchor_utility,
+            "signal_utility_floor": utility_floor,
+            "signal_utility_solver_floor": utility_floor,
+            "signal_utility_tolerance": tolerance,
+            "final_signal_utility": final_utility,
+            "one_way_turnover": turnover,
+            "estimated_transaction_cost": estimated_cost,
+            "signal_capture_ratio": signal_capture_ratio(
+                anchor_utility, final_utility
+            ),
+            "anchor_predicted_volatility": anchor_volatility,
+            "optimized_predicted_volatility": optimized_volatility,
+            "predicted_risk_reduction": (
+                anchor_volatility - optimized_volatility
+            ),
+            "anchor_reallocation": float(
+                0.5 * (weights - anchor).abs().sum()
+            ),
+            "maximum_anchor_weight_deviation": float(
+                (weights - anchor).abs().max()
+            ),
+            "anchor_asset_count": int((anchor > tolerance).sum()),
+            "objective_value": risk.variance(optimized_active),
+        }
+    )
+    return OptimizationResult(
+        weights=weights,
+        solver=solver,
+        constraints=report,
+    )
+
+
+
+def _optimize_blended_minimum_variance(
+    expected_return: pd.Series,
+    covariance: pd.DataFrame | PortfolioRisk,
+    benchmark: pd.Series,
+    current: pd.Series | None,
+    sectors: pd.Series | None,
+    exposures: pd.DataFrame | None,
+    tradable: pd.Series,
+    optimizer_config: dict[str, Any],
+    constraint_config: dict[str, Any],
+    *,
+    anchor_weights: pd.Series | None,
+    candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
+) -> OptimizationResult:
+    if anchor_weights is None:
+        raise OptimizationError(
+            "blended_minimum_variance requires anchor_weights"
+        )
+    if candidate_mask is None:
+        raise OptimizationError(
+            "blended_minimum_variance requires a candidate_mask"
+        )
+
+    tolerance = float(constraint_config["constraint_tolerance"])
+    anchor = _execution_aware_anchor(
+        anchor_weights.reindex(expected_return.index),
+        current,
+        tradable,
+        tolerance=tolerance,
+    )
+    anchor_report = constraint_report(
+        anchor,
+        benchmark,
+        current,
+        covariance,
+        sectors,
+        exposures,
+        tradable,
+        constraint_config,
+        candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
+    )
+    if not anchor_report["passed"]:
+        details = ", ".join(
+            item["constraint"] for item in anchor_report["violations"]
+        )
+        raise OptimizationError(
+            "executable signal anchor violates configured constraints: " + details
+        )
+
+    strength = float(optimizer_config["blend_strength"])
+    # Keep the endpoint inside the same signal candidate universe as the anchor.
+    # Using anchor>0 here would silently promote carried/frozen holdings to
+    # candidates and can break the final candidate-weight-range check.
+    endpoint_candidate_mask = candidate_mask.reindex(expected_return.index)
+    if endpoint_candidate_mask.isna().any():
+        raise OptimizationError("candidate_mask is missing optimization assets")
+    endpoint_candidate_mask = endpoint_candidate_mask.astype(bool).rename("is_candidate")
+    if strength == 0.0:
+        endpoint_weights = anchor.copy()
+        endpoint_solver: dict[str, Any] = {
+            "backend": "anchor_only",
+            "solver": None,
+            "iterations": 0,
+            "problem_cache_hit": False,
+            "solver_wall_seconds": 0.0,
+            "problem_compile_seconds": 0.0,
+        }
+    else:
+        endpoint_optimizer = dict(optimizer_config)
+        endpoint_optimizer.update(
+            {
+                "objective_mode": "minimum_variance",
+                "risk_aversion": 1.0,
+                "turnover_penalty": 0.0,
+            }
+        )
+        zero_return = pd.Series(0.0, index=expected_return.index)
+        endpoint = _optimize_cvxpy(
+            zero_return,
+            zero_return,
+            covariance,
+            benchmark,
+            current,
+            sectors,
+            exposures,
+            endpoint_candidate_mask,
+            exit_only_mask,
+            tradable,
+            endpoint_optimizer,
+            constraint_config,
+        )
+        endpoint_weights = endpoint.weights
+        endpoint_solver = dict(endpoint.solver)
+
+    weights = ((1.0 - strength) * anchor + strength * endpoint_weights).rename(
+        "target_weight"
+    )
+    report = constraint_report(
+        weights,
+        benchmark,
+        current,
+        covariance,
+        sectors,
+        exposures,
+        tradable,
+        constraint_config,
+        candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
+    )
+    if not report["passed"]:
+        details = ", ".join(item["constraint"] for item in report["violations"])
+        raise OptimizationError(
+            "blended portfolio violates independently checked constraints: " + details
+        )
+
+    risk = as_portfolio_risk(covariance)
+    anchor_volatility = float(
+        np.sqrt(max(risk.variance(anchor.to_numpy(dtype=float)), 0.0))
+    )
+    endpoint_volatility = float(
+        np.sqrt(max(risk.variance(endpoint_weights.to_numpy(dtype=float)), 0.0))
+    )
+    optimized_volatility = float(
+        np.sqrt(max(risk.variance(weights.to_numpy(dtype=float)), 0.0))
+    )
+    risk_tolerance = max(100.0 * tolerance, 1.0e-7)
+    if optimized_volatility > anchor_volatility + risk_tolerance:
+        raise OptimizationError(
+            "blended minimum-variance portfolio increases predicted total volatility"
+        )
+
+    solver = dict(endpoint_solver)
+    solver.update(
+        {
+            "objective_mode": "blended_minimum_variance",
+            "inner_objective_mode": "minimum_variance",
+            "blend_strength": strength,
+            "anchor_predicted_volatility": anchor_volatility,
+            "minimum_variance_predicted_volatility": endpoint_volatility,
+            "optimized_predicted_volatility": optimized_volatility,
+            "predicted_risk_reduction": anchor_volatility - optimized_volatility,
+            "anchor_reallocation": float(0.5 * (weights - anchor).abs().sum()),
+            "maximum_anchor_weight_deviation": float((weights - anchor).abs().max()),
+            "anchor_asset_count": int(endpoint_candidate_mask.sum()),
+            "objective_value": risk.variance(weights.to_numpy(dtype=float)),
+        }
+    )
+    return OptimizationResult(weights=weights, solver=solver, constraints=report)
 
 def optimize_portfolio(
     expected_return: pd.Series,
@@ -815,9 +1183,10 @@ def optimize_portfolio(
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
-    *,
     signal_score: pd.Series | None = None,
+    anchor_weights: pd.Series | None = None,
     candidate_mask: pd.Series | None = None,
+    exit_only_mask: pd.Series | None = None,
     cost_model: dict[str, Any] | None = None,
 ) -> OptimizationResult:
     if candidate_mask is not None:
@@ -829,7 +1198,53 @@ def optimize_portfolio(
         raise OptimizationError(
             "candidate_mask is required when candidate_weight_range is configured"
         )
+    if exit_only_mask is not None:
+        exit_only_mask = exit_only_mask.reindex(expected_return.index)
+        if exit_only_mask.isna().any():
+            raise OptimizationError("exit_only_mask is missing optimization assets")
+        exit_only_mask = exit_only_mask.astype(bool)
+        if exit_only_mask.any() and current is None:
+            raise OptimizationError("exit-only constraints require current weights")
+        if (exit_only_mask & ~tradable.reindex(expected_return.index).astype(bool)).any():
+            raise OptimizationError("exit-only assets must be tradable")
+
     objective_mode = optimizer_config["objective_mode"]
+    if objective_mode == "signal_preserving_minimum_variance":
+        return _optimize_signal_preserving_minimum_variance(
+            expected_return,
+            covariance,
+            benchmark,
+            current,
+            sectors,
+            exposures,
+            tradable,
+            optimizer_config,
+            constraint_config,
+            linear_cost_bps=float(
+                (cost_model or {"linear_cost_bps": 7.0})[
+                    "linear_cost_bps"
+                ]
+            ),
+            signal_score=signal_score,
+            anchor_weights=anchor_weights,
+            candidate_mask=candidate_mask,
+            exit_only_mask=exit_only_mask,
+        )
+    if objective_mode == "blended_minimum_variance":
+        return _optimize_blended_minimum_variance(
+            expected_return,
+            covariance,
+            benchmark,
+            current,
+            sectors,
+            exposures,
+            tradable,
+            optimizer_config,
+            constraint_config,
+            anchor_weights=anchor_weights,
+            candidate_mask=candidate_mask,
+            exit_only_mask=exit_only_mask,
+        )
     if objective_mode in {"score_max_te", "lexicographic_signal_cost"}:
         if signal_score is None:
             raise OptimizationError(f"{objective_mode} requires a signal_score vector")
@@ -851,6 +1266,7 @@ def optimize_portfolio(
             sectors=sectors,
             exposures=exposures,
             candidate_mask=candidate_mask,
+            exit_only_mask=exit_only_mask,
             tradable=tradable,
             optimizer_config=optimizer_config,
             constraint_config=constraint_config,
@@ -860,7 +1276,7 @@ def optimize_portfolio(
         )
 
     backend = optimizer_config["solver_backend"]
-    if backend in {"cvxpy", "auto"}:
+    if backend in {"cvxpy", "clarabel_socp", "auto"}:
         try:
             return _optimize_cvxpy(
                 expected_return,
@@ -871,15 +1287,20 @@ def optimize_portfolio(
                 sectors,
                 exposures,
                 candidate_mask,
+                exit_only_mask,
                 tradable,
                 optimizer_config,
                 constraint_config,
             )
         except OptimizationError as exc:
-            if backend == "cvxpy" or "backend is unavailable" not in str(exc):
+            if (
+                backend in {"cvxpy", "clarabel_socp"}
+                or optimizer_config.get("fallback_policy", "scipy_highs") == "error"
+                or "backend is unavailable" not in str(exc)
+            ):
                 raise
     if objective_mode == "score_max_te":
-        return _optimize_score_highs(
+        result = _optimize_score_highs(
             expected_return,
             objective_signal,
             covariance,
@@ -888,20 +1309,25 @@ def optimize_portfolio(
             sectors,
             exposures,
             candidate_mask,
+            exit_only_mask,
             tradable,
             optimizer_config,
             constraint_config,
         )
-    return _optimize_scipy(
-        expected_return,
-        objective_signal,
-        covariance,
-        benchmark,
-        current,
-        sectors,
-        exposures,
-        candidate_mask,
-        tradable,
-        optimizer_config,
-        constraint_config,
-    )
+    else:
+        result = _optimize_scipy(
+            expected_return,
+            objective_signal,
+            covariance,
+            benchmark,
+            current,
+            sectors,
+            exposures,
+            candidate_mask,
+            exit_only_mask,
+            tradable,
+            optimizer_config,
+            constraint_config,
+        )
+    result.solver["backend_fallback_used"] = bool(backend == "auto")
+    return result

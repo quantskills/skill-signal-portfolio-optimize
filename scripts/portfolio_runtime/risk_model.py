@@ -285,6 +285,19 @@ def _standardize_style(
         raise RiskModelError(f"{name} exposure has no usable cross-sectional variation") from exc
 
 
+def latest_valid_market_cap(
+    market_cap: pd.DataFrame,
+    exposure_date: str,
+    tickers: pd.Index,
+) -> pd.Series:
+    """Return each asset's latest finite positive market cap known by a date."""
+    history = market_cap.loc[market_cap.index <= exposure_date, tickers]
+    if history.empty:
+        raise RiskModelError(f"market cap has no as-of row through {exposure_date}")
+    valid = history.where(np.isfinite(history) & history.gt(0))
+    return valid.ffill().iloc[-1].astype(float)
+
+
 def _style_exposures_asof(
     returns: pd.DataFrame,
     market_cap: pd.DataFrame,
@@ -292,7 +305,7 @@ def _style_exposures_asof(
     tickers: pd.Index,
     config: dict[str, Any],
 ) -> tuple[pd.DataFrame, pd.Series]:
-    cap = market_cap.loc[exposure_date, tickers].astype(float)
+    cap = latest_valid_market_cap(market_cap, exposure_date, tickers)
     regression_weight = np.power(cap, config["regression_weight_power"])
     log_cap = _mad_clip(np.log(cap), config["size_winsorize_mad"])
     size = _weighted_standardize(log_cap, regression_weight)
@@ -590,7 +603,9 @@ def estimate_structural_risk_model(
         if use_industry and industry_history is not None
         else None
     )
-    target_cap = market_cap.loc[common_dates[-1]].reindex(target_universe)
+    target_cap = latest_valid_market_cap(
+        market_cap, common_dates[-1], target_universe
+    )
     invalid_target = target_cap.isna() | ~np.isfinite(target_cap) | target_cap.le(0)
     if target_industry is not None:
         invalid_target |= target_industry.isna()

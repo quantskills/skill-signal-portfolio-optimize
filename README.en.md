@@ -8,7 +8,7 @@ Convert one frozen cross-sectional stock signal into benchmark-relative long-onl
 | --- | --- |
 | Catalog status | `active` |
 | Validation level | `runnable` |
-| Implementation version | `1.3.3` |
+| Implementation version | `1.7.0` |
 | Python | CI uses 3.12 |
 | License | GPL-3.0-only |
 
@@ -20,7 +20,7 @@ An upstream model ranks stocks but does not determine how much capital to assign
 
 ```text
 frozen signal -> full-cross-section calibration -> candidates -> risk model
-              -> two-stage optimization -> target weights
+              -> conservative anchor blending -> target weights
               -> next-day rolling backtest -> risk and constraint diagnostics
 ```
 
@@ -39,7 +39,13 @@ It does not train prediction models, select alpha factors, place orders, or repr
 - v1.3.0 adds an isolated `stockdemo-compatible` execution engine for TWAP, next-day execution, `keep=0.8`, lots, cash, ST/limit filters, and stockdemo metric semantics; the legacy `native` backtest remains unchanged.
 - v1.3.2 adds explicit `terminal_writeoff` handling for confirmed terminal securities; explicit `carry_forward` is also available for legacy StockDemo parity, while `error` remains available for fail-closed quality checks.
 - v1.3.3 aligns Stockdemo-compatible defaults with `ba875fc8`: Top200, whole universe, TWAP, next-day execution, `transaction=1.4`, `keep=0.7`, daily rebalancing, and 7 bps linear cost; optimizer risk constraints remain independent.
+- v1.4.0 supports daily or monthly dynamic risk refresh; monthly mode builds one snapshot per calendar month while optimization and execution remain daily, with model dates recorded in manifests.
+- v1.5.0 adds a Clarabel direct second-order-cone fast path enabled by the shipped examples, preserves factor risk in `X/F/D` form instead of expanding dense asset covariance, and reuses parameterized rolling problems and prior solutions when structure is unchanged.
+- v1.6.0 adds conservative anchor blending: keep the executable equal-weight Top200 portfolio as the core and blend only 10% by default toward a candidate-set minimum-variance endpoint. The signal is not reused to re-rank names inside Top200; style and industry enter softly through factor risk.
+- v1.7.0 adds ISO-weekly risk refresh and signal-preserving active-risk optimization: retain 97% of anchor signal utility by default, minimize benchmark-relative risk under that floor, and penalize turnover using the effective one-way fee.
 - Emit target weights, risk summaries, constraint diagnostics, signal diagnostics, and hash-backed run manifests.
+
+Start new experiments from the [v1.7 signal-preserving config](examples/v1.7-signal-preserving-config.yaml); legacy objective modes remain available for reproducing historical runs.
 
 ## Risk Factors
 
@@ -131,6 +137,8 @@ See [references/risk-model.md](references/risk-model.md) and [references/backtes
 Add `--stockdemo-market-file /path/to/stockdemo_market.parquet` to the same command when the next optimization must consume holdings actually executed by Stockdemo rules instead of theoretically drifted targets. `--stockdemo-transaction` and `--stockdemo-initial-cash` override the legacy defaults. This mode additionally writes `execution_feedback.parquet` and `stockdemo_compat/`; cash is disclosed separately and risk constraints use actual stock holdings normalized by stock market value. Omitting the flag preserves the existing rolling behavior.
 
 The default missing-held policy is `carry_forward` for legacy StockDemo parity: a missing held ticker is valued at its last valid close and remains non-tradable. Pass `--stockdemo-missing-held-policy error` for data-quality checks. For confirmed terminal securities, pass `--stockdemo-missing-held-policy terminal_writeoff` together with the explicit terminal-event manifest; do not infer terminal events from gaps.
+
+The rolling `--missing-security-policy` defaults to `auto`, which selects `freeze_last` only when StockDemo actual-holdings feedback and `carry_forward` are both enabled. Missing candidate-only names are excluded; benchmark or current names remain in the optimization universe and are frozen at current weight. This does not infer delisting, fabricate returns, or mark a security tradable. Counts and tickers are audited, while every other mode remains fail-closed.
 
 ## Stockdemo-compatible backtest
 

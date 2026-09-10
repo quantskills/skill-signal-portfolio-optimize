@@ -8,15 +8,18 @@ Long-form rows for both portfolios:
 
 ```text
 date | ticker | portfolio | target_weight | benchmark_weight |
-current_weight | signal_available | is_candidate | has_signal | raw_prediction |
-signal_score | expected_return | tradable
+current_weight | signal_available | is_candidate | exit_only | has_signal | raw_prediction |
+signal_score | expected_return | tradable | synthetic_nontradable
 ```
 
-`portfolio` is either `equal_weight_signal` or `risk_optimized`. `signal_available` reports prediction coverage on the optimization universe; `is_candidate` distinguishes selectable names from benchmark- or current-only names; `has_signal` is retained as a compatibility alias for full-signal membership.
+`synthetic_nontradable` distinguishes an absent tradability row handled by explicit
+`freeze_last` from an observed `tradable=false` row.
+
+`portfolio` is either `equal_weight_signal` or `risk_optimized`. `signal_available` reports prediction coverage on the optimization universe; `is_candidate` distinguishes selectable names from benchmark- or current-only names; `exit_only` marks a missing-signal tradable holding whose target cannot exceed current weight; `has_signal` is retained as a compatibility alias for full-signal membership.
 
 ## `constraint_diagnostics.json`
 
-Contains solver status, iterations, objective value, hard-constraint tolerances, turnover, candidate aggregate weight, and per-industry/style benchmark exposure, portfolio exposure, active exposure, lower/upper bounds, slack, binding status, and violations for both portfolios. `constraint_slacks` uses positive values for remaining capacity, zero for binding constraints, and negative values for violations. Raw and controllable stock-weight maxima are both recorded. Candidate diagnostics record configured and effective aggregate bounds; a frozen non-tradable holding outside the candidate set reduces only the effective attainable candidate maximum. A drifted non-tradable position outside a stock bound is held exactly and listed under `frozen_bound_exceptions`; the exception does not relax bounds for tradable assets.
+Contains solver status, iterations, objective value, hard-constraint tolerances, turnover, candidate aggregate weight, and per-industry/style benchmark exposure, portfolio exposure, active exposure, lower/upper bounds, slack, binding status, and violations for both portfolios. `constraint_slacks` uses positive values for remaining capacity, zero for binding constraints, and negative values for violations. Raw and controllable stock-weight maxima are both recorded. Exit-only diagnostics record the maximum weight increase and independently verify that it is within tolerance. Candidate diagnostics record configured and effective aggregate bounds; a frozen non-tradable holding outside the candidate set reduces only the effective attainable candidate maximum. A drifted non-tradable position outside a stock bound is held exactly and listed under `frozen_bound_exceptions`; the exception does not relax bounds for tradable assets.
 
 Only `risk_optimized` must satisfy every configured optimizer constraint. Baseline violations are reported for comparison.
 
@@ -26,11 +29,13 @@ Contains expected return, ex-ante absolute volatility, active volatility, and ch
 
 ## `signal_diagnostics.json`
 
-Contains signal type, direction, requested date, full calibration, candidate, and optimization asset counts, optimization prediction coverage, candidate target weight, missing-prediction policy, allowed frozen-missing count, raw/calibrated distribution summaries, winsorization count, rank transform, rank power, and calibration settings.
+Contains signal type, direction, requested date, full calibration, candidate, and optimization asset counts, optimization prediction coverage, candidate target weight, missing-prediction policy, frozen-missing, exit-only, and benchmark-only neutral counts and ticker lists, raw/calibrated distribution summaries, winsorization count, rank transform, rank power, and calibration settings.
+
+Missing-security diagnostics additionally record the resolved policy, synthetic non-tradable names, and candidates excluded because their tradability row is absent.
 
 ## `optimization_summary.json`
 
-Contains the primary and final signal utilities, signal utility floor and capture ratio, exact one-way turnover, estimated linear transaction cost, turnover saved versus the same-signal equal-weight baseline, risk form, selected backend, both stage statuses, hard-constraint slacks and bindings, available duals, and explicit reasons for unavailable dual or KKT fields.
+Contains the primary and final signal utilities, signal utility floor and capture ratio, exact one-way turnover, estimated linear transaction cost, turnover saved versus the same-signal equal-weight baseline, risk form, selected backend, both stage statuses, hard-constraint slacks and bindings, available duals, and explicit reasons for unavailable dual or KKT fields. For the schema 6 conservative blend it instead records `blend_strength`, anchor asset count, anchor/minimum-variance/final predicted volatility, predicted risk reduction, reallocated weight, and maximum single-name deviation. `solver_performance` records conic compile and solve time, cache key and hit status, DPP status, warm-start request, risk-operator row count, and tracking-error formulation when available.
 
 ## `run_manifest.json`
 
@@ -54,9 +59,11 @@ The daily table contains gross return, proportional transaction cost, net return
 NAV, drawdown, benchmark net return, active return, active NAV, and active drawdown for
 equal-weight, optimized, and simulated benchmark portfolios. `portfolio_metrics.json` adds
 geometrically annualized excess return, realized tracking error, information ratio, ending
-active NAV, and maximum active drawdown. `optimization_diagnostics.parquet` includes scalar
-slacks for turnover, tracking error, stock limits, and candidate-weight bounds.
-`optimization_summary.json` aggregates constraint binding counts and ratios, signal-capture minimum/mean/maximum, signal utility loss, turnover, estimated cost, runtime, backend, risk form, and cache reuse.
+active NAV, and maximum active drawdown. `optimization_diagnostics.parquet` includes scalar slacks for turnover, tracking error, stock limits, and candidate-weight bounds. Conic runs additionally include solve and compile seconds, cache key and hit status, DPP status, warm-start request, risk-operator rows, and tracking-error formulation. Conservative-blend runs additionally carry the blend and predicted-risk diagnostics through this daily table.
+
+With missing-security handling enabled, rolling diagnostics also expose `missing_security_policy`, `synthetic_nontradable_asset_count`, and `excluded_missing_candidate_count`; the rolling manifest records the resolved policy in checkpoint provenance.
+
+`optimization_summary.json` aggregates constraint binding counts and ratios, signal-capture minimum/mean/maximum, signal utility loss, turnover, estimated cost, runtime, backend, risk form, and dynamic-risk cache reuse. Its `solver_performance` section separately aggregates Clarabel solve time, problem compile time, and parameterized-problem cache hit count and ratio.
 
 With `--stockdemo-market-file`, rolling output additionally contains `execution_feedback.parquet` and `stockdemo_compat/`. The feedback table records daily executed cash, cash weight, holdings, buy/sell amounts, costs, turnover, source target date, and the next rebalance that consumes the state. When explicit terminal write-off handling is enabled it also records `terminal_writeoff_count`, `terminal_writeoff_value`, and `terminal_writeoff_tickers`; with `carry_forward` it records `carried_forward_count`, `carried_forward_value`, and `carried_forward_tickers`. Rolling summaries aggregate the count and value fields. `optimization_diagnostics.parquet` identifies `current_state_source` and `actual_cash_weight`. The nested replay contains `stats.csv`, `transaction.csv`, `holdings.csv`, and `summary.json`.
 `rolling_manifest.json` records a SHA-256 entry for every resolved covariance and, when

@@ -395,6 +395,69 @@ def test_terminal_writeoff_removes_only_declared_missing_holding(tmp_path: Path)
     assert set(weights.index) == {"000002.SZ"}
 
 
+def test_terminal_writeoff_removes_stale_target_before_order_validation(
+    tmp_path: Path,
+) -> None:
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    market = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230104
+    )
+    state = StockDemoPortfolioState.initial(1_000_000.0)
+    advance_stockdemo_state(
+        state=state,
+        date="20230102",
+        day=market.loc[market["date"].eq("20230102")].set_index("ticker"),
+        fee_rate=0.0007,
+        target=pd.Series({"000001.SZ": 0.5, "000002.SZ": 0.5}),
+    )
+    day = market.loc[
+        market["date"].eq("20230103") & market["ticker"].ne("000001.SZ")
+    ].set_index("ticker")
+
+    snapshot, _, _, weights = advance_stockdemo_state(
+        state=state,
+        date="20230103",
+        day=day,
+        fee_rate=0.0007,
+        target=pd.Series({"000001.SZ": 0.5, "000002.SZ": 0.5}),
+        missing_target_policy="error",
+        missing_held_policy="terminal_writeoff",
+        terminal_events={"20230103": {"000001.SZ"}},
+    )
+
+    assert snapshot["terminal_writeoff_count"] == 1
+    assert snapshot["terminal_target_removed_count"] == 1
+    assert snapshot["terminal_target_removed_weight"] == pytest.approx(0.5)
+    assert snapshot["terminal_target_removed_tickers"] == "000001.SZ"
+    assert snapshot["target_renormalization_factor"] == pytest.approx(2.0)
+    assert snapshot["missing_target_count"] == 0
+    assert "000001.SZ" not in state.holdings
+    assert weights.index.tolist() == ["000002.SZ"]
+    assert weights.iloc[0] == pytest.approx(1.0)
+
+
+def test_terminal_event_does_not_allow_never_held_missing_target(tmp_path: Path) -> None:
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    day = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230102
+    ).set_index("ticker")
+    state = StockDemoPortfolioState.initial(1_000_000.0)
+
+    with pytest.raises(InputDataError, match="missing positive target"):
+        advance_stockdemo_state(
+            state=state,
+            date="20230102",
+            day=day,
+            fee_rate=0.0007,
+            target=pd.Series({"999999.SZ": 1.0}),
+            missing_target_policy="error",
+            missing_held_policy="terminal_writeoff",
+            terminal_events={"20230102": {"999999.SZ"}},
+        )
+
+
 def test_undeclared_missing_holding_still_fails(tmp_path: Path) -> None:
     market_path = tmp_path / "market.parquet"
     _market().to_parquet(market_path, index=False)
@@ -445,7 +508,7 @@ def test_stockdemo_replay_accepts_manifest_terminal_event(tmp_path: Path) -> Non
             longx=1,
             initial_cash=1_000_000.0,
             exact_window=False,
-            missing_target_policy="cash",
+            missing_target_policy="error",
             missing_held_policy="terminal_writeoff",
         ),
         terminal_events={"20230104": {"000001.SZ"}},
@@ -454,6 +517,8 @@ def test_stockdemo_replay_accepts_manifest_terminal_event(tmp_path: Path) -> Non
     terminal = stats.loc[stats["date"].eq(20230104)].iloc[0]
     assert terminal["terminal_writeoff_count"] == 1
     assert terminal["terminal_writeoff_tickers"] == "000001.SZ"
+    assert terminal["terminal_target_removed_count"] == 1
+    assert terminal["terminal_target_removed_tickers"] == "000001.SZ"
     assert summary["metrics"]["observations"] == 2
 
 

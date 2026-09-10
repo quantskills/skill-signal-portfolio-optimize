@@ -139,6 +139,7 @@ class SingleDatePipelineTest(unittest.TestCase):
         self,
         output_name: str = "output",
         candidate_file: Path | None = None,
+        missing_security_policy: str = "error",
     ) -> dict[str, object]:
         return run_single_date(
             config_path=self.config,
@@ -150,6 +151,7 @@ class SingleDatePipelineTest(unittest.TestCase):
             sector_file=self.sectors,
             exposure_file=self.exposures,
             tradability_file=self.tradability,
+            missing_security_policy=missing_security_policy,
             requested_date=self.date,
             output_dir=self.root / output_name,
         )
@@ -430,6 +432,32 @@ class SingleDatePipelineTest(unittest.TestCase):
         self.assertEqual(manifest["candidate_asset_count"], 2)
         self.assertEqual(manifest["benchmark_or_current_only_asset_count"], 4)
 
+    def test_candidate_universe_override_filters_source_candidates(self) -> None:
+        candidate_file = self.write_candidates(self.tickers[:4])
+        result = run_single_date(
+            config_path=self.config,
+            signal_file=self.signal,
+            candidate_file=candidate_file,
+            candidate_universe=pd.Index(self.tickers[:2]),
+            covariance_file=self.covariance,
+            benchmark_file=self.benchmark,
+            current_weights_file=self.current,
+            sector_file=self.sectors,
+            exposure_file=self.exposures,
+            tradability_file=self.tradability,
+            requested_date=self.date,
+            output_dir=self.root / "candidate-override-output",
+        )
+
+        manifest = json.loads(
+            (Path(result["output_dir"]) / "run_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert manifest["candidate_asset_count"] == 2
+        assert manifest["candidate_universe_override"]["source_asset_count"] == 4
+        assert manifest["candidate_universe_override"]["excluded_asset_count"] == 2
+
     def test_candidate_missing_from_full_signal_is_rejected(self) -> None:
         candidates = self.write_candidates([*self.tickers[:2], "000099.SZ"])
         with self.assertRaisesRegex(InputDataError, "candidate universe contains"):
@@ -496,6 +524,146 @@ class SingleDatePipelineTest(unittest.TestCase):
         self.assertEqual(float(frozen["signal_score"]), 0.0)
         self.assertEqual(diagnostics["allowed_frozen_missing_prediction_count"], 1)
 
+
+    def test_role_aware_missing_held_signal_is_exit_only(self) -> None:
+        self.write_v3_config()
+        config = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        config["signal"]["missing_prediction_policy"] = "role_aware"
+        self.config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+        signal = pd.read_csv(self.signal)
+        signal = signal.loc[signal["ticker"].ne(self.tickers[-1])]
+        signal.to_csv(self.signal, index=False)
+        candidates = self.write_candidates(self.tickers[:-1])
+        tradability = pd.read_csv(self.tradability)
+        tradability["tradable"] = True
+        tradability.to_csv(self.tradability, index=False)
+
+        result = self.run_pipeline("role-aware-exit-only", candidates)
+
+        output = Path(result["output_dir"])
+        weights = pd.read_parquet(output / "target_weights.parquet")
+        held = weights.loc[
+            weights["portfolio"].eq("risk_optimized")
+            & weights["ticker"].eq(self.tickers[-1])
+        ].iloc[0]
+        diagnostics = json.loads(
+            (output / "signal_diagnostics.json").read_text(encoding="utf-8")
+        )
+        constraints = json.loads(
+            (output / "constraint_diagnostics.json").read_text(encoding="utf-8")
+        )["risk_optimized"]["constraints"]
+        self.assertTrue(bool(held["exit_only"]))
+        self.assertLessEqual(float(held["target_weight"]), 1.0 / 6.0 + 1.0e-6)
+        self.assertEqual(diagnostics["exit_only_missing_prediction_count"], 1)
+        self.assertLessEqual(
+            constraints["maximum_exit_only_weight_increase"], 1.0e-6
+        )
+
+    def test_role_aware_allows_benchmark_only_neutral_signal(self) -> None:
+        self.write_v3_config()
+        config = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        config["signal"]["missing_prediction_policy"] = "role_aware"
+        self.config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+        signal = pd.read_csv(self.signal)
+        signal = signal.loc[signal["ticker"].ne(self.tickers[-1])]
+        signal.to_csv(self.signal, index=False)
+        candidates = self.write_candidates(self.tickers[:-1])
+        current = pd.read_csv(self.current)
+        current.loc[current["ticker"].eq(self.tickers[-1]), "current_weight"] = 0.0
+        current.loc[current["ticker"].eq(self.tickers[0]), "current_weight"] = 1.0 / 3.0
+        current.to_csv(self.current, index=False)
+        tradability = pd.read_csv(self.tradability)
+        tradability["tradable"] = True
+        tradability.to_csv(self.tradability, index=False)
+
+        result = self.run_pipeline("role-aware-benchmark-only", candidates)
+
+        diagnostics = json.loads(
+            (
+                Path(result["output_dir"]) / "signal_diagnostics.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            diagnostics["benchmark_only_neutral_prediction_count"], 1
+        )
+        self.assertEqual(diagnostics["exit_only_missing_prediction_count"], 0)
+
+    def test_role_aware_rejects_frozen_candidate_without_signal(self) -> None:
+        self.write_v3_config()
+        config = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        config["signal"]["missing_prediction_policy"] = "role_aware"
+        self.config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+        signal = pd.read_csv(self.signal)
+        signal = signal.loc[signal["ticker"].ne(self.tickers[0])]
+        signal.to_csv(self.signal, index=False)
+        candidates = self.write_candidates(self.tickers)
+
+        with self.assertRaisesRegex(InputDataError, "candidate"):
+            self.run_pipeline("role-aware-frozen-candidate-missing", candidates)
+
+    def test_role_aware_still_rejects_candidate_without_signal(self) -> None:
+        self.write_v3_config()
+        config = yaml.safe_load(self.config.read_text(encoding="utf-8"))
+        config["signal"]["missing_prediction_policy"] = "role_aware"
+        self.config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+        signal = pd.read_csv(self.signal)
+        signal = signal.loc[signal["ticker"].ne(self.tickers[-1])]
+        signal.to_csv(self.signal, index=False)
+        candidates = self.write_candidates(self.tickers)
+
+        with self.assertRaisesRegex(InputDataError, "candidate universe"):
+            self.run_pipeline("role-aware-candidate-missing", candidates)
+
+
+    def test_missing_tradability_record_fails_closed_by_default(self) -> None:
+        tradability = pd.read_csv(self.tradability)
+        tradability = tradability.loc[
+            tradability["ticker"].ne(self.tickers[0])
+        ]
+        tradability.to_csv(self.tradability, index=False)
+
+        with self.assertRaisesRegex(InputDataError, "tradability missing"):
+            self.run_pipeline("missing-tradability-strict")
+
+    def test_freeze_last_excludes_missing_candidate_and_freezes_holding(self) -> None:
+        tradability = pd.read_csv(self.tradability)
+        tradability = tradability.loc[
+            tradability["ticker"].ne(self.tickers[0])
+        ]
+        tradability.to_csv(self.tradability, index=False)
+
+        result = self.run_pipeline(
+            "missing-tradability-freeze",
+            missing_security_policy="freeze_last",
+        )
+
+        output = Path(result["output_dir"])
+        weights = pd.read_parquet(output / "target_weights.parquet")
+        frozen = weights.loc[
+            weights["portfolio"].eq("risk_optimized")
+            & weights["ticker"].eq(self.tickers[0])
+        ].iloc[0]
+        diagnostics = json.loads(
+            (output / "signal_diagnostics.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(
+            (output / "run_manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertAlmostEqual(float(frozen["target_weight"]), 1.0 / 6.0)
+        self.assertFalse(bool(frozen["tradable"]))
+        self.assertTrue(bool(frozen["synthetic_nontradable"]))
+        self.assertFalse(bool(frozen["is_candidate"]))
+        self.assertEqual(diagnostics["synthetic_nontradable_tickers"], [self.tickers[0]])
+        self.assertEqual(diagnostics["excluded_missing_candidate_count"], 1)
+        self.assertEqual(manifest["missing_security_resolution"]["policy"], "freeze_last")
     def test_signal_rejects_additional_factor_columns(self) -> None:
         frame = pd.read_csv(self.signal)
         frame["alpha002"] = np.arange(len(frame))

@@ -24,6 +24,7 @@ class StageSolution:
     optimality_gap: float | None = None
     risk_cut_matrix: np.ndarray | None = None
     risk_cut_bounds: np.ndarray | None = None
+    diagnostics: dict[str, Any] | None = None
 
 
 def signal_utility(
@@ -49,8 +50,16 @@ def signal_capture_ratio(primary_utility: float, final_utility: float) -> float:
     return float(1.0 - max(primary_utility - final_utility, 0.0) / scale)
 
 
-def select_lexicographic_backend(requested: str) -> str:
-    if requested not in {"auto", "cvxpy", "scipy_slsqp", "scipy_highs"}:
+def select_lexicographic_backend(
+    requested: str, fallback_policy: str = "scipy_highs"
+) -> str:
+    if requested not in {
+        "auto",
+        "cvxpy",
+        "clarabel_socp",
+        "scipy_slsqp",
+        "scipy_highs",
+    }:
         raise OptimizationError(f"unsupported solver backend: {requested}")
     try:
         import cvxpy as cp
@@ -58,7 +67,7 @@ def select_lexicographic_backend(requested: str) -> str:
         has_clarabel = "CLARABEL" in set(cp.installed_solvers())
     except ImportError:
         has_clarabel = False
-    if requested == "cvxpy":
+    if requested in {"cvxpy", "clarabel_socp"}:
         if not has_clarabel:
             raise OptimizationError(
                 "CVXPY with CLARABEL is unavailable for lexicographic optimization"
@@ -66,6 +75,10 @@ def select_lexicographic_backend(requested: str) -> str:
         return "cvxpy_clarabel"
     if requested == "auto" and has_clarabel:
         return "cvxpy_clarabel"
+    if requested == "auto" and fallback_policy == "error":
+        raise OptimizationError(
+            "CVXPY with CLARABEL is unavailable and fallback_policy is error"
+        )
     return "scipy_highs_lexicographic"
 
 
@@ -103,6 +116,7 @@ def _linear_problem(
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
     candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
     tradable: pd.Series,
     constraint_config: dict[str, Any],
     *,
@@ -123,6 +137,7 @@ def _linear_problem(
         candidate_mask,
         tradable,
         local_constraints,
+        exit_only_mask=exit_only_mask,
     )
 
 
@@ -233,6 +248,7 @@ def solve_primary_signal_problem_scipy(
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
     candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
@@ -244,6 +260,7 @@ def solve_primary_signal_problem_scipy(
         sectors,
         exposures,
         candidate_mask,
+        exit_only_mask,
         tradable,
         constraint_config,
         require_turnover_auxiliary=False,
@@ -262,7 +279,9 @@ def solve_primary_signal_problem_scipy(
         max_tracking_error=constraint_config["max_tracking_error"],
         constraint_tolerance=float(constraint_config["constraint_tolerance"]),
         objective_tolerance=max(float(optimizer_config["ftol"]), 1.0e-4),
-        iteration_budget=int(optimizer_config["max_iterations"]),
+        iteration_budget=int(
+            optimizer_config.get("max_cutting_planes", optimizer_config["max_iterations"])
+        ),
         n_assets=n_assets,
         current_values=(
             None if current is None else current.to_numpy(dtype=float)
@@ -297,6 +316,7 @@ def solve_secondary_cost_problem_scipy(
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
     linear_cost_bps: float,
+    exit_only_mask: pd.Series | None = None,
 ) -> StageSolution:
     n_assets = len(benchmark)
     a_eq, b_eq, a_ub, b_ub, bounds, with_turnover = _linear_problem(
@@ -305,6 +325,7 @@ def solve_secondary_cost_problem_scipy(
         sectors,
         exposures,
         candidate_mask,
+        exit_only_mask,
         tradable,
         constraint_config,
         require_turnover_auxiliary=True,
@@ -484,23 +505,6 @@ def solve_secondary_cost_problem_scipy(
     )
 
 
-def _cvxpy_risk_expression(cp: Any, risk: PortfolioRisk, active: Any) -> Any:
-    if risk.form == "asset_covariance":
-        assert risk.asset_covariance is not None
-        return cp.quad_form(
-            active, cp.psd_wrap(risk.asset_covariance.to_numpy(dtype=float))
-        )
-    assert risk.exposures is not None
-    assert risk.factor_covariance is not None
-    assert risk.specific_variance is not None
-    x = risk.exposures.to_numpy(dtype=float)
-    f = risk.factor_covariance.to_numpy(dtype=float)
-    d = risk.specific_variance.to_numpy(dtype=float)
-    return cp.quad_form(x.T @ active, cp.psd_wrap(f)) + cp.sum(
-        cp.multiply(d, cp.square(active))
-    )
-
-
 def _solve_cvxpy(
     *,
     signal_score: pd.Series,
@@ -510,97 +514,64 @@ def _solve_cvxpy(
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
     candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
     linear_cost_bps: float,
 ) -> tuple[StageSolution, StageSolution, float, float]:
-    import cvxpy as cp
+    from .conic_optimizer import solve_lexicographic_clarabel
 
     n_assets = len(benchmark)
-    a_eq, b_eq, a_ub, b_ub, bounds, with_turnover = _linear_problem(
+    a_eq, b_eq, a_ub, b_ub, bounds, _ = _linear_problem(
         benchmark,
         current,
         sectors,
         exposures,
         candidate_mask,
+        exit_only_mask,
         tradable,
         constraint_config,
         require_turnover_auxiliary=True,
     )
-    decision = cp.Variable(len(bounds.lb))
-    weights = decision[:n_assets]
-    active = weights - benchmark.to_numpy(dtype=float)
-    hard_constraints: list[Any] = [
-        a_eq @ decision == b_eq,
-        decision >= bounds.lb,
-        decision <= bounds.ub,
-    ]
-    if len(a_ub):
-        hard_constraints.append(a_ub @ decision <= b_ub)
-    if constraint_config["max_tracking_error"] is not None:
-        hard_constraints.append(
-            _cvxpy_risk_expression(cp, risk, active)
-            <= float(constraint_config["max_tracking_error"]) ** 2
-        )
-    score = signal_score.to_numpy(dtype=float)
-    utility = score @ active
-    options = {
-        "max_iter": int(optimizer_config["max_iterations"]),
-        "tol_gap_abs": float(optimizer_config["ftol"]),
-        "tol_feas": max(float(optimizer_config["ftol"]), 1.0e-10),
-    }
-    primary_problem = cp.Problem(cp.Maximize(utility), hard_constraints)
-    try:
-        primary_problem.solve(solver="CLARABEL", warm_start=False, verbose=False, **options)
-    except Exception as exc:
-        raise OptimizationError(f"CVXPY CLARABEL primary solve failed: {exc}") from exc
-    if primary_problem.status != cp.OPTIMAL or decision.value is None:
-        raise OptimizationError(
-            f"CVXPY CLARABEL primary solve did not return optimum: {primary_problem.status}"
-        )
-    primary_decision = np.asarray(decision.value, dtype=float)
-    primary_utility = signal_utility(primary_decision[:n_assets], benchmark, signal_score)
-    floor = signal_utility_floor(
-        primary_utility, float(optimizer_config["minimum_signal_capture"])
+    solved = solve_lexicographic_clarabel(
+        signal_score=signal_score.to_numpy(dtype=float),
+        risk_input=risk,
+        benchmark=benchmark.to_numpy(dtype=float),
+        current=None if current is None else current.to_numpy(dtype=float),
+        a_eq=a_eq,
+        b_eq=b_eq,
+        a_ub=a_ub,
+        b_ub=b_ub,
+        lower_bounds=bounds.lb,
+        upper_bounds=bounds.ub,
+        optimizer_config=optimizer_config,
+        max_tracking_error=constraint_config["max_tracking_error"],
+        linear_cost_bps=linear_cost_bps,
+        minimum_signal_capture=float(optimizer_config["minimum_signal_capture"]),
     )
     primary = StageSolution(
-        decision=primary_decision,
-        objective_value=-primary_utility,
-        iterations=int(primary_problem.solver_stats.num_iters or 0),
-        status=str(primary_problem.status),
-        message=str(primary_problem.status),
+        decision=solved.primary_decision,
+        objective_value=solved.primary_objective_value,
+        iterations=solved.primary_iterations,
+        status=solved.primary_status,
+        message=solved.primary_status,
+        diagnostics=solved.diagnostics,
     )
-    reference = benchmark.to_numpy(dtype=float) if current is None else current.to_numpy(dtype=float)
-    secondary_objective = float(optimizer_config["stability_penalty"]) * cp.sum_squares(
-        weights - reference
-    )
-    if with_turnover:
-        secondary_objective += 0.5 * float(linear_cost_bps) / 10000.0 * cp.sum(
-            decision[n_assets:]
-        )
-    utility_constraint = utility >= floor
-    secondary_problem = cp.Problem(
-        cp.Minimize(secondary_objective), [*hard_constraints, utility_constraint]
-    )
-    try:
-        secondary_problem.solve(solver="CLARABEL", warm_start=False, verbose=False, **options)
-    except Exception as exc:
-        raise OptimizationError(f"CVXPY CLARABEL secondary solve failed: {exc}") from exc
-    if secondary_problem.status != cp.OPTIMAL or decision.value is None:
-        raise OptimizationError(
-            "CVXPY CLARABEL secondary solve did not return optimum: "
-            f"{secondary_problem.status}"
-        )
     secondary = StageSolution(
-        decision=np.asarray(decision.value, dtype=float),
-        objective_value=float(secondary_problem.value),
-        iterations=int(secondary_problem.solver_stats.num_iters or 0),
-        status=str(secondary_problem.status),
-        message=str(secondary_problem.status),
-        duals={"signal_utility_floor": float(utility_constraint.dual_value)},
+        decision=solved.secondary_decision,
+        objective_value=solved.secondary_objective_value,
+        iterations=solved.secondary_iterations,
+        status=solved.secondary_status,
+        message=solved.secondary_status,
+        duals=(
+            None
+            if solved.utility_floor_dual is None
+            else {"signal_utility_floor": solved.utility_floor_dual}
+        ),
+        diagnostics=solved.diagnostics,
     )
-    return primary, secondary, primary_utility, floor
+    return primary, secondary, solved.primary_utility, solved.utility_floor
 
 
 def optimize_lexicographic_signal_cost(
@@ -613,6 +584,7 @@ def optimize_lexicographic_signal_cost(
     sectors: pd.Series | None,
     exposures: pd.DataFrame | None,
     candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
     tradable: pd.Series,
     optimizer_config: dict[str, Any],
     constraint_config: dict[str, Any],
@@ -630,9 +602,15 @@ def optimize_lexicographic_signal_cost(
     sectors = None if sectors is None else sectors.reindex(index)
     exposures = None if exposures is None else exposures.reindex(index)
     candidate_mask = None if candidate_mask is None else candidate_mask.reindex(index)
+    exit_only_mask = (
+        None if exit_only_mask is None else exit_only_mask.reindex(index)
+    )
     tradable = tradable.reindex(index)
     risk = _risk_for_index(as_portfolio_risk(risk_input), index)
-    backend = select_lexicographic_backend(optimizer_config["solver_backend"])
+    backend = select_lexicographic_backend(
+        optimizer_config["solver_backend"],
+        optimizer_config.get("fallback_policy", "scipy_highs"),
+    )
     if backend == "cvxpy_clarabel":
         primary, secondary, primary_utility, utility_floor = _solve_cvxpy(
             signal_score=signal_score,
@@ -642,6 +620,7 @@ def optimize_lexicographic_signal_cost(
             sectors=sectors,
             exposures=exposures,
             candidate_mask=candidate_mask,
+            exit_only_mask=exit_only_mask,
             tradable=tradable,
             optimizer_config=optimizer_config,
             constraint_config=constraint_config,
@@ -656,6 +635,7 @@ def optimize_lexicographic_signal_cost(
             sectors=sectors,
             exposures=exposures,
             candidate_mask=candidate_mask,
+            exit_only_mask=exit_only_mask,
             tradable=tradable,
             optimizer_config=optimizer_config,
             constraint_config=constraint_config,
@@ -677,6 +657,7 @@ def optimize_lexicographic_signal_cost(
             sectors=sectors,
             exposures=exposures,
             candidate_mask=candidate_mask,
+            exit_only_mask=exit_only_mask,
             tradable=tradable,
             optimizer_config=optimizer_config,
             constraint_config=constraint_config,
@@ -697,6 +678,7 @@ def optimize_lexicographic_signal_cost(
         tradable,
         constraint_config,
         candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
     )
     tolerance = max(float(constraint_config["constraint_tolerance"]), 1.0e-9)
     if not report["passed"]:
@@ -768,7 +750,11 @@ def optimize_lexicographic_signal_cost(
             None if backend == "cvxpy_clarabel" else "HiGHS linear-relaxation backend does not expose a complete KKT certificate"
         ),
         "backend_selected_before_solve": True,
-        "backend_fallback_used": False,
+        "backend_fallback_used": bool(
+            optimizer_config["solver_backend"] == "auto"
+            and backend != "cvxpy_clarabel"
+        ),
+        **(secondary.diagnostics or {}),
     }
     return OptimizationResult(
         weights=weights.reindex(original_index), solver=solver, constraints=report

@@ -23,7 +23,12 @@ from portfolio_runtime.backtest import (  # noqa: E402
 )
 from portfolio_runtime.config import DEFAULT_CONFIG  # noqa: E402
 from portfolio_runtime.errors import InputDataError  # noqa: E402
-from portfolio_runtime.rolling import ROLLING_OUTPUT_FILES, run_rolling_experiment  # noqa: E402
+from portfolio_runtime.io import DateTableCache  # noqa: E402
+from portfolio_runtime.rolling import (  # noqa: E402
+    ROLLING_OUTPUT_FILES,
+    _preflight_signal_coverage,
+    run_rolling_experiment,
+)
 
 
 def test_backtest_applies_targets_next_day_and_charges_turnover() -> None:
@@ -111,6 +116,83 @@ def test_benchmark_relative_performance_and_metrics() -> None:
     assert metrics["information_ratio"] is None
 
 
+def test_signal_preflight_rejects_abrupt_cross_section_loss(
+    tmp_path: Path,
+) -> None:
+    first = [f"{value:06d}.SZ" for value in range(10)]
+    second = first[:5]
+    signal = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "prediction": float(index)}
+            for date, tickers in ((20230102, first), (20230103, second))
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    candidates = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker}
+            for date, tickers in ((20230102, first[:2]), (20230103, second[:2]))
+            for ticker in tickers
+        ]
+    )
+    signal_path = tmp_path / "signal.parquet"
+    candidate_path = tmp_path / "candidate.parquet"
+    signal.to_parquet(signal_path, index=False)
+    candidates.to_parquet(candidate_path, index=False)
+
+    with pytest.raises(InputDataError, match="abrupt cross-section loss"):
+        _preflight_signal_coverage(
+            signal_file=signal_path,
+            candidate_file=candidate_path,
+            dates=["20230102", "20230103"],
+            signal_config={
+                "minimum_daily_signal_count_ratio": 0.80,
+                "maximum_prior_candidate_missing_ratio": 0.05,
+            },
+            table_cache=DateTableCache(),
+        )
+
+
+def test_signal_preflight_rejects_missing_prior_candidate_batch(
+    tmp_path: Path,
+) -> None:
+    first = [f"{value:06d}.SZ" for value in range(10)]
+    second = first[2:] + ["000010.SZ", "000011.SZ"]
+    signal = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "prediction": float(index)}
+            for date, tickers in ((20230102, first), (20230103, second))
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    candidates = pd.DataFrame(
+        [
+            {"date": 20230102, "ticker": ticker}
+            for ticker in first[:4]
+        ]
+        + [
+            {"date": 20230103, "ticker": ticker}
+            for ticker in second[:4]
+        ]
+    )
+    signal_path = tmp_path / "signal.parquet"
+    candidate_path = tmp_path / "candidate.parquet"
+    signal.to_parquet(signal_path, index=False)
+    candidates.to_parquet(candidate_path, index=False)
+
+    with pytest.raises(InputDataError, match="prior candidates"):
+        _preflight_signal_coverage(
+            signal_file=signal_path,
+            candidate_file=candidate_path,
+            dates=["20230102", "20230103"],
+            signal_config={
+                "minimum_daily_signal_count_ratio": 0.80,
+                "maximum_prior_candidate_missing_ratio": 0.05,
+            },
+            table_cache=DateTableCache(),
+        )
+
+
 def test_rolling_experiment_writes_stable_outputs(tmp_path: Path) -> None:
     dates = [20230102, 20230103, 20230104, 20230105, 20230106]
     rebalance_dates = [20230102, 20230104]
@@ -165,7 +247,8 @@ def test_rolling_experiment_writes_stable_outputs(tmp_path: Path) -> None:
                 "schema_version": 2,
                 "optimizer": {
                     "objective_mode": "score_max_te",
-                    "solver_backend": "auto",
+                    "solver_backend": "scipy_highs",
+                    "fallback_policy": "scipy_highs",
                     "risk_aversion": 5.0,
                     "turnover_penalty": 0.001,
                     "smoothing_epsilon": 1.0e-8,
@@ -241,6 +324,28 @@ def test_rolling_experiment_writes_stable_outputs(tmp_path: Path) -> None:
     assert manifest["input_cache"]["enabled"] is True
     assert manifest["input_cache"]["file_load_count"] >= 3
     assert manifest["input_cache"]["cache_hit_count"] > 0
+
+    monthly_output = tmp_path / "monthly_output"
+    monthly_result = run_rolling_experiment(
+        config_path=config_path,
+        signal_file=signal_path,
+        covariance_root=covariance_path,
+        exposure_root=exposure_root,
+        benchmark_file=benchmark_path,
+        asset_returns_file=returns_path,
+        risk_refresh_frequency="monthly",
+        output_dir=monthly_output,
+        transaction_cost_bps=10.0,
+    )
+    assert monthly_result["status"] == "success"
+    monthly_manifest = json.loads(
+        (monthly_output / "rolling_manifest.json").read_text()
+    )
+    assert monthly_manifest["risk_refresh_frequency"] == "monthly"
+    assert [item["model_date"] for item in monthly_manifest["exposure_inputs"]] == [
+        "20230102",
+        "20230102",
+    ]
 
 
 def test_rolling_rejects_exposure_file_and_root_together(tmp_path: Path) -> None:
@@ -322,20 +427,32 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
                 "is_st": False,
                 "adj_factor": 1.0,
             }
-            for date_index, date in enumerate(rebalance_dates)
+            for date_index, date in enumerate(dates)
             for index, ticker in enumerate(tickers)
         ]
     )
+    market = market.loc[
+        ~(
+            market["date"].eq(20230104) & market["ticker"].eq(tickers[0])
+        )
+    ].copy()
     signal_path = tmp_path / "signal.parquet"
     benchmark_path = tmp_path / "benchmark.parquet"
     returns_path = tmp_path / "returns.parquet"
     market_path = tmp_path / "market.parquet"
+    tradability_path = tmp_path / "tradability.parquet"
     covariance_path = tmp_path / "covariance.parquet"
     config_path = tmp_path / "config.yaml"
     signal.to_parquet(signal_path, index=False)
     benchmark.to_parquet(benchmark_path, index=False)
     returns.to_parquet(returns_path, index=False)
     market.to_parquet(market_path, index=False)
+    market.loc[:, ["date", "ticker"]].assign(
+        tradable=True
+    ).to_parquet(
+        tradability_path,
+        index=False,
+    )
     pd.DataFrame(np.eye(2) * 0.10, index=tickers, columns=tickers).to_parquet(
         covariance_path
     )
@@ -353,6 +470,7 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
         covariance_root=covariance_path,
         benchmark_file=benchmark_path,
         asset_returns_file=returns_path,
+        tradability_file=tradability_path,
         stockdemo_market_file=market_path,
         output_dir=output,
     )
@@ -362,7 +480,13 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
         output / "stockdemo_compat"
     )
     feedback = pd.read_parquet(output / "execution_feedback.parquet")
-    assert feedback["target_date"].dropna().tolist() == ["20230102", "20230103"]
+    assert feedback["target_date"].dropna().tolist() == [
+        "20230102",
+        "20230103",
+        "20230104",
+    ]
+    assert feedback.iloc[-1]["date"] == "20230105"
+    assert pd.isna(feedback.iloc[-1]["next_rebalance_date"])
     diagnostics = pd.read_parquet(output / "optimization_diagnostics.parquet")
     assert diagnostics["current_state_source"].tolist() == [
         "configured_initial_or_theoretical_drift",
@@ -370,6 +494,9 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
         "stockdemo_actual",
     ]
     assert diagnostics["actual_cash_weight"].iloc[1:].notna().all()
+    assert diagnostics["missing_security_policy"].eq("freeze_last").all()
+    assert diagnostics["synthetic_nontradable_asset_count"].tolist() == [0, 0, 1]
+    assert diagnostics["excluded_missing_candidate_count"].tolist() == [0, 0, 1]
     stats = pd.read_csv(output / "stockdemo_compat" / "stats.csv")
     assert stats["unrealized_pnl"].iloc[-1] == pytest.approx(
         feedback["unrealized_pnl"].iloc[-1]
@@ -383,3 +510,13 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
         (output / "stockdemo_compat" / "summary.json").read_text()
     )
     assert stockdemo_summary["output_dir"] == str(output / "stockdemo_compat")
+    manifest = json.loads((output / "rolling_manifest.json").read_text())
+    assert manifest["missing_security_policy"] == "freeze_last"
+    final_weights = pd.read_parquet(output / "rebalance_weights.parquet")
+    frozen = final_weights.loc[
+        final_weights["date"].eq("20230104")
+        & final_weights["portfolio"].eq("risk_optimized")
+        & final_weights["ticker"].eq(tickers[0])
+    ].iloc[0]
+    assert frozen["target_weight"] == pytest.approx(frozen["current_weight"])
+    assert bool(frozen["synthetic_nontradable"])

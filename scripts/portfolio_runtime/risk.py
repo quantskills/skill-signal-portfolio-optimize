@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 
 from .errors import InputDataError
 from .io import normalize_ticker, read_table, select_date_rows, sha256_file
@@ -64,6 +65,42 @@ class PortfolioRisk:
         f = self.factor_covariance.to_numpy(dtype=float)
         values = x @ f @ x.T + np.diag(self.specific_variance.to_numpy(dtype=float))
         return pd.DataFrame(values, index=self.tickers, columns=self.tickers)
+
+    def square_root_operator(self) -> sparse.csc_matrix:
+        """Return R with variance(w) == ||R @ w||^2 without densifying factor risk."""
+        if self.form == "asset_covariance":
+            assert self.asset_covariance is not None
+            covariance = self.asset_covariance.to_numpy(dtype=float)
+            try:
+                root = np.linalg.cholesky(covariance).T
+            except np.linalg.LinAlgError:
+                values, vectors = np.linalg.eigh(
+                    0.5 * (covariance + covariance.T)
+                )
+                root = np.sqrt(np.maximum(values, 0.0))[:, None] * vectors.T
+            return sparse.csc_matrix(root)
+
+        assert self.exposures is not None
+        assert self.factor_covariance is not None
+        assert self.specific_variance is not None
+        factor_covariance = self.factor_covariance.to_numpy(dtype=float)
+        values, vectors = np.linalg.eigh(
+            0.5 * (factor_covariance + factor_covariance.T)
+        )
+        factor_root = np.sqrt(np.maximum(values, 0.0))[:, None] * vectors.T
+        factor_operator = factor_root @ self.exposures.to_numpy(dtype=float).T
+        specific_operator = sparse.diags(
+            np.sqrt(
+                np.maximum(
+                    self.specific_variance.to_numpy(dtype=float), 0.0
+                )
+            ),
+            format="csc",
+        )
+        return sparse.vstack(
+            [sparse.csc_matrix(factor_operator), specific_operator],
+            format="csc",
+        )
 
 
 def as_portfolio_risk(value: pd.DataFrame | PortfolioRisk) -> PortfolioRisk:

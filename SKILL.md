@@ -1,6 +1,6 @@
 ---
 name: skill-signal-portfolio-optimize
-description: Build an open Barra-style structural equity risk model and convert one frozen cross-sectional stock signal into benchmark-relative long-only target weights with auditable two-stage signal-capture, transaction-cost, exposure, turnover, tracking-error, and tradability controls. Use when Codex needs to optimize a LightGBM or single-factor stock signal, estimate or consume covariance, enforce market-cap, style, or point-in-time industry constraints, run a next-trading-day rolling portfolio study, or diagnose weights, risk, turnover, NAV, and drawdown results. Also use for Chinese requests such as 风险模型、协方差估计、信号组合优化、单因子权重优化、风险约束配权、行业风格中性、滚动优化、净值回撤、换手成本或优化前后回测对比.
+description: Build an open Barra-style structural equity risk model and convert one frozen cross-sectional stock signal into benchmark-relative long-only target weights with an auditable conservative equal-weight anchor blend, structural factor risk, and optional legacy exposure, turnover, tracking-error, and tradability controls. Use when Codex needs to optimize a LightGBM or single-factor stock signal, estimate or consume covariance, enforce market-cap, style, or point-in-time industry constraints, run a next-trading-day rolling portfolio study, or diagnose weights, risk, turnover, NAV, and drawdown results. Also use for Chinese requests such as 风险模型、协方差估计、信号组合优化、单因子权重优化、风险约束配权、行业风格中性、滚动优化、净值回撤、换手成本或优化前后回测对比.
 quantSkills:
   schema_version: 2.1.0
   organization: quantskills
@@ -61,16 +61,26 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 - Accept either a supplied asset covariance or mutually exclusive `X`, `F`, and `D` factor-form risk inputs; otherwise estimate an open market/style/optional-industry structural model.
 - Build the optimization universe from candidates, positive benchmark names, and positive current holdings; the full signal does not enlarge the risk matrix.
 - Require SIZE control in schema versions 2 through 5 and allow target ranges for other style exposures.
-- In schema versions 3 through 5, fail when an optimization asset lacks a prediction except for a positive, non-tradable frozen holding.
+- In schema versions 3 through 7, use role-aware missing-signal handling: candidates remain strict, missing tradable holdings outside the candidate set are exit-only, benchmark-only names are signal-neutral, and non-tradable holdings remain frozen.
 - Do not claim that the open model is MSCI Barra or a proprietary Barra product.
 - Build an equal-weight signal baseline and a risk-optimized portfolio on the same date.
 - Run rolling optimization with drifted current holdings and next-trading-day target execution.
-- Reuse complete static risk files and dynamically rebuild exact risk coverage when carried holdings expand the optimization universe.
+- Support daily, ISO-weekly, or monthly dynamic risk refresh; weekly and monthly modes reuses the first selected model date in each calendar month while retaining daily optimization and execution.
+- Use the Clarabel second-order-cone path for performance-sensitive runs. Keep factor risk in `X/F/D` form and reuse parameterized problems and prior solutions when the risk and constraint structure is unchanged.
+- For schema version 6, keep the executable equal-weight Top-N signal portfolio as the anchor and blend it toward a candidate-set minimum-variance endpoint. Default to a 10% blend, use the signal only for membership, and apply style/industry risk softly through `X/F/D` rather than hard neutrality constraints.
+- For schema version 7, preserve a configured fraction of the executable anchor active signal utility, minimize benchmark-relative factor risk under that floor, and apply an exact L1 turnover penalty through the Clarabel backend.
+- Reuse complete static risk files and dynamically rebuild exact risk coverage in daily mode.
+- In weekly or monthly mode, include positions carried into the period in the fixed snapshot, defer
+  uncovered optional candidates, and fail closed if benchmark or held names lack risk coverage.
+- Before a monthly rolling run builds any risk snapshot, preflight every model date and report
+  whether return, as-of market-cap, or point-in-time industry coverage is missing for a benchmark name.
+- Record the selected risk model date and refresh frequency in rolling diagnostics and manifests.
 - Persist input-signed date checkpoints so interrupted rolling experiments can resume safely.
 - v1.2 caches repeated rolling input tables in-process and partitions them by normalized date; this is a performance optimization only and does not change signal, risk, or execution semantics.
 - v1.3 adds an isolated `stockdemo-compatible` order-level replay path. It does not change Barra calculations or the legacy `native` return backtest.
 - v1.3.1 can explicitly feed Stockdemo-executed closing holdings into the next rolling optimization; omitting the market flag preserves theoretical-drift behavior.
 - v1.3.2 uses `carry_forward` by default for legacy StockDemo parity, supports `terminal_writeoff` for confirmed terminal holdings, and keeps `error` as the fail-closed quality-check policy.
+- Missing tradability rows remain fail-closed by default. In StockDemo `carry_forward` rolling runs, `auto` maps them to `freeze_last`: missing candidates are excluded, while benchmark/current names stay in the universe and are frozen at current weight with explicit diagnostics.
 - Fail closed on missing covariance coverage, invalid weights, infeasible constraints, or non-finite inputs.
 - Produce target weights, `optimization_summary.json`, and machine-readable diagnostics; do not place orders.
 
@@ -257,10 +267,12 @@ This is a transparent Barra-style implementation. It does not reproduce MSCI Bar
 - Treat position, industry, market-cap, configurable style, turnover, tracking-error, and tradability limits as testable constraints.
 - Treat `candidate_weight_range` as a hard aggregate-weight range over the supplied candidate universe, not as a filter on benchmark or carried names. When a non-tradable outside-candidate holding is frozen, reduce only the candidate range to its attainable maximum and disclose configured and effective bounds.
 - Freeze a non-tradable asset at its current weight; fail if that current weight is unavailable. If market drift already pushed that frozen weight beyond a stock bound, preserve the executable freeze, disclose a frozen-bound exception, and keep the bound strict for every tradable asset.
-- Under schema versions 3 through 5, never assign a neutral score to a tradable optimization asset with a missing prediction; only a positive non-tradable frozen holding is exempt.
+- Under schema versions 3 through 7, never invent alpha for a missing candidate. With `role_aware`, a missing tradable holding outside the candidate set may only maintain or reduce its current weight, a benchmark-only non-holding receives neutral alpha, and a missing non-tradable holding remains frozen.
 - Never silently replace a failed optimization with equal weights.
-- Select and record the schema 5 backend before solving: use CVXPY/Clarabel only when both are installed, otherwise use the SciPy two-stage backend. Never switch after a solve starts or describe cross-environment backend selection as bitwise deterministic.
-- When CVXPY is unavailable, solve legacy `score_max_te` with auditable HiGHS ellipsoid cuts; independently recheck every hard constraint.
+- Select and record the backend before solving. The recommended `clarabel_socp` backend requires CVXPY and Clarabel and fails clearly when unavailable; it never silently changes the portfolio definition.
+- Express tracking error as `norm(R * (w-b), 2)`, where `R` is built directly from factor covariance and specific variance. Do not expand factor risk into a dense asset covariance for the Clarabel path.
+- Reuse a DPP-compatible parameterized problem only when its exact risk and constraint structure matches; update signal, benchmark, current-state bounds, and right-hand sides between solves and request a warm start.
+- SciPy/HiGHS is an explicit compatibility fallback through `fallback_policy: scipy_highs`; cap its ellipsoid cutting planes with `max_cutting_planes`, record the fallback, and independently recheck every hard constraint.
 
 ## Outputs
 
@@ -289,6 +301,7 @@ a small fixture using the same input data.
 - The reported 2023-2026 results are development-period evidence on one frozen Alpha191+LightGBM signal, not a sealed holdout and not proof of general performance.
 - The rolling engine models next-trading-day target execution and configurable linear transaction costs. It does not model intraday fills, market impact, borrow, or live order routing.
 - Solver results can differ slightly by backend and numerical library. Always use the recorded backend, resolved configuration, input hashes, and constraint diagnostics when reproducing a run.
+- v1.5 unit tests establish risk-operator equivalence, conic constraint satisfaction, and same-structure cache reuse. They do not establish a universal speedup; report full-period wall time and cache-hit ratio before making a performance claim.
 
 See [references/validation-notes.md](references/validation-notes.md) for version-level evidence and interpretation limits.
 

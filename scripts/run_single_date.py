@@ -36,6 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--exposure-file", help="Optional style exposures")
     parser.add_argument("--tradability-file", help="Optional tradability flags")
+    parser.add_argument(
+        "--missing-security-policy",
+        choices=("error", "freeze_last"),
+        default="error",
+        help=(
+            "Handle optimization names absent from tradability: fail or freeze "
+            "required holdings/benchmark names and exclude missing candidates."
+        ),
+    )
     parser.add_argument("--date", required=True, help="Rebalance date")
     parser.add_argument("--output-dir", required=True, help="New or empty output directory")
     return parser
@@ -57,6 +66,7 @@ def main() -> int:
             sector_file=args.sector_file,
             exposure_file=args.exposure_file,
             tradability_file=args.tradability_file,
+            missing_security_policy=args.missing_security_policy,
             requested_date=args.date,
             output_dir=args.output_dir,
         )

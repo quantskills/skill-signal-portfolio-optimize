@@ -42,7 +42,9 @@ def _v5_config(*, risk_form: str = "factor_model", capture: float = 0.995) -> di
         },
         "optimizer": {
             "objective_mode": "lexicographic_signal_cost",
-            "solver_backend": "auto",
+            # Keep this fixture independent of optional CVXPY/Clarabel extras.
+            "solver_backend": "scipy_highs",
+            "fallback_policy": "scipy_highs",
             "risk_aversion": 5.0,
             "turnover_penalty": 0.001,
             "smoothing_epsilon": 1.0e-8,

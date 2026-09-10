@@ -4,12 +4,16 @@
 
 - Catalog status: `active`
 - Validation level: `runnable`
-- Current implementation version: `1.3.3` (v1.3 Stockdemo-compatible execution plus actual-holdings feedback and ba875fc8-aligned defaults); the comparison table below records the historical v1.0.0 experiment.
+- Current implementation version: `1.5.0` (v1.4 monthly dynamic risk refresh plus v1.5 direct factor-risk Clarabel solving, reusable parameterized conic problems, and bounded compatibility fallback); the comparison table below records the historical v1.0.0 experiment.
 - Validation claim: commands, examples, declarations, and automated tests are runnable
+- v1.5 correctness evidence: unit tests verify that direct factor-risk and dense-covariance variance agree, both objective families satisfy independently checked constraints, and repeated same-structure solves hit the parameterized cache.
+- Excluded performance claim: a full-period production-universe wall-clock comparison has not yet been completed, so v1.5 does not claim a fixed speedup ratio.
 - Excluded claim: this repository is not yet `verified` against a sealed holdout or independent reproduction package
 - Governance note: final community listing and validation require QuantSkills maintainer review
 
 ## Common Evaluation Protocol
+
+- Missing-security validation covers strict rejection plus StockDemo carry-forward integration: absent candidate rows are excluded, required carried holdings are frozen exactly, and the distinction is persisted in outputs.
 
 The version comparison uses one frozen Alpha191+LightGBM signal and a common portfolio backtest:
 
@@ -75,3 +79,13 @@ A defensible reproduction must preserve:
 - constraint diagnostics for every rebalance date
 
 The public examples demonstrate the interface but do not bundle proprietary or local research data. Keep data and formal experiment outputs outside the source repository.
+
+## v1.7 Verification Status
+
+Schema 7 has unit coverage for configuration validation, signal-floor
+satisfaction, active-risk reduction, and compatibility with the existing
+Clarabel path. A one-date real-input smoke run retained 0.970000000041 of
+anchor signal utility and reduced predicted active volatility from 0.0159064
+to 0.0150802 with all constraints passing. This is implementation evidence
+only; a rolling holdout comparison is still required before claiming improved
+Sharpe ratio or realized performance.

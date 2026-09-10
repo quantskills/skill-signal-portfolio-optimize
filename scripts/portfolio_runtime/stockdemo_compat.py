@@ -708,6 +708,29 @@ def _writeoff_missing_holdings(
     return missing, float(writeoff_value)
 
 
+def _remove_terminal_targets(
+    target: pd.Series,
+    terminal_writeoff_tickers: pd.Index,
+) -> tuple[pd.Series, pd.Index, float, float]:
+    """Remove targets already written off and preserve the intended stock budget."""
+
+    execution_target = target.astype(float).copy()
+    removed = execution_target.index.intersection(terminal_writeoff_tickers)
+    removed_weight = 0.0
+    renormalization_factor = 1.0
+    if len(removed):
+        positive_total = float(execution_target.clip(lower=0.0).sum())
+        removed_weight = float(
+            execution_target.reindex(removed, fill_value=0.0).clip(lower=0.0).sum()
+        )
+        execution_target = execution_target.drop(removed, errors="ignore")
+        remaining_total = float(execution_target.clip(lower=0.0).sum())
+        if remaining_total > 0.0:
+            renormalization_factor = positive_total / remaining_total
+            execution_target = execution_target * renormalization_factor
+    return execution_target, removed, removed_weight, renormalization_factor
+
+
 def _carry_forward_missing_holdings(
     *,
     holdings: Mapping[str, float],
@@ -834,16 +857,26 @@ def advance_stockdemo_state(
     orders: list[dict[str, Any]] = []
     turnover_amount = 0.0
     fees = 0.0
+    terminal_target_removed_tickers = pd.Index([], dtype=object)
+    terminal_target_removed_weight = 0.0
+    target_renormalization_factor = 1.0
     missing_target_tickers = pd.Index([], dtype=object)
     missing_target_weight = 0.0
     if target is not None:
-        positive_target = target.astype(float)
-        positive_target = positive_target[positive_target.gt(0)]
+        (
+            execution_target,
+            terminal_target_removed_tickers,
+            terminal_target_removed_weight,
+            target_renormalization_factor,
+        ) = _remove_terminal_targets(target, terminal_writeoff_tickers)
+        positive_target = execution_target[execution_target.gt(0)]
         missing_target_tickers = positive_target.index.difference(day.index)
-        missing_target_weight = float(positive_target.reindex(missing_target_tickers, fill_value=0.0).sum())
+        missing_target_weight = float(
+            positive_target.reindex(missing_target_tickers, fill_value=0.0).sum()
+        )
         state.cash, orders, turnover_amount, fees = _place_orders(
             day=day,
-            target=target,
+            target=execution_target,
             holdings=state.holdings,
             holding_adj=state.holding_adj,
             cash=state.cash,
@@ -882,6 +915,12 @@ def advance_stockdemo_state(
         "missing_target_count": int(len(missing_target_tickers)),
         "missing_target_weight": missing_target_weight,
         "missing_target_tickers": ",".join(map(str, missing_target_tickers.tolist())),
+        "terminal_target_removed_count": int(len(terminal_target_removed_tickers)),
+        "terminal_target_removed_weight": terminal_target_removed_weight,
+        "terminal_target_removed_tickers": ",".join(
+            map(str, terminal_target_removed_tickers.tolist())
+        ),
+        "target_renormalization_factor": target_renormalization_factor,
         "terminal_writeoff_count": int(len(terminal_writeoff_tickers)),
         "terminal_writeoff_value": float(terminal_writeoff_value),
         "terminal_writeoff_tickers": ",".join(map(str, terminal_writeoff_tickers.tolist())),
@@ -1074,6 +1113,9 @@ def run_stockdemo_compat(
         day_orders: list[dict[str, Any]] = []
         turnover_amount = 0.0
         fees = 0.0
+        terminal_target_removed_tickers = pd.Index([], dtype=object)
+        terminal_target_removed_weight = 0.0
+        target_renormalization_factor = 1.0
         if signal_date is not None:
             if signal is not None:
                 target = _equal_target(
@@ -1087,6 +1129,12 @@ def run_stockdemo_compat(
                 )
             else:
                 target = target_by_date[signal_date]
+            (
+                target,
+                terminal_target_removed_tickers,
+                terminal_target_removed_weight,
+                target_renormalization_factor,
+            ) = _remove_terminal_targets(target, terminal_writeoff_tickers)
             cash, day_orders, turnover_amount, fees = _place_orders(
                 day=day,
                 target=target,
@@ -1131,6 +1179,14 @@ def run_stockdemo_compat(
                 "buy_amount": buy_amount,
                 "sell_amount": sell_amount,
                 "holdings": len(holdings),
+                "terminal_target_removed_count": int(
+                    len(terminal_target_removed_tickers)
+                ),
+                "terminal_target_removed_weight": terminal_target_removed_weight,
+                "terminal_target_removed_tickers": ",".join(
+                    map(str, terminal_target_removed_tickers.tolist())
+                ),
+                "target_renormalization_factor": target_renormalization_factor,
                 "terminal_writeoff_count": int(len(terminal_writeoff_tickers)),
                 "terminal_writeoff_value": float(terminal_writeoff_value),
                 "terminal_writeoff_tickers": ",".join(map(str, terminal_writeoff_tickers.tolist())),

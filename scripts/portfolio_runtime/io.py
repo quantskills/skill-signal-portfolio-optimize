@@ -319,27 +319,36 @@ def load_exposures(
     return numeric.astype(float)
 
 
-def load_tradability(
+def resolve_tradability(
     path: str | Path,
     requested_date: str,
     universe: pd.Index,
     *,
+    missing_security_policy: str = "error",
     table_cache: DateTableCache | None = None,
-) -> pd.Series:
+) -> tuple[pd.Series, pd.Index]:
+    if missing_security_policy not in {"error", "freeze_last"}:
+        raise InputDataError(
+            "missing_security_policy must be error or freeze_last"
+        )
     frame = _select_table_rows(
         path, requested_date, "tradability", date_optional=True, table_cache=table_cache
     )
     _require_columns(frame, ["ticker", "tradable"], "tradability")
     indexed = _normalize_index(frame[["ticker", "tradable"]], "tradability")
     missing = universe.difference(indexed.index)
-    if len(missing):
+    if len(missing) and missing_security_policy == "error":
         raise InputDataError(
             f"tradability missing optimization ticker(s): {list(missing[:10])}"
         )
     true_values = {"true", "1", "yes", "y"}
     false_values = {"false", "0", "no", "n"}
     parsed: list[bool] = []
+    missing_names = set(missing)
     for ticker, value in indexed["tradable"].reindex(universe).items():
+        if ticker in missing_names:
+            parsed.append(False)
+            continue
         if isinstance(value, (bool, np.bool_)):
             parsed.append(bool(value))
             continue
@@ -350,7 +359,27 @@ def load_tradability(
             parsed.append(False)
         else:
             raise InputDataError(f"invalid tradable value for {ticker}: {value!r}")
-    return pd.Series(parsed, index=universe, name="tradable", dtype=bool)
+    return (
+        pd.Series(parsed, index=universe, name="tradable", dtype=bool),
+        pd.Index(missing, name="ticker"),
+    )
+
+
+def load_tradability(
+    path: str | Path,
+    requested_date: str,
+    universe: pd.Index,
+    *,
+    table_cache: DateTableCache | None = None,
+) -> pd.Series:
+    tradable, _ = resolve_tradability(
+        path,
+        requested_date,
+        universe,
+        missing_security_policy="error",
+        table_cache=table_cache,
+    )
+    return tradable
 
 
 def load_covariance(

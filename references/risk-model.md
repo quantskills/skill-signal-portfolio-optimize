@@ -60,6 +60,17 @@ Set `industry_mode` to `required`, `optional`, or `disabled`. Do not pass a stat
 industry snapshot through historical dates. Pass `asset_cov.parquet` to the optimizer and
 `exposures.parquet` as its style-exposure input.
 
+Risk refresh frequency is controlled by
+`--risk-refresh-frequency daily|weekly|monthly` on the rolling
+runner. `daily` is the backward-compatible default. With `weekly` or `monthly`, the
+first selected rebalance date of each ISO week or calendar month builds one risk snapshot;
+later dates still optimize and trade daily while reusing that snapshot. The fixed-period
+model universe is the union of that period's candidates, positive benchmark names, and
+positive holdings carried into the period. Market capitalization uses the latest finite
+positive value known by the model date, which keeps suspended names PIT-safe. Candidates
+without model-date risk coverage are deferred until the next refresh; benchmark names and
+carried holdings remain hard requirements. The runtime never silently falls back to a
+date-specific risk build in weekly or monthly mode.
 For a rolling experiment, build all selected dates with a resumable cache:
 
 ```bash
@@ -104,8 +115,11 @@ change therefore creates a different cache directory. Complete matching dynamic 
 reused; incomplete or stale exact-path caches fail closed. Static caches are never overwritten.
 
 Every positive current holding must have return-panel coverage and a finite positive as-of
-market cap. When tradability is supplied, every optimization name must also have an explicit
-record; a non-tradable holding remains frozen at its current weight.
+market cap. Tradability coverage is strict by default. Under explicit `freeze_last`, an
+optimization name whose current-date tradability row is absent remains eligible for risk
+coverage only when the return, market-cap, exposure, and any required industry inputs remain
+available; candidate-only names are excluded, while required benchmark/current names are
+frozen at current weight. No risk input is fabricated.
 
 ## Outputs
 
