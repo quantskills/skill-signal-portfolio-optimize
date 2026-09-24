@@ -57,9 +57,9 @@ def resolve_industry_ranges(
 
 
 def resolve_style_ranges(
-    constraint_config: dict[str, Any], names: list[str]
+    constraint_config: dict[str, Any], names: list[str], key: str = "style_active_ranges"
 ) -> dict[str, dict[str, float]]:
-    specification = constraint_config["style_active_ranges"]
+    specification = constraint_config[key]
     if specification is not None:
         enabled = {
             name: values for name, values in specification.items()
@@ -67,7 +67,7 @@ def resolve_style_ranges(
         }
         missing = set(enabled) - set(names)
         if missing:
-            raise ConfigError(f"style exposures missing configured factor(s): {sorted(missing)}")
+            raise ConfigError(f"{key} exposures missing configured factor(s): {sorted(missing)}")
         return {
             name: {
                 "lower_active": float(enabled[name]["lower_active"]),

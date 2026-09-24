@@ -26,9 +26,71 @@ from portfolio_runtime.errors import InputDataError  # noqa: E402
 from portfolio_runtime.io import DateTableCache  # noqa: E402
 from portfolio_runtime.rolling import (  # noqa: E402
     ROLLING_OUTPUT_FILES,
+    _period_model_universes,
+    _initial_weights,
     _preflight_signal_coverage,
     run_rolling_experiment,
 )
+from portfolio_runtime.pipeline import _validate_weight_vector  # noqa: E402
+
+
+def test_cash_initial_state_is_distinct_from_full_investment(tmp_path: Path) -> None:
+    path = tmp_path / "benchmark.parquet"
+    pd.DataFrame(
+        {"date": [20230102, 20230102], "ticker": ["A", "B"],
+         "benchmark_weight": [0.5, 0.5]}
+    ).to_parquet(path, index=False)
+    cash = _initial_weights("20230102", path, None, position_policy="cash")
+    benchmark = _initial_weights("20230102", path, None)
+    assert cash.sum() == 0.0
+    assert benchmark.sum() == pytest.approx(1.0)
+    _validate_weight_vector(
+        cash, "current", require_full_investment=False, tolerance=1.0e-8
+    )
+    with pytest.raises(InputDataError, match="expected 1"):
+        _validate_weight_vector(
+            cash, "current", require_full_investment=True, tolerance=1.0e-8
+        )
+
+
+def test_period_risk_universe_includes_execution_anchor(tmp_path: Path) -> None:
+    signal = tmp_path / "signal.parquet"
+    candidate = tmp_path / "candidate.parquet"
+    anchor = tmp_path / "anchor.parquet"
+    benchmark = tmp_path / "benchmark.parquet"
+    pd.DataFrame(
+        {
+            "date": [20240102, 20240102, 20240103, 20240103],
+            "ticker": ["A", "B", "A", "B"],
+            "prediction": [2.0, 1.0, 2.0, 1.0],
+        }
+    ).to_parquet(signal, index=False)
+    pd.DataFrame(
+        {
+            "date": [20240102, 20240103],
+            "ticker": ["A", "A"],
+        }
+    ).to_parquet(candidate, index=False)
+    pd.DataFrame(
+        {
+            "date": [20240102, 20240103],
+            "ticker": ["B", "B"],
+        }
+    ).to_parquet(anchor, index=False)
+    pd.DataFrame(
+        {
+            "date": [20240102, 20240103],
+            "ticker": ["C", "C"],
+            "benchmark_weight": [1.0, 1.0],
+        }
+    ).to_parquet(benchmark, index=False)
+
+    universes = _period_model_universes(
+        signal, candidate, benchmark, ["20240102", "20240103"],
+        DateTableCache(), frequency="monthly", anchor_file=anchor,
+    )
+
+    assert universes["202401"].tolist() == ["A", "B", "C"]
 
 
 def test_backtest_applies_targets_next_day_and_charges_turnover() -> None:
@@ -472,6 +534,7 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
         asset_returns_file=returns_path,
         tradability_file=tradability_path,
         stockdemo_market_file=market_path,
+        stockdemo_keep=0.8,
         output_dir=output,
     )
 
@@ -510,6 +573,8 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
         (output / "stockdemo_compat" / "summary.json").read_text()
     )
     assert stockdemo_summary["output_dir"] == str(output / "stockdemo_compat")
+    assert stockdemo_summary["config"]["keep"] == pytest.approx(0.8)
+    assert stockdemo_summary["config"]["longx"] == 2
     manifest = json.loads((output / "rolling_manifest.json").read_text())
     assert manifest["missing_security_policy"] == "freeze_last"
     final_weights = pd.read_parquet(output / "rebalance_weights.parquet")

@@ -320,6 +320,38 @@ def test_risk_coverage_explains_missing_industry_and_preflight_fails(
         )
 
 
+def test_optional_industry_keeps_missing_asof_industry_risk_eligible(
+    tmp_path: Path,
+) -> None:
+    inputs = _risk_inputs(tmp_path)
+    config = yaml.safe_load(inputs["config"].read_text(encoding="utf-8"))
+    config["industry_mode"] = "optional"
+    inputs["config"].write_text(yaml.safe_dump(config), encoding="utf-8")
+    tickers = pd.read_parquet(inputs["cap"]).columns
+    missing = tickers[0]
+    industry_path = tmp_path / "industry_optional.parquet"
+    pd.DataFrame(
+        {
+            "stock_symbol": tickers[1:],
+            "l1_code": ["801010"] * (len(tickers) - 1),
+            "in_date": ["20200101"] * (len(tickers) - 1),
+            "out_date": [None] * (len(tickers) - 1),
+        }
+    ).to_parquet(industry_path, index=False)
+    provider = DynamicRiskModelCache(
+        config_path=inputs["config"],
+        returns_file=inputs["returns"],
+        market_cap_file=inputs["cap"],
+        industry_file=industry_path,
+        cache_root=tmp_path / "dynamic-optional",
+    )
+    universe = pd.Index(tickers[:8], name="ticker")
+    coverage = provider.model_universe_coverage(str(inputs["date"]), universe)
+
+    assert bool(coverage.loc[missing, "available"])
+    assert coverage.loc[missing, "missing_reasons"] == "missing_asof_industry"
+
+
 def test_positive_current_holding_missing_risk_data_fails(tmp_path: Path) -> None:
     inputs = _risk_inputs(tmp_path)
     provider = _provider(tmp_path, inputs)

@@ -138,6 +138,30 @@ class StructuralRiskModelTest(unittest.TestCase):
         self.assertFalse(result.manifest["industry_history_used"])
         self.assertGreater(float(np.linalg.eigvalsh(result.asset_cov).min()), 0.0)
 
+    def test_optional_industry_keeps_unknown_target_with_zero_industry_exposure(self) -> None:
+        missing = self.universe[0]
+        industry = self.industry.loc[
+            ~self.industry["ticker"].eq(missing)
+        ].copy()
+        config = {**self.config, "industry_mode": "optional"}
+        result = estimate_structural_risk_model(
+            returns=self.returns,
+            market_cap=self.market_cap,
+            industry_history=industry,
+            target_universe=self.universe,
+            requested_date=self.dates[-1],
+            config=config,
+        )
+        industry_columns = [
+            name for name in result.factor_cov.columns
+            if name.startswith("INDUSTRY:")
+        ]
+        self.assertTrue(industry_columns)
+        self.assertTrue(
+            (result.exposures.loc[missing, industry_columns] == 0.0).all()
+        )
+        self.assertTrue(np.isfinite(result.specific_var.loc[missing]))
+
     def test_public_cli_writes_stable_outputs(self) -> None:
         returns_path = self.root / "returns.parquet"
         cap_path = self.root / "market_cap.parquet"
