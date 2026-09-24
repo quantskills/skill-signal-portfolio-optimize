@@ -52,6 +52,18 @@ quantSkills:
 
 Turn one frozen stock-level signal into reviewable target weights. Treat the signal as an upstream alpha forecast and keep it separate from the risk factors used to constrain the portfolio.
 
+## Optimizer modes (branch per mode)
+
+The engine is mode-agnostic; each validated optimizer mode lives on its own branch with documentation, evidence, and default parameters.
+
+| Mode | Branch | objective_mode / schema | Status |
+|---|---|---|---|
+| Lexicographic SOCP (signal utility → cost) | `v1.8.0-lexicographic-socp` | `lexicographic_signal_cost` / 5 | ✅ validated on 4 frozen signals, universal default locked — see `docs/lexicographic-socp-mode.md` |
+| Mean-variance | `main` | `mean_variance` / 1 | engine-level baseline |
+| Score-max-TE | `main` | `score_max_te` / 2 | engine-level |
+| Blended minimum-variance anchor | — | `blended_minimum_variance` / 6 | engine-level |
+| Alpha-capture / alpha-reward / risk-aware selection | `v1.8.0-alpha-aware` | schemas 8/9/10 | in development |
+
 ## Scope
 
 - Accept exactly one full-cross-section final signal column: `date | ticker | prediction`.
