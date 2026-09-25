@@ -59,12 +59,38 @@ def _build_linear_system(
         benchmark.to_numpy(dtype=float) + float(config["max_active_weight"]),
     )
     frozen = ~tradable.to_numpy(dtype=bool)
+    frozen_weights = np.zeros(n_assets)
     if frozen.any():
         if current is None:
             raise OptimizationError("current weights are required for non-tradable assets")
         frozen_values = current.to_numpy(dtype=float)[frozen]
         lower[:n_assets][frozen] = frozen_values
         upper[:n_assets][frozen] = frozen_values
+        frozen_weights = np.where(frozen, np.clip(current.to_numpy(dtype=float), 0.0, None), 0.0)
+    # 可调整部分口径：冻结持仓（停牌/不可卖出）的权重不可控，不应计入主动带；
+    # 参考基准同时剔除冻结持仓对应的成分股权重，并按可调整总权重重新缩放，
+    # 使「可调整组合 vs 可调整基准」两侧口径一致，再叠加冻结权重本身：
+    #   center_k = β_k · (1 − Σfrozen) / (1 − Σfrozen_benchmark) + Σ_{i∈k} frozen_i
+    # 无冻结持仓时恒等于原口径（center_k = b_k），因此不影响任何既有结果。
+    frozen_band_exemption = bool(config.get("frozen_active_band_exemption", False))
+    if frozen_band_exemption:
+        benchmark_values = benchmark.to_numpy(dtype=float)
+        frozen_benchmark = np.where(frozen, benchmark_values, 0.0)
+        band_base_scale = max(1.0 - float(frozen_weights.sum()), 0.0) / max(
+            1.0 - float(frozen_benchmark.sum()), 1.0e-12
+        )
+    else:
+        benchmark_values = benchmark.to_numpy(dtype=float)
+        frozen_benchmark = None
+        band_base_scale = 1.0
+
+    def band_center(coefficients: np.ndarray, base: np.ndarray) -> float:
+        center = float(coefficients @ base)
+        if frozen_band_exemption:
+            center = float(coefficients @ (base - frozen_benchmark)) * band_base_scale + float(
+                coefficients @ frozen_weights
+            )
+        return center
 
     if exit_only_mask is not None:
         if current is None:
@@ -112,7 +138,7 @@ def _build_linear_system(
         ranges = resolve_industry_ranges(config, names)
         for name, specification in ranges.items():
             coefficients = (sectors == name).to_numpy(dtype=float)
-            center = float(coefficients @ benchmark.to_numpy(dtype=float))
+            center = band_center(coefficients, benchmark_values)
             add_active_range(
                 coefficients, center, specification["lower_active"], specification["upper_active"]
             )
@@ -122,7 +148,7 @@ def _build_linear_system(
         ranges = resolve_style_ranges(config, names)
         for name, specification in ranges.items():
             coefficients = exposures[name].to_numpy(dtype=float)
-            center = float(coefficients @ benchmark.to_numpy(dtype=float))
+            center = band_center(coefficients, benchmark_values)
             add_active_range(
                 coefficients, center, specification["lower_active"], specification["upper_active"]
             )
@@ -133,9 +159,10 @@ def _build_linear_system(
             anchor_ranges = resolve_style_ranges(
                 config, names, key="anchor_style_active_ranges"
             )
+            reference_values = reference.to_numpy(dtype=float)
             for name, specification in anchor_ranges.items():
                 coefficients = exposures[name].to_numpy(dtype=float)
-                center = float(coefficients @ reference.to_numpy(dtype=float))
+                center = band_center(coefficients, reference_values)
                 add_active_range(
                     coefficients, center, specification["lower_active"], specification["upper_active"]
                 )

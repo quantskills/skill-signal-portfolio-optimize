@@ -290,3 +290,80 @@ def test_auto_backend_selection_matches_available_dependencies() -> None:
             select_lexicographic_backend("clarabel_socp")
         with pytest.raises(OptimizationError, match="fallback_policy is error"):
             select_lexicographic_backend("auto", fallback_policy="error")
+
+
+def _industry_band_problem() -> tuple:
+    """冻结持仓落在窄行业带上：A 停牌不可卖，其权重 0.08 > 行业带上限 0.05+0.02。"""
+    tickers = pd.Index(["A", "B", "C", "D"], name="ticker")
+    expected = pd.Series(0.0, index=tickers)
+    score = pd.Series([0.5, 2.0, 1.0, -1.0], index=tickers)
+    covariance = pd.DataFrame(np.eye(4) * 0.05, index=tickers, columns=tickers)
+    benchmark = pd.Series({"A": 0.02, "B": 0.03, "C": 0.475, "D": 0.475})
+    current = pd.Series({"A": 0.08, "B": 0.02, "C": 0.45, "D": 0.45})
+    tradable = pd.Series({"A": False, "B": True, "C": True, "D": True})
+    sectors = pd.Series({"A": "IND1", "B": "IND1", "C": "IND2", "D": "IND2"})
+    optimizer = deepcopy(DEFAULT_CONFIG["optimizer"])
+    optimizer.update(
+        {
+            "objective_mode": "lexicographic_signal_cost",
+            "solver_backend": "scipy_slsqp",
+            "minimum_signal_capture": 0.50,
+            "max_iterations": 2000,
+            "ftol": 1.0e-10,
+        }
+    )
+    constraints = deepcopy(DEFAULT_CONFIG["constraints"])
+    constraints.update(
+        {
+            "max_weight": 0.60,
+            "max_active_weight": 0.10,
+            "max_turnover": 0.30,
+            "max_tracking_error": None,
+            "industry_active_range": {
+                "default": {"lower_active": -0.02, "upper_active": 0.02},
+                "overrides": {},
+            },
+        }
+    )
+    return expected, score, covariance, benchmark, current, tradable, sectors, optimizer, constraints
+
+
+def _solve_industry_band(exemption: bool):
+    expected, score, covariance, benchmark, current, tradable, sectors, optimizer, constraints = (
+        _industry_band_problem()
+    )
+    constraints["frozen_active_band_exemption"] = exemption
+    return optimize_portfolio(
+        expected,
+        covariance,
+        benchmark,
+        current,
+        sectors,
+        None,
+        tradable,
+        optimizer,
+        constraints,
+        signal_score=score,
+        candidate_mask=pd.Series(True, index=expected.index),
+        cost_model={"linear_cost_bps": 7.0},
+    )
+
+
+def test_frozen_holding_makes_narrow_industry_band_infeasible_by_default() -> None:
+    """默认口径（历史行为）：冻结持仓计入行业带 → 可行域为空。"""
+    with pytest.raises(OptimizationError):
+        _solve_industry_band(False)
+
+
+def test_frozen_band_exemption_restores_feasibility_and_keeps_adjustable_band() -> None:
+    """开启豁免：冻结权重不计入行业带，可调整部分仍严格落在 ±2% 内。"""
+    result = _solve_industry_band(True)
+    assert result.constraints["passed"]
+    weights = result.weights
+    assert weights["A"] == pytest.approx(0.08, abs=1.0e-10)  # 冻结持仓原样保留
+    sectors = pd.Series({"A": "IND1", "B": "IND1", "C": "IND2", "D": "IND2"})
+    benchmark = pd.Series({"A": 0.02, "B": 0.03, "C": 0.475, "D": 0.475})
+    ind1_total = float(weights[sectors == "IND1"].sum())
+    adjustable_active = (ind1_total - 0.08) - float(benchmark[sectors == "IND1"].sum())
+    assert -0.02 - 1.0e-5 <= adjustable_active <= 0.02 + 1.0e-5
+    assert ind1_total - float(benchmark[sectors == "IND1"].sum()) > 0.02  # 总偏离确实超带（被冻结造成）

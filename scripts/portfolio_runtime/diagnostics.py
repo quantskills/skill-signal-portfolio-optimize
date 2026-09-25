@@ -338,13 +338,27 @@ def constraint_report(
                 max(float(increases.max()), 0.0)
             )
 
+    # 主动带口径：开启冻结豁免时，行业/风格带按「可调整部分」计量——
+    # 基准剔除冻结持仓对应的成分股权重并按可调整总权重缩放，再叠加冻结权重本身。
+    band_base = benchmark
+    if bool(constraint_config.get("frozen_active_band_exemption", False)) and current is not None:
+        frozen_mask = ~tradable.astype(bool)
+        if bool(frozen_mask.any()):
+            frozen_weight_series = weights.where(frozen_mask, 0.0)
+            frozen_benchmark = benchmark.where(frozen_mask, 0.0)
+            base_scale = max(1.0 - float(frozen_weight_series.sum()), 0.0) / max(
+                1.0 - float(frozen_benchmark.sum()), 1.0e-12
+            )
+            band_base = (benchmark - frozen_benchmark) * base_scale + frozen_weight_series
+
     sector_ranges: dict[str, dict[str, float]] = {}
     if sectors is not None:
         names = sorted(sectors.unique().tolist())
         sector_ranges = resolve_industry_ranges(constraint_config, names)
+        band_values = band_base.to_numpy(dtype=float)
         for name in names:
             coefficients = (sectors == name).to_numpy(dtype=float)
-            benchmark_value = float(coefficients @ benchmark.to_numpy(dtype=float))
+            benchmark_value = float(coefficients @ band_values)
             portfolio_value = float(coefficients @ weights.to_numpy(dtype=float))
             active_value = portfolio_value - benchmark_value
             specification = sector_ranges.get(name)
@@ -357,9 +371,10 @@ def constraint_report(
     if exposures is not None:
         names = list(exposures.columns)
         factor_ranges = resolve_style_ranges(constraint_config, names)
+        band_values = band_base.to_numpy(dtype=float)
         for name in names:
             coefficients = exposures[name].to_numpy(dtype=float)
-            benchmark_value = float(coefficients @ benchmark.to_numpy(dtype=float))
+            benchmark_value = float(coefficients @ band_values)
             portfolio_value = float(coefficients @ weights.to_numpy(dtype=float))
             active_value = portfolio_value - benchmark_value
             specification = factor_ranges.get(name)

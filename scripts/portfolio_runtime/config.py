@@ -71,6 +71,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "style_active_ranges": None,
         "anchor_style_active_ranges": None,
         "candidate_weight_range": None,
+        # 冻结持仓（停牌/不可卖出）的权重不计入行业/风格主动带；默认关闭以保持历史口径可复现。
+        "frozen_active_band_exemption": False,
         "weight_sum_tolerance": 1.0e-8,
         "constraint_tolerance": 1.0e-6,
     },
@@ -437,6 +439,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("constraints.max_weight must be positive")
     if not isinstance(constraints["initial_cash_turnover_exempt"], bool):
         raise ConfigError("constraints.initial_cash_turnover_exempt must be boolean")
+    if not isinstance(constraints["frozen_active_band_exemption"], bool):
+        raise ConfigError("constraints.frozen_active_band_exemption must be boolean")
     for key in ("max_turnover", "max_tracking_error"):
         if constraints[key] is not None:
             constraints[key] = _finite_number(
