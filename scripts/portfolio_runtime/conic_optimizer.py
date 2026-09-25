@@ -417,8 +417,10 @@ def solve_clarabel_socp(
             "CVXPY CLARABEL did not return an acceptable optimum: "
             f"{compiled.problem.status}"
         )
+    # Clarabel 在紧的风格/行业带边界上会留下约 1e-6 量级的负权重残差（组合权重的 1e-6，
+    # 经济上可忽略）。与效用下限校验保持同一量级：容差下限取 1e-5，超出才报错。
     cleaning_tolerance = max(
-        100.0 * float(optimizer_config["ftol"]), 1.0e-6
+        100.0 * float(optimizer_config["ftol"]), 1.0e-5
     )
     cleaned_decision, clipped_weight_mass = _clean_long_only_numerics(
         np.asarray(compiled.decision.value, dtype=float),
@@ -667,8 +669,10 @@ def solve_lexicographic_clarabel(
             "CVXPY CLARABEL primary solve did not return an acceptable optimum: "
             f"{compiled.primary_problem.status}"
         )
+    # Clarabel 在紧的风格/行业带边界上会留下约 1e-6 量级的负权重残差（组合权重的 1e-6，
+    # 经济上可忽略）。与效用下限校验保持同一量级：容差下限取 1e-5，超出才报错。
     cleaning_tolerance = max(
-        100.0 * float(optimizer_config["ftol"]), 1.0e-6
+        100.0 * float(optimizer_config["ftol"]), 1.0e-5
     )
     primary_decision, primary_clipped_weight_mass = _clean_long_only_numerics(
         np.asarray(compiled.decision.value, dtype=float),
