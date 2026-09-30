@@ -41,6 +41,18 @@ class PortfolioRisk:
         factor_active = x.T @ values
         return float(factor_active @ f @ factor_active + np.dot(d, values**2))
 
+    def diagonal(self) -> np.ndarray:
+        if self.form == "asset_covariance":
+            assert self.asset_covariance is not None
+            return np.diag(self.asset_covariance.to_numpy(dtype=float)).copy()
+        assert self.exposures is not None
+        assert self.factor_covariance is not None
+        assert self.specific_variance is not None
+        x = self.exposures.to_numpy(dtype=float)
+        f = self.factor_covariance.to_numpy(dtype=float)
+        systematic = np.einsum("ij,jk,ik->i", x, f, x)
+        return systematic + self.specific_variance.to_numpy(dtype=float)
+
     def gradient(self, weights: np.ndarray | pd.Series) -> np.ndarray:
         values = np.asarray(weights, dtype=float)
         if self.form == "asset_covariance":

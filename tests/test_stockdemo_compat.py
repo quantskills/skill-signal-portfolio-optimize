@@ -137,6 +137,38 @@ def test_signal_execution_uses_next_date_and_st_filter(tmp_path: Path) -> None:
     assert np.isfinite(payload["metrics"]["annualized_return"])
 
 
+def test_recorded_signal_targets_replay_identical_execution(tmp_path: Path) -> None:
+    signal = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "signal": float(3 - index)}
+            for date in (20230102, 20230103, 20230104)
+            for index, ticker in enumerate(("000001.SZ", "000002.SZ", "688001.SH"))
+        ]
+    )
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    market = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230105
+    )
+    config = StockDemoExecutionConfig(
+        longx=2, keep=0.8, initial_cash=1_000_000.0, exact_window=False
+    )
+    run_stockdemo_compat(
+        market=market, signal=signal, config=config,
+        output_dir=tmp_path / "signal", record_signal_targets=True,
+    )
+    targets = pd.read_parquet(tmp_path / "signal" / "signal_targets.parquet")
+    assert set(targets.columns) == {"date", "ticker", "target_weight"}
+    assert targets.groupby("date")["target_weight"].sum().eq(1.0).all()
+    run_stockdemo_compat(
+        market=market, targets=targets, config=config,
+        output_dir=tmp_path / "target",
+    )
+    signal_stats = pd.read_csv(tmp_path / "signal" / "stats.csv")
+    target_stats = pd.read_csv(tmp_path / "target" / "stats.csv")
+    pd.testing.assert_frame_equal(signal_stats, target_stats)
+
+
 def test_target_execution_reuses_stockdemo_order_accounting(tmp_path: Path) -> None:
     market_path = tmp_path / "market.parquet"
     _market().to_parquet(market_path, index=False)

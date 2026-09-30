@@ -264,6 +264,8 @@ def run_single_date(
     config_path: str | Path,
     signal_file: str | Path,
     candidate_file: str | Path | None = None,
+    anchor_file: str | Path | None = None,
+    anchor_weights_file: str | Path | None = None,
     candidate_universe: pd.Index | None = None,
     covariance_file: str | Path | None,
     benchmark_file: str | Path,
@@ -278,10 +280,19 @@ def run_single_date(
     tradability_file: str | Path | None = None,
     missing_security_policy: str = "error",
     table_cache: DateTableCache | None = None,
+    allow_cash_current: bool = False,
+    ignore_turnover_constraint: bool = False,
+    execution_anchor_passthrough: bool = False,
 ) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     date = normalize_date(requested_date)
     config = load_config(config_path)
+    constraint_config = dict(config["constraints"])
+    constraint_config["_strict_target_holdings"] = (
+        int(config["schema_version"]) == 10
+    )
+    if ignore_turnover_constraint:
+        constraint_config["max_turnover"] = None
     effective_cost_bps, cost_resolution = resolve_linear_cost_bps(
         config, transaction_cost_bps
     )
@@ -295,6 +306,40 @@ def run_single_date(
         if candidate_file is None
         else load_candidate_universe(candidate_file, date, table_cache=table_cache)
     )
+    source_anchor_candidates = (
+        source_candidates
+        if anchor_file is None
+        else load_candidate_universe(anchor_file, date, table_cache=table_cache)
+    )
+    source_anchor_weights = None
+    if anchor_weights_file is not None:
+        source_anchor_weights = load_weight_series(
+            anchor_weights_file,
+            date,
+            "anchor_weight",
+            "anchor weights",
+            table_cache=table_cache,
+        )
+        _validate_weight_vector(
+            source_anchor_weights,
+            "anchor weights",
+            require_full_investment=True,
+            tolerance=tolerance,
+        )
+        outside_anchor = source_anchor_weights[
+            source_anchor_weights.gt(tolerance)
+        ].index.difference(source_anchor_candidates)
+        if len(outside_anchor):
+            raise InputDataError(
+                "anchor weights contain positive ticker(s) outside the anchor "
+                f"universe: {list(outside_anchor[:10])}"
+            )
+    outside_anchor_source = source_anchor_candidates.difference(source_candidates)
+    if len(outside_anchor_source):
+        raise InputDataError(
+            "anchor universe contains ticker(s) outside the source candidate "
+            f"universe: {list(outside_anchor_source[:10])}"
+        )
     if candidate_universe is None:
         candidates = source_candidates
     else:
@@ -336,7 +381,7 @@ def run_single_date(
         _validate_weight_vector(
             current_input,
             "current",
-            require_full_investment=True,
+            require_full_investment=not allow_cash_current,
             tolerance=tolerance,
         )
 
@@ -356,6 +401,31 @@ def run_single_date(
         missing_security_policy=missing_security_policy,
         table_cache=table_cache,
     )
+    available_anchor = source_anchor_candidates.intersection(candidates)
+    top_n = int(config["baseline"]["top_n"])
+    anchor_missing_from_risk = source_anchor_candidates.difference(candidates)
+    strict_anchor = anchor_file is not None or config["schema_version"] == 10
+    if strict_anchor:
+        fill_count = max(top_n - min(len(available_anchor), top_n), 0)
+        if fill_count:
+            fill_pool = candidates.difference(available_anchor, sort=False)
+            fill_ranked = calibrated_signal.loc[
+                fill_pool, "signal_score"
+            ].sort_values(ascending=False, kind="mergesort")
+            available_anchor = available_anchor.append(
+                pd.Index(fill_ranked.index[:fill_count], name="ticker")
+            ).drop_duplicates()
+        if len(available_anchor) < top_n:
+            raise InputDataError(
+                "available anchor and candidate pool cannot support baseline.top_n"
+            )
+    if source_anchor_weights is not None and config["schema_version"] == 10:
+        # A StockDemo anchor can lose an unavailable name during tradability
+        # filtering. Schema 10 instead requires an exact N-name full-investment
+        # target, so rebuild the post-filter anchor on eligible names.
+        source_anchor_weights = pd.Series(
+            1.0 / top_n, index=available_anchor[:top_n], dtype=float
+        )
     benchmark = benchmark_input.reindex(universe, fill_value=0.0)
     current = (
         None if current_input is None else current_input.reindex(universe, fill_value=0.0)
@@ -454,10 +524,21 @@ def run_single_date(
         covariance_diagnostics = dict(risk.diagnostics or {})
 
     signal_baseline = build_equal_weight_baseline(
-        calibrated_signal.loc[candidates, "signal_score"],
+        calibrated_signal.loc[available_anchor, "signal_score"],
         config["baseline"]["top_n"],
     )
     baseline = signal_baseline.reindex(universe, fill_value=0.0)
+    optimization_anchor = (
+        baseline
+        if source_anchor_weights is None
+        else source_anchor_weights.reindex(universe, fill_value=0.0)
+    )
+    _validate_weight_vector(
+        optimization_anchor,
+        "optimization anchor",
+        require_full_investment=True,
+        tolerance=tolerance,
+    )
     optimized = optimize_portfolio(
         calibrated["expected_return"],
         risk,
@@ -467,12 +548,14 @@ def run_single_date(
         exposures,
         tradable,
         config["optimizer"],
-        config["constraints"],
+        constraint_config,
         signal_score=calibrated["signal_score"],
-        anchor_weights=baseline,
+        anchor_weights=optimization_anchor,
         candidate_mask=candidate_mask,
         exit_only_mask=exit_only_mask,
         cost_model={"linear_cost_bps": effective_cost_bps},
+        selection_config=config["selection"],
+        execution_anchor_passthrough=execution_anchor_passthrough,
     )
 
     baseline_constraints = constraint_report(
@@ -483,7 +566,7 @@ def run_single_date(
         sectors,
         exposures,
         tradable,
-        config["constraints"],
+        constraint_config,
         candidate_mask=candidate_mask,
         exit_only_mask=exit_only_mask,
     )
@@ -509,6 +592,35 @@ def run_single_date(
         "objective_mode": config["optimizer"]["objective_mode"],
         "backend": optimized.solver.get("backend"),
         "risk_form": risk_form,
+        "selection_mode": optimized.solver.get("selection_mode"),
+        "selection_pool_size": optimized.solver.get("selection_pool_size"),
+        "selection_effective_pool_size": optimized.solver.get(
+            "selection_effective_pool_size"
+        ),
+        "selection_protected_top_n": optimized.solver.get(
+            "selection_protected_top_n"
+        ),
+        "selection_target_holdings": optimized.solver.get(
+            "selection_target_holdings"
+        ),
+        "selection_risk_penalty": optimized.solver.get("selection_risk_penalty"),
+        "selection_overlap_count": optimized.solver.get("selection_overlap_count"),
+        "selection_overlap_ratio": optimized.solver.get("selection_overlap_ratio"),
+        "selection_replacement_count": optimized.solver.get(
+            "selection_replacement_count"
+        ),
+        "selection_signal_score_change": optimized.solver.get(
+            "selection_signal_score_change"
+        ),
+        "selection_added_tickers": optimized.solver.get("selection_added_tickers"),
+        "selection_removed_tickers": optimized.solver.get("selection_removed_tickers"),
+        "selection_ticker_sha256": optimized.solver.get("selection_ticker_sha256"),
+        "execution_anchor_passthrough": optimized.solver.get(
+            "execution_anchor_passthrough", False
+        ),
+        "execution_deferred_freeze_count": optimized.solver.get(
+            "execution_deferred_freeze_count", 0
+        ),
         "blend_strength": optimized.solver.get("blend_strength"),
         "anchor_asset_count": optimized.solver.get("anchor_asset_count"),
         "anchor_predicted_volatility": optimized.solver.get(
@@ -519,6 +631,12 @@ def run_single_date(
         ),
         "optimized_predicted_volatility": optimized.solver.get("optimized_predicted_volatility"),
         "predicted_risk_reduction": optimized.solver.get("predicted_risk_reduction"),
+        "minimum_predicted_risk_reduction": optimized.solver.get(
+            "minimum_predicted_risk_reduction"
+        ),
+        "risk_triggered_passthrough": optimized.solver.get(
+            "risk_triggered_passthrough", False
+        ),
         "anchor_reallocation": optimized.solver.get("anchor_reallocation"),
         "maximum_anchor_weight_deviation": optimized.solver.get("maximum_anchor_weight_deviation"),
         "primary_signal_utility": optimized.solver.get("primary_signal_utility"),
@@ -534,7 +652,23 @@ def run_single_date(
         "final_signal_utility": optimized.solver.get("final_signal_utility"),
         "signal_capture_ratio": optimized.solver.get("signal_capture_ratio"),
         "minimum_signal_capture": optimized.solver.get("minimum_signal_capture"),
+        "minimum_alpha_capture": optimized.solver.get("minimum_alpha_capture"),
+        "alpha_reward_weight": optimized.solver.get("alpha_reward_weight"),
+        "normalized_alpha_scale": optimized.solver.get("normalized_alpha_scale"),
+        "alpha_reward_contribution": optimized.solver.get(
+            "alpha_reward_contribution"
+        ),
+        "anchor_expected_return": optimized.solver.get("anchor_expected_return"),
+        "endpoint_expected_return": optimized.solver.get("endpoint_expected_return"),
+        "optimized_expected_return": optimized.solver.get("optimized_expected_return"),
+        "alpha_floor": optimized.solver.get("alpha_floor"),
+        "endpoint_alpha_floor": optimized.solver.get("endpoint_alpha_floor"),
+        "alpha_capture_ratio": optimized.solver.get("alpha_capture_ratio"),
+        "alpha_preserving_predicted_volatility": optimized.solver.get(
+            "alpha_preserving_predicted_volatility"
+        ),
         "one_way_turnover": optimized.solver.get("one_way_turnover"),
+        "turnover_constraint_exempt": bool(ignore_turnover_constraint),
         "baseline_one_way_turnover": baseline_turnover,
         "turnover_saved": (
             None
@@ -581,6 +715,18 @@ def run_single_date(
         {
             "calibration_asset_count": int(len(signal)),
             "candidate_asset_count": int(len(candidates)),
+            "source_anchor_asset_count": int(len(source_anchor_candidates)),
+            "effective_anchor_asset_count": int(len(available_anchor)),
+            "provided_anchor_asset_count": (
+                None
+                if source_anchor_weights is None
+                else int(source_anchor_weights.gt(tolerance).sum())
+            ),
+            "provided_anchor_weight": float(optimization_anchor.sum()),
+            "anchor_missing_from_risk_count": int(len(anchor_missing_from_risk)),
+            "anchor_missing_from_risk_ticker_sha256": _ticker_index_hash(
+                anchor_missing_from_risk
+            ),
             "optimization_asset_count": int(len(universe)),
             "optimization_prediction_coverage": float(
                 1.0 - missing_prediction.mean()
@@ -609,6 +755,7 @@ def run_single_date(
             "current_weight": (
                 np.nan if current is None else current.to_numpy(dtype=float)
             ),
+            "anchor_weight": optimization_anchor.to_numpy(dtype=float),
             "signal_available": ~missing_prediction.to_numpy(dtype=bool),
             "is_candidate": candidate_mask.to_numpy(dtype=bool),
             "exit_only": exit_only_mask.to_numpy(dtype=bool),
@@ -633,6 +780,8 @@ def run_single_date(
 
     supplied_paths = {
         "candidates": candidate_file,
+        "anchor": anchor_file,
+        "anchor_weights": anchor_weights_file,
         "config": config_path,
         "signal": signal_file,
         "covariance": covariance_file,
@@ -660,6 +809,12 @@ def run_single_date(
         "asset_count": int(len(universe)),
         "signal_asset_count": int(len(signal)),
         "candidate_asset_count": int(len(candidates)),
+        "source_anchor_asset_count": int(len(source_anchor_candidates)),
+        "effective_anchor_asset_count": int(len(available_anchor)),
+        "anchor_missing_from_risk_count": int(len(anchor_missing_from_risk)),
+        "anchor_missing_from_risk_ticker_sha256": _ticker_index_hash(
+            anchor_missing_from_risk
+        ),
         "missing_security_resolution": {
             "policy": missing_security_policy,
             "synthetic_nontradable_asset_count": int(len(synthetic_nontradable)),

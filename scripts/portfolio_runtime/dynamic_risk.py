@@ -167,8 +167,9 @@ class DynamicRiskModelCache:
             "has_return_panel",
             "has_market_cap_panel",
             "has_valid_asof_market_cap",
-            "has_asof_industry",
         ]
+        if self.context.config["industry_mode"] == "required":
+            required.append("has_asof_industry")
         coverage["available"] = coverage[required].all(axis=1)
         reason_names = {
             "has_return_panel": "missing_return_panel",
@@ -176,10 +177,16 @@ class DynamicRiskModelCache:
             "has_valid_asof_market_cap": "invalid_asof_market_cap",
             "has_asof_industry": "missing_asof_industry",
         }
+        reason_columns = [
+            "has_return_panel",
+            "has_market_cap_panel",
+            "has_valid_asof_market_cap",
+            "has_asof_industry",
+        ]
         coverage["missing_reasons"] = [
             ",".join(
                 reason_names[column]
-                for column in required
+                for column in reason_columns
                 if not bool(row[column])
             )
             for _, row in coverage.iterrows()

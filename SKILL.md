@@ -56,6 +56,7 @@ Turn one frozen stock-level signal into reviewable target weights. Treat the sig
 
 The engine is mode-agnostic; each validated optimizer mode lives on its own branch with documentation, evidence, and default parameters.
 
+
 | Mode | Branch | objective_mode / schema | Status |
 |---|---|---|---|
 | Lexicographic SOCP (signal utility → cost) | `v1.8.0-lexicographic-socp` | `lexicographic_signal_cost` / 5 | ✅ validated on 4 frozen signals, universal default locked — see `docs/lexicographic-socp-mode.md` |
@@ -63,6 +64,11 @@ The engine is mode-agnostic; each validated optimizer mode lives on its own bran
 | Score-max-TE | `main` | `score_max_te` / 2 | engine-level |
 | Blended minimum-variance anchor | — | `blended_minimum_variance` / 6 | engine-level |
 | Alpha-capture / alpha-reward / risk-aware selection | `v1.8.0-alpha-aware` | schemas 8/9/10 | in development |
+
+For reproducible runs, use the versioned presets under defaults/. The general
+recommended preset is defaults/default_lexicographic_v1_8.yaml; the 259
+flexible benchmark-enhancement and strict TopN presets are research-specific.
+See docs/default-presets.md for the optimizer/execution parameter contract.
 
 ## Scope
 

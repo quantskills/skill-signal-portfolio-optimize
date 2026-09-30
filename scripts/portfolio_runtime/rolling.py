@@ -47,6 +47,7 @@ from .stockdemo_compat import (
     advance_stockdemo_state,
     load_terminal_events,
     load_stockdemo_market,
+    load_stockdemo_signal,
     run_stockdemo_compat,
 )
 
@@ -302,6 +303,7 @@ def _period_model_universes(
     table_cache: DateTableCache,
     *,
     frequency: str,
+    anchor_file: str | Path | None = None,
 ) -> dict[str, pd.Index]:
     universes: dict[str, set[str]] = {}
     for date in dates:
@@ -328,6 +330,11 @@ def _period_model_universes(
         universes[period].update(
             str(value) for value in benchmark.index
         )
+        if anchor_file is not None:
+            anchor = load_candidate_universe(
+                anchor_file, date, table_cache=table_cache
+            )
+            universes[period].update(str(value) for value in anchor)
     return {
         period: pd.Index(sorted(values), name="ticker")
         for period, values in universes.items()
@@ -521,7 +528,17 @@ def _initial_weights(
     benchmark_file: str | Path,
     initial_weights_file: str | Path | None,
     table_cache: DateTableCache | None = None,
+    *,
+    position_policy: str = "benchmark",
 ) -> pd.Series:
+    if position_policy == "cash":
+        if initial_weights_file is not None:
+            raise InputDataError("cash initial position cannot use initial_weights_file")
+        benchmark = load_weight_series(
+            benchmark_file, first_date, "benchmark_weight", "benchmark",
+            table_cache=table_cache,
+        )
+        return pd.Series(0.0, index=benchmark.index, name="current_weight")
     if initial_weights_file is None:
         return load_weight_series(
             benchmark_file, first_date, "benchmark_weight", "benchmark",
@@ -556,6 +573,41 @@ def _diagnostic_rows(
         "solver_backend": solver.get("backend"),
         "solver_name": solver.get("solver"),
         "objective_mode": solver.get("objective_mode"),
+        "selection_mode": optimization_summary.get("selection_mode"),
+        "selection_pool_size": optimization_summary.get("selection_pool_size"),
+        "selection_effective_pool_size": optimization_summary.get(
+            "selection_effective_pool_size"
+        ),
+        "selection_protected_top_n": optimization_summary.get(
+            "selection_protected_top_n"
+        ),
+        "selection_target_holdings": optimization_summary.get(
+            "selection_target_holdings"
+        ),
+        "selection_risk_penalty": optimization_summary.get(
+            "selection_risk_penalty"
+        ),
+        "selection_overlap_count": optimization_summary.get(
+            "selection_overlap_count"
+        ),
+        "selection_overlap_ratio": optimization_summary.get(
+            "selection_overlap_ratio"
+        ),
+        "selection_replacement_count": optimization_summary.get(
+            "selection_replacement_count"
+        ),
+        "selection_signal_score_change": optimization_summary.get(
+            "selection_signal_score_change"
+        ),
+        "selection_ticker_sha256": optimization_summary.get(
+            "selection_ticker_sha256"
+        ),
+        "execution_anchor_passthrough": optimization_summary.get(
+            "execution_anchor_passthrough", False
+        ),
+        "execution_deferred_freeze_count": optimization_summary.get(
+            "execution_deferred_freeze_count", 0
+        ),
         "solver_iterations": solver.get("iterations"),
         "objective_value": solver.get("objective_value"),
         "solver_wall_seconds": solver.get("solver_wall_seconds"),
@@ -581,6 +633,21 @@ def _diagnostic_rows(
         "final_signal_utility": optimization_summary.get("final_signal_utility"),
         "signal_capture_ratio": optimization_summary.get("signal_capture_ratio"),
         "minimum_signal_capture": optimization_summary.get("minimum_signal_capture"),
+        "minimum_alpha_capture": optimization_summary.get("minimum_alpha_capture"),
+        "alpha_reward_weight": optimization_summary.get("alpha_reward_weight"),
+        "normalized_alpha_scale": optimization_summary.get("normalized_alpha_scale"),
+        "alpha_reward_contribution": optimization_summary.get(
+            "alpha_reward_contribution"
+        ),
+        "anchor_expected_return": optimization_summary.get("anchor_expected_return"),
+        "endpoint_expected_return": optimization_summary.get("endpoint_expected_return"),
+        "optimized_expected_return": optimization_summary.get("optimized_expected_return"),
+        "alpha_floor": optimization_summary.get("alpha_floor"),
+        "endpoint_alpha_floor": optimization_summary.get("endpoint_alpha_floor"),
+        "alpha_capture_ratio": optimization_summary.get("alpha_capture_ratio"),
+        "alpha_preserving_predicted_volatility": optimization_summary.get(
+            "alpha_preserving_predicted_volatility"
+        ),
         "estimated_transaction_cost": optimization_summary.get("estimated_transaction_cost"),
         "turnover_saved": optimization_summary.get("turnover_saved"),
         "risk_form": optimization_summary.get("risk_form"),
@@ -590,6 +657,12 @@ def _diagnostic_rows(
         "minimum_variance_predicted_volatility": optimization_summary.get("minimum_variance_predicted_volatility"),
         "optimized_predicted_volatility": optimization_summary.get("optimized_predicted_volatility"),
         "predicted_risk_reduction": optimization_summary.get("predicted_risk_reduction"),
+        "minimum_predicted_risk_reduction": optimization_summary.get(
+            "minimum_predicted_risk_reduction"
+        ),
+        "risk_triggered_passthrough": optimization_summary.get(
+            "risk_triggered_passthrough", False
+        ),
         "anchor_reallocation": optimization_summary.get("anchor_reallocation"),
         "maximum_anchor_weight_deviation": optimization_summary.get("maximum_anchor_weight_deviation"),
         "backend_fallback_used": bool(solver.get("backend_fallback_used", False)),
@@ -702,6 +775,8 @@ def run_rolling_experiment(
     config_path: str | Path,
     signal_file: str | Path,
     candidate_file: str | Path | None = None,
+    anchor_file: str | Path | None = None,
+    anchor_weights_file: str | Path | None = None,
     benchmark_file: str | Path,
     asset_returns_file: str | Path,
     output_dir: str | Path,
@@ -728,11 +803,14 @@ def run_rolling_experiment(
     stockdemo_market_file: str | Path | None = None,
     stockdemo_twap_file: str | Path | None = None,
     stockdemo_transaction: float = 1.4,
+    stockdemo_keep: float = 0.7,
     stockdemo_initial_cash: float = 100_000_000.0,
     stockdemo_turnover_mode: str = "flex",
     stockdemo_missing_target_policy: str = "error",
     stockdemo_missing_held_policy: str = "carry_forward",
     stockdemo_terminal_events_file: str | Path | None = None,
+    initial_position_policy: str = "benchmark",
+    stockdemo_signal_anchor: bool = False,
 ) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     if risk_refresh_frequency not in {"daily", "weekly", "monthly"}:
@@ -742,6 +820,21 @@ def run_rolling_experiment(
     if missing_security_policy not in {"auto", "error", "freeze_last"}:
         raise InputDataError(
             "missing_security_policy must be auto, error, or freeze_last"
+        )
+    if initial_position_policy not in {"benchmark", "cash"}:
+        raise InputDataError("initial_position_policy must be benchmark or cash")
+    if initial_position_policy == "cash" and stockdemo_market_file is None:
+        raise InputDataError("cash initial position requires StockDemo execution feedback")
+    if stockdemo_signal_anchor and (
+        stockdemo_market_file is None
+        or initial_position_policy != "cash"
+        or candidate_file is None
+        or anchor_file is not None
+        or anchor_weights_file is not None
+    ):
+        raise InputDataError(
+            "stockdemo_signal_anchor requires StockDemo execution, cash initial "
+            "position, a candidate_file, and no conflicting anchor_file"
         )
     effective_missing_security_policy = missing_security_policy
     if missing_security_policy == "auto":
@@ -823,6 +916,7 @@ def run_rolling_experiment(
             dates,
             table_cache,
             frequency=risk_refresh_frequency,
+            anchor_file=anchor_file,
         )
         risk_preflight = _preflight_periodic_risk_coverage(
             dynamic_cache,
@@ -883,7 +977,9 @@ def run_rolling_experiment(
                 "stockdemo execution feedback requires at least two rebalance dates"
             )
         execution_config = StockDemoExecutionConfig(
+            longx=int(portfolio_config["baseline"]["top_n"]),
             transaction=float(stockdemo_transaction),
+            keep=float(stockdemo_keep),
             initial_cash=float(stockdemo_initial_cash),
             turnover_mode=stockdemo_turnover_mode,
             exact_window=False,
@@ -932,7 +1028,8 @@ def run_rolling_experiment(
         )
 
     initial = _initial_weights(
-        dates[0], benchmark_file, initial_weights_file, table_cache=table_cache
+        dates[0], benchmark_file, initial_weights_file, table_cache=table_cache,
+        position_policy=initial_position_policy,
     )
     current = initial.copy()
     previous_target: pd.Series | None = None
@@ -962,6 +1059,12 @@ def run_rolling_experiment(
         "candidate_sha256": (
             None if candidate_file is None else sha256_file(candidate_file)
         ),
+        "anchor_sha256": (
+            None if anchor_file is None else sha256_file(anchor_file)
+        ),
+        "anchor_weights_sha256": (
+            None if anchor_weights_file is None else sha256_file(anchor_weights_file)
+        ),
         "benchmark_sha256": sha256_file(benchmark_file),
         "risk_refresh_frequency": risk_refresh_frequency,
         "missing_security_policy": effective_missing_security_policy,
@@ -981,13 +1084,92 @@ def run_rolling_experiment(
         "stockdemo_turnover_mode": (
             None if execution_config is None else execution_config.turnover_mode
         ),
+        "stockdemo_keep": (
+            None if execution_config is None else execution_config.keep
+        ),
         "stockdemo_transaction": (
             None if execution_config is None else execution_config.transaction
         ),
         "stockdemo_missing_held_policy": stockdemo_missing_held_policy,
+        "stockdemo_signal_anchor": stockdemo_signal_anchor,
+        "initial_position_policy": initial_position_policy,
         "stockdemo_terminal_events_sha256": terminal_events_fingerprint,
     }
+    effective_candidate_file = candidate_file
+    effective_anchor_file = anchor_file
+    effective_anchor_weights_file = anchor_weights_file
     try:
+        if stockdemo_signal_anchor:
+            assert execution_market is not None and execution_config is not None
+            source_signal = load_stockdemo_signal(signal_file)
+            source_signal = source_signal.loc[source_signal["date"].isin(dates)]
+            if sorted(source_signal["date"].unique().tolist()) != dates:
+                raise InputDataError("StockDemo signal does not cover every rebalance date")
+            reference_dir = working / "stockdemo_signal_reference"
+            run_stockdemo_compat(
+                market=execution_market,
+                signal=source_signal,
+                output_dir=reference_dir,
+                config=execution_config,
+                terminal_events=terminal_events,
+                record_signal_targets=True,
+            )
+            reference_targets = pd.read_parquet(reference_dir / "signal_targets.parquet")
+            counts = reference_targets.groupby("date")["ticker"].nunique()
+            if counts.to_dict() != {
+                date: int(portfolio_config["baseline"]["top_n"])
+                for date in dates
+            }:
+                raise InputDataError(
+                    "StockDemo signal target does not contain exact Top-N on every date"
+                )
+            effective_anchor_file = working / "stockdemo_anchor.parquet"
+            reference_targets[["date", "ticker"]].to_parquet(
+                effective_anchor_file, index=False
+            )
+            effective_anchor_weights_file = working / "stockdemo_anchor_weights.parquet"
+            reference_targets.rename(
+                columns={"target_weight": "anchor_weight"}
+            )[["date", "ticker", "anchor_weight"]].to_parquet(
+                effective_anchor_weights_file, index=False
+            )
+            candidates_input = read_table(candidate_file)[["date", "ticker"]].copy()
+            candidates_input["date"] = candidates_input["date"].map(normalize_date)
+            effective_candidate_file = working / "stockdemo_candidates.parquet"
+            pd.concat(
+                [candidates_input, reference_targets[["date", "ticker"]]],
+                ignore_index=True,
+            ).drop_duplicates(["date", "ticker"]).to_parquet(
+                effective_candidate_file, index=False
+            )
+            # The source Top-N may retain a non-tradable holding after its
+            # prediction disappears. Source candidates remain strictly
+            # preflighted; role-aware single-date handling freezes such
+            # non-candidate holdings without inventing alpha.
+            if risk_refresh_frequency in {"weekly", "monthly"} and dynamic_cache is not None:
+                planned_period_model_universes = _period_model_universes(
+                    signal_file, effective_candidate_file, benchmark_file,
+                    dates, table_cache, frequency=risk_refresh_frequency,
+                    anchor_file=effective_anchor_file,
+                )
+                risk_preflight = _preflight_periodic_risk_coverage(
+                    dynamic_cache,
+                    planned_universes=planned_period_model_universes,
+                    benchmark_file=benchmark_file,
+                    dates=dates,
+                    tolerance=tolerance,
+                    table_cache=table_cache,
+                    frequency=risk_refresh_frequency,
+                )
+            shutil.copyfile(
+                reference_dir / "signal_targets.parquet",
+                temporary / "stockdemo_signal_anchor.parquet",
+            )
+            reference_targets.rename(
+                columns={"target_weight": "anchor_weight"}
+            )[["date", "ticker", "anchor_weight"]].to_parquet(
+                temporary / "stockdemo_signal_anchor_weights.parquet", index=False
+            )
         for position, date in enumerate(dates, start=1):
             feedback_cash_weight: float | None = None
             if (
@@ -1025,11 +1207,14 @@ def run_rolling_experiment(
                             "next_rebalance_date": date,
                         }
                     )
-                if actual_weights.empty:
+                if actual_weights.empty and initial_position_policy != "cash":
                     raise InputDataError(
                         "stockdemo execution produced no stock holdings for optimizer feedback"
                     )
-                current = actual_weights
+                current = (
+                    pd.Series(0.0, index=initial.index, name="current_weight")
+                    if actual_weights.empty else actual_weights
+                )
                 feedback_cash_weight = float(execution_feedback_rows[-1]["cash_weight"])
             elif previous_target is not None and previous_date is not None:
                 drift_dates = calendar[positions[previous_date] + 1 : positions[date] + 1]
@@ -1059,7 +1244,9 @@ def run_rolling_experiment(
                 candidates = (
                     load_signal(signal_file, date, table_cache=table_cache).index
                     if candidate_file is None
-                    else load_candidate_universe(candidate_file, date, table_cache=table_cache)
+                    else load_candidate_universe(
+                        effective_candidate_file, date, table_cache=table_cache
+                    )
                 )
                 benchmark = load_weight_series(
                     benchmark_file, date, "benchmark_weight", "benchmark",
@@ -1268,6 +1455,19 @@ def run_rolling_experiment(
             signature_payload = {
                 **base_signature_inputs,
                 "date": date,
+                "effective_anchor_sha256": (
+                    None if effective_anchor_file is None
+                    else sha256_file(effective_anchor_file)
+                ),
+                "effective_anchor_weights_sha256": (
+                    None
+                    if effective_anchor_weights_file is None
+                    else sha256_file(effective_anchor_weights_file)
+                ),
+                "effective_candidate_file_sha256": (
+                    None if effective_candidate_file is None
+                    else sha256_file(effective_candidate_file)
+                ),
                 "risk_model_date": risk_model_date,
                 "risk_refresh_frequency": risk_refresh_frequency,
                 "effective_candidate_sha256": (
@@ -1276,6 +1476,11 @@ def run_rolling_experiment(
                     else _canonical_hash(candidates.tolist())
                 ),
                 "current_weights_sha256": sha256_file(current_path),
+                "initial_cash_turnover_exempt_applied": bool(
+                    position == 1
+                    and initial_position_policy == "cash"
+                    and portfolio_config["constraints"]["initial_cash_turnover_exempt"]
+                ),
                 "risk_fingerprint": risk_fingerprint,
                 "risk_form": risk_form,
                 "covariance_sha256": (
@@ -1317,10 +1522,17 @@ def run_rolling_experiment(
                         )
                     )
                 try:
+                    initial_cash_turnover_exempt = bool(
+                        position == 1
+                        and initial_position_policy == "cash"
+                        and portfolio_config["constraints"]["initial_cash_turnover_exempt"]
+                    )
                     run_single_date(
                         config_path=config_path,
                         signal_file=signal_file,
-                        candidate_file=candidate_file,
+                        candidate_file=effective_candidate_file,
+                        anchor_file=effective_anchor_file,
+                        anchor_weights_file=effective_anchor_weights_file,
                         candidate_universe=(
                             candidates if dynamic_cache is not None else None
                         ),
@@ -1330,6 +1542,9 @@ def run_rolling_experiment(
                         transaction_cost_bps=transaction_cost_bps,
                         benchmark_file=benchmark_file,
                         current_weights_file=current_path,
+                        allow_cash_current=initial_position_policy == "cash",
+                        ignore_turnover_constraint=initial_cash_turnover_exempt,
+                        execution_anchor_passthrough=stockdemo_signal_anchor,
                         sector_file=sector_file,
                         exposure_file=date_exposure_file,
                         tradability_file=tradability_file,
@@ -1359,6 +1574,41 @@ def run_rolling_experiment(
                         shutil.rmtree(build_output)
                     raise
             weights = pd.read_parquet(date_output / "target_weights.parquet")
+            execution_anchor_override_count = 0
+            if (
+                stockdemo_signal_anchor
+                and float(portfolio_config["selection"]["risk_penalty"]) == 0.0
+            ):
+                risk_rows = weights.loc[
+                    weights["portfolio"].eq("risk_optimized")
+                ].set_index("ticker")
+                requested_anchor = risk_rows["anchor_weight"].astype(float)
+                if requested_anchor.isna().any():
+                    raise InputDataError("optimized target is missing anchor weights")
+                comparison_index = risk_rows.index.union(requested_anchor.index)
+                previous_values = risk_rows["target_weight"].reindex(
+                    comparison_index, fill_value=0.0
+                )
+                requested_values = requested_anchor.reindex(
+                    comparison_index, fill_value=0.0
+                )
+                execution_anchor_override_count = int(
+                    (previous_values - requested_values).abs().gt(tolerance).sum()
+                )
+                risk_rows = risk_rows.reindex(comparison_index)
+                risk_rows["date"] = date
+                risk_rows["portfolio"] = "risk_optimized"
+                risk_rows["target_weight"] = requested_values
+                risk_rows.index.name = "ticker"
+                weights = pd.concat(
+                    [
+                        weights.loc[
+                            ~weights["portfolio"].eq("risk_optimized")
+                        ],
+                        risk_rows.reset_index(),
+                    ],
+                    ignore_index=True,
+                )
             weight_frames.append(weights)
             previous_target = weights.loc[
                 weights["portfolio"].eq("risk_optimized")
@@ -1386,6 +1636,20 @@ def run_rolling_experiment(
                         missing_candidate_excluded_count
                     ),
                     "synthetic_nontradable_count": synthetic_nontradable_count,
+                    "execution_anchor_override_applied": (
+                        stockdemo_signal_anchor
+                        and float(
+                            portfolio_config["selection"]["risk_penalty"]
+                        ) == 0.0
+                    ),
+                    "execution_anchor_override_count": (
+                        execution_anchor_override_count
+                    ),
+                    "initial_cash_turnover_exempt_applied": bool(
+                        position == 1
+                        and initial_position_policy == "cash"
+                        and portfolio_config["constraints"]["initial_cash_turnover_exempt"]
+                    ),
                 }
             )
             diagnostic_rows.append(diagnostic)
@@ -1530,8 +1794,36 @@ def run_rolling_experiment(
         for encoded in diagnostics.get("binding_constraints", pd.Series(dtype=str)).dropna():
             for name in json.loads(encoded):
                 binding_counts[str(name)] = binding_counts.get(str(name), 0) + 1
+        selection_overlap_values = pd.to_numeric(
+            diagnostics.get("selection_overlap_ratio", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        selection_replacement_values = pd.to_numeric(
+            diagnostics.get("selection_replacement_count", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        selection_risk_values = pd.to_numeric(
+            diagnostics.get("predicted_risk_reduction", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        selection_signal_values = pd.to_numeric(
+            diagnostics.get("selection_signal_score_change", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
         capture_values = pd.to_numeric(
             diagnostics.get("signal_capture_ratio", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        alpha_capture_values = pd.to_numeric(
+            diagnostics.get("alpha_capture_ratio", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        alpha_loss_values = (
+            pd.to_numeric(diagnostics["anchor_expected_return"], errors="coerce")
+            - pd.to_numeric(diagnostics["optimized_expected_return"], errors="coerce")
+        ).dropna()
+        alpha_reward_values = pd.to_numeric(
+            diagnostics.get("alpha_reward_contribution", pd.Series(dtype=float)),
             errors="coerce",
         ).dropna()
         utility_loss_values = (
@@ -1589,10 +1881,70 @@ def run_rolling_experiment(
             "binding_constraint_ratios": {
                 name: float(count / len(dates)) for name, count in binding_counts.items()
             },
+            "risk_aware_selection": {
+                "mean_overlap_ratio": (
+                    None if selection_overlap_values.empty
+                    else float(selection_overlap_values.mean())
+                ),
+                "minimum_overlap_ratio": (
+                    None if selection_overlap_values.empty
+                    else float(selection_overlap_values.min())
+                ),
+                "mean_replacement_count": (
+                    None if selection_replacement_values.empty
+                    else float(selection_replacement_values.mean())
+                ),
+                "maximum_replacement_count": (
+                    None if selection_replacement_values.empty
+                    else int(selection_replacement_values.max())
+                ),
+                "mean_predicted_risk_reduction": (
+                    None if selection_risk_values.empty
+                    else float(selection_risk_values.mean())
+                ),
+                "mean_signal_score_change": (
+                    None if selection_signal_values.empty
+                    else float(selection_signal_values.mean())
+                ),
+            },
             "signal_capture_ratio": {
                 "minimum": None if capture_values.empty else float(capture_values.min()),
                 "mean": None if capture_values.empty else float(capture_values.mean()),
                 "maximum": None if capture_values.empty else float(capture_values.max()),
+            },
+            "alpha_capture_ratio": {
+                "minimum": (
+                    None if alpha_capture_values.empty
+                    else float(alpha_capture_values.min())
+                ),
+                "mean": (
+                    None if alpha_capture_values.empty
+                    else float(alpha_capture_values.mean())
+                ),
+                "maximum": (
+                    None if alpha_capture_values.empty
+                    else float(alpha_capture_values.max())
+                ),
+            },
+            "expected_return_loss": {
+                "total": (
+                    None if alpha_loss_values.empty
+                    else float(alpha_loss_values.sum())
+                ),
+                "mean": (
+                    None if alpha_loss_values.empty
+                    else float(alpha_loss_values.mean())
+                ),
+            },
+            "alpha_reward_contribution": {
+                "mean": (
+                    None if alpha_reward_values.empty
+                    else float(alpha_reward_values.mean())
+                ),
+                "maximum": (
+                    None if alpha_reward_values.empty
+                    else float(alpha_reward_values.max())
+                ),
             },
             "signal_utility_loss": {
                 "total": (
@@ -1682,6 +2034,7 @@ def run_rolling_experiment(
             "config": config_path,
             "signal": signal_file,
             "candidates": candidate_file,
+            "anchor_weights": anchor_weights_file,
             "benchmark": benchmark_file,
             "asset_returns": asset_returns_file,
             "sectors": sector_file,
@@ -1711,10 +2064,24 @@ def run_rolling_experiment(
             "cost_model_resolution": cost_resolution,
             "risk_form": risk_form,
             "risk_refresh_frequency": risk_refresh_frequency,
+            "initial_position_policy": initial_position_policy,
+            "stockdemo_signal_anchor": stockdemo_signal_anchor,
+            "stockdemo_signal_anchor_sha256": (
+                sha256_file(temporary / "stockdemo_signal_anchor.parquet")
+                if stockdemo_signal_anchor else None
+            ),
+            "stockdemo_signal_anchor_weights_sha256": (
+                sha256_file(temporary / "stockdemo_signal_anchor_weights.parquet")
+                if stockdemo_signal_anchor else None
+            ),
             "missing_security_policy": effective_missing_security_policy,
             "signal_preflight": signal_preflight,
             "risk_preflight": risk_preflight,
             "execution_timing": (
+                "signal observed on t; StockDemo uses next-day market "
+                "state and holdings to form the baseline anchor; risk inputs are "
+                "as of t; requested targets execute with StockDemo order accounting"
+                if stockdemo_signal_anchor else
                 "target formed on t, executed by Stockdemo rules on the next market date, "
                 "and actual normalized stock holdings feed the next optimization"
                 if execution_config is not None
@@ -1764,6 +2131,11 @@ def run_rolling_experiment(
             },
             "outputs": [
                 *ROLLING_OUTPUT_FILES,
+                *(["stockdemo_signal_anchor.parquet"] if stockdemo_signal_anchor else []),
+                *(
+                    ["stockdemo_signal_anchor_weights.parquet"]
+                    if stockdemo_signal_anchor else []
+                ),
                 *(
                     ["execution_feedback.parquet", "stockdemo_compat"]
                     if execution_config is not None

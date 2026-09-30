@@ -607,7 +607,7 @@ def estimate_structural_risk_model(
         market_cap, common_dates[-1], target_universe
     )
     invalid_target = target_cap.isna() | ~np.isfinite(target_cap) | target_cap.le(0)
-    if target_industry is not None:
+    if target_industry is not None and industry_mode == "required":
         invalid_target |= target_industry.isna()
     if invalid_target.any():
         raise RiskModelError(
@@ -626,7 +626,8 @@ def estimate_structural_risk_model(
         exposures["MARKET"] = 1.0
     exposures.loc[:, config["style_factors"]] = target_styles
     if target_industry is not None:
-        for code in target_industry.astype(str).unique():
+        known_target_industry = target_industry.dropna().astype(str)
+        for code in known_target_industry.unique():
             factor_name = f"INDUSTRY:{code}"
             if factor_name not in exposures.columns:
                 raise RiskModelError(f"target industry {code} is absent from factor history")
@@ -635,7 +636,8 @@ def estimate_structural_risk_model(
     specific = all_specific.reindex(target_universe)
     imputed = specific.isna()
     if target_industry is not None and industry_history is not None:
-        for code in target_industry.astype(str).unique():
+        known_target_industry = target_industry.dropna().astype(str)
+        for code in known_target_industry.unique():
             members = target_industry.astype(str).eq(code)
             reference = all_specific.reindex(
                 _industry_asof(industry_history, requested_date)

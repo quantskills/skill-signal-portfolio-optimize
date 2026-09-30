@@ -995,6 +995,7 @@ def run_stockdemo_compat(
     benchmark: pd.DataFrame | None = None,
     portfolio_name: str = "signal",
     terminal_events: Mapping[str, Iterable[str]] | None = None,
+    record_signal_targets: bool = False,
 ) -> dict[str, Any]:
     """Run signal or target-weight execution using stockdemo accounting rules."""
 
@@ -1005,6 +1006,8 @@ def run_stockdemo_compat(
         )
     if (signal is None) == (targets is None):
         raise InputDataError("provide exactly one of signal or targets")
+    if record_signal_targets and signal is None:
+        raise InputDataError("record_signal_targets requires signal input")
     required_market = MARKET_REQUIRED | {
         "adj_factor",
         "ideal_trade_price",
@@ -1076,6 +1079,7 @@ def run_stockdemo_compat(
     rows: list[dict[str, Any]] = []
     transactions: list[dict[str, Any]] = []
     holding_rows: list[dict[str, Any]] = []
+    signal_target_rows: list[dict[str, Any]] = []
     last_balance_prices: dict[str, float] = {}
     first = True
     first_execution = execution_dates[0]
@@ -1135,6 +1139,15 @@ def run_stockdemo_compat(
                 terminal_target_removed_weight,
                 target_renormalization_factor,
             ) = _remove_terminal_targets(target, terminal_writeoff_tickers)
+            if record_signal_targets:
+                signal_target_rows.extend(
+                    {
+                        "date": signal_date,
+                        "ticker": ticker,
+                        "target_weight": float(weight),
+                    }
+                    for ticker, weight in target.items()
+                )
             cash, day_orders, turnover_amount, fees = _place_orders(
                 day=day,
                 target=target,
@@ -1247,6 +1260,10 @@ def run_stockdemo_compat(
         columns=["date", "ticker", "B/S", "volume", "trade_price", "adj_factor", "amount", "transaction"],
     )
     pd.DataFrame(holding_rows).to_csv(output / "holdings.csv", index=False)
+    if record_signal_targets:
+        pd.DataFrame(signal_target_rows).to_parquet(
+            output / "signal_targets.parquet", index=False
+        )
     summary = {
         "status": "success",
         "portfolio": portfolio_name,

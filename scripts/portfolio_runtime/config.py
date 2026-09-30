@@ -39,12 +39,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_iterations": 2000,
         "ftol": 1.0e-10,
         "minimum_signal_capture": 0.995,
+        "minimum_alpha_capture": 1.0,
+        "alpha_reward_weight": 0.0,
         "stability_penalty": 1.0e-8,
         "warm_start": True,
         "conic_cache_size": 8,
         "fallback_policy": "scipy_highs",
         "max_cutting_planes": 100,
         "blend_strength": 0.10,
+        "minimum_predicted_risk_reduction": 0.0,
+    },
+    "selection": {
+        "mode": "none",
+        "pool_size": 500,
+        "protected_top_n": 180,
+        "target_holdings": 200,
+        "risk_penalty": 0.10,
     },
     # ba875fc8 uses transaction=1.4 per-thousand round-trip, which is
     # 7 bps for the one-way turnover cost used by the optimizer.
@@ -53,12 +63,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_weight": 0.20,
         "max_active_weight": 0.15,
         "max_turnover": None,
+        "initial_cash_turnover_exempt": False,
         "max_tracking_error": None,
         "sector_active_limit": None,
         "factor_active_limit": None,
         "industry_active_range": None,
         "style_active_ranges": None,
+        "anchor_style_active_ranges": None,
         "candidate_weight_range": None,
+        # 冻结持仓（停牌/不可卖出）的权重不计入行业/风格主动带；默认关闭以保持历史口径可复现。
+        "frozen_active_band_exemption": False,
         "weight_sum_tolerance": 1.0e-8,
         "constraint_tolerance": 1.0e-6,
     },
@@ -222,8 +236,8 @@ def _candidate_weight_range(value: Any) -> dict[str, float] | None:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    if config["schema_version"] not in {1, 2, 3, 4, 5, 6, 7}:
-        raise ConfigError("schema_version must equal 1, 2, 3, 4, 5, 6, or 7")
+    if config["schema_version"] not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
+        raise ConfigError("schema_version must equal 1, 2, 3, 4, 5, 6, 7, 8, 9, or 10")
 
     signal = config["signal"]
     if signal["type"] not in {"rank_score", "expected_return"}:
@@ -267,12 +281,12 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             "error_except_frozen, or role_aware"
         )
     if (
-        config["schema_version"] in {3, 4, 5, 6, 7}
+        config["schema_version"] in {3, 4, 5, 6, 7, 8, 9, 10}
         and signal["missing_prediction_policy"]
         not in {"error_except_frozen", "role_aware"}
     ):
         raise ConfigError(
-            "schema_version 3, 4, 5, 6, or 7 requires signal.missing_prediction_policy "
+            "schema_version 3 through 10 requires signal.missing_prediction_policy "
             "error_except_frozen or role_aware"
         )
     for key in (
@@ -311,10 +325,16 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "lexicographic_signal_cost",
         "signal_preserving_minimum_variance",
         "blended_minimum_variance",
+        "blended_alpha_preserving_minimum_variance",
+        "blended_alpha_reward_minimum_variance",
+        "risk_aware_selection",
     }:
         raise ConfigError(
             "optimizer.objective_mode must be mean_variance, score_max_te, "
-            "lexicographic_signal_cost, blended_minimum_variance, or signal_preserving_minimum_variance"
+            "lexicographic_signal_cost, blended_minimum_variance, "
+            "blended_alpha_preserving_minimum_variance, "
+            "blended_alpha_reward_minimum_variance, risk_aware_selection, or "
+            "signal_preserving_minimum_variance"
         )
     if optimizer["solver_backend"] not in {
         "scipy_slsqp",
@@ -358,6 +378,18 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     )
     if optimizer["minimum_signal_capture"] > 1.0:
         raise ConfigError("optimizer.minimum_signal_capture must not exceed 1")
+    optimizer["minimum_alpha_capture"] = _finite_number(
+        optimizer["minimum_alpha_capture"],
+        "optimizer.minimum_alpha_capture",
+        minimum=0.0,
+    )
+    if optimizer["minimum_alpha_capture"] > 1.0:
+        raise ConfigError("optimizer.minimum_alpha_capture must not exceed 1")
+    optimizer["alpha_reward_weight"] = _finite_number(
+        optimizer["alpha_reward_weight"],
+        "optimizer.alpha_reward_weight",
+        minimum=0.0,
+    )
     iterations = optimizer["max_iterations"]
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
         raise ConfigError("optimizer.max_iterations must be a positive integer")
@@ -375,6 +407,29 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if optimizer["blend_strength"] > 1.0:
         raise ConfigError("optimizer.blend_strength must not exceed 1")
 
+    selection = config["selection"]
+    if selection["mode"] not in {"none", "risk_aware_boundary"}:
+        raise ConfigError(
+            "selection.mode must be none or risk_aware_boundary"
+        )
+    for key in ("pool_size", "protected_top_n", "target_holdings"):
+        value = selection[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ConfigError(f"selection.{key} must be a non-negative integer")
+    if selection["target_holdings"] <= 0:
+        raise ConfigError("selection.target_holdings must be positive")
+    if selection["protected_top_n"] >= selection["target_holdings"]:
+        raise ConfigError(
+            "selection.protected_top_n must be below target_holdings"
+        )
+    if selection["pool_size"] < selection["target_holdings"]:
+        raise ConfigError(
+            "selection.pool_size must be at least target_holdings"
+        )
+    selection["risk_penalty"] = _finite_number(
+        selection["risk_penalty"], "selection.risk_penalty", minimum=0.0
+    )
+
     constraints = config["constraints"]
     for key in ("max_weight", "max_active_weight", "weight_sum_tolerance", "constraint_tolerance"):
         constraints[key] = _finite_number(
@@ -382,6 +437,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if constraints["max_weight"] <= 0:
         raise ConfigError("constraints.max_weight must be positive")
+    if not isinstance(constraints["initial_cash_turnover_exempt"], bool):
+        raise ConfigError("constraints.initial_cash_turnover_exempt must be boolean")
+    if not isinstance(constraints["frozen_active_band_exemption"], bool):
+        raise ConfigError("constraints.frozen_active_band_exemption must be boolean")
     for key in ("max_turnover", "max_tracking_error"):
         if constraints[key] is not None:
             constraints[key] = _finite_number(
@@ -398,6 +457,9 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     )
     constraints["style_active_ranges"] = _style_ranges(
         constraints["style_active_ranges"]
+    )
+    constraints["anchor_style_active_ranges"] = _style_ranges(
+        constraints["anchor_style_active_ranges"]
     )
     constraints["candidate_weight_range"] = _candidate_weight_range(
         constraints["candidate_weight_range"]
@@ -543,6 +605,149 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                 "candidate_weight_range.min_weight >= 0.95"
             )
 
+    if config["schema_version"] == 8:
+        if (
+            optimizer["objective_mode"]
+            != "blended_alpha_preserving_minimum_variance"
+        ):
+            raise ConfigError(
+                "schema_version 8 requires optimizer.objective_mode "
+                "blended_alpha_preserving_minimum_variance"
+            )
+        if signal["type"] != "expected_return" or signal["zscore"]:
+            raise ConfigError(
+                "schema_version 8 requires signal.type expected_return and "
+                "signal.zscore false"
+            )
+        if optimizer["solver_backend"] not in {
+            "cvxpy",
+            "clarabel_socp",
+            "auto",
+        }:
+            raise ConfigError(
+                "schema_version 8 requires a CVXPY/Clarabel solver backend"
+            )
+        if optimizer["fallback_policy"] != "error":
+            raise ConfigError(
+                "schema_version 8 requires optimizer.fallback_policy error"
+            )
+        prohibited = {
+            "max_turnover": constraints["max_turnover"],
+            "max_tracking_error": constraints["max_tracking_error"],
+            "sector_active_limit": constraints["sector_active_limit"],
+            "factor_active_limit": constraints["factor_active_limit"],
+            "industry_active_range": constraints["industry_active_range"],
+            "style_active_ranges": constraints["style_active_ranges"],
+        }
+        enabled = sorted(
+            name for name, value in prohibited.items() if value is not None
+        )
+        if enabled:
+            raise ConfigError(
+                "schema_version 8 uses soft factor risk and does not allow "
+                "hard risk/turnover constraints: " + ", ".join(enabled)
+            )
+        candidate_range = constraints["candidate_weight_range"]
+        if (
+            candidate_range is None
+            or candidate_range["min_weight"] < 0.95
+        ):
+            raise ConfigError(
+                "schema_version 8 requires "
+                "candidate_weight_range.min_weight >= 0.95"
+            )
+
+    if config["schema_version"] == 9:
+        if optimizer["objective_mode"] != "blended_alpha_reward_minimum_variance":
+            raise ConfigError(
+                "schema_version 9 requires optimizer.objective_mode "
+                "blended_alpha_reward_minimum_variance"
+            )
+        if signal["type"] != "expected_return" or signal["zscore"]:
+            raise ConfigError(
+                "schema_version 9 requires signal.type expected_return and "
+                "signal.zscore false"
+            )
+        if optimizer["solver_backend"] not in {
+            "cvxpy",
+            "clarabel_socp",
+            "auto",
+        }:
+            raise ConfigError(
+                "schema_version 9 requires a CVXPY/Clarabel solver backend"
+            )
+        if optimizer["fallback_policy"] != "error":
+            raise ConfigError(
+                "schema_version 9 requires optimizer.fallback_policy error"
+            )
+        if optimizer["alpha_reward_weight"] <= 0.0:
+            raise ConfigError(
+                "schema_version 9 requires optimizer.alpha_reward_weight to be positive"
+            )
+        prohibited = {
+            "max_turnover": constraints["max_turnover"],
+            "max_tracking_error": constraints["max_tracking_error"],
+            "sector_active_limit": constraints["sector_active_limit"],
+            "factor_active_limit": constraints["factor_active_limit"],
+            "industry_active_range": constraints["industry_active_range"],
+            "style_active_ranges": constraints["style_active_ranges"],
+        }
+        enabled = sorted(
+            name for name, value in prohibited.items() if value is not None
+        )
+        if enabled:
+            raise ConfigError(
+                "schema_version 9 uses soft factor risk and does not allow "
+                "hard risk/turnover constraints: " + ", ".join(enabled)
+            )
+        candidate_range = constraints["candidate_weight_range"]
+        if candidate_range is None or candidate_range["min_weight"] < 0.95:
+            raise ConfigError(
+                "schema_version 9 requires "
+                "candidate_weight_range.min_weight >= 0.95"
+            )
+
+    if config["schema_version"] == 10:
+        if optimizer["objective_mode"] != "risk_aware_selection":
+            raise ConfigError(
+                "schema_version 10 requires optimizer.objective_mode "
+                "risk_aware_selection"
+            )
+        if selection["mode"] != "risk_aware_boundary":
+            raise ConfigError(
+                "schema_version 10 requires selection.mode risk_aware_boundary"
+            )
+        if config["covariance"]["risk_form"] != "factor_model":
+            raise ConfigError(
+                "schema_version 10 requires covariance.risk_form factor_model"
+            )
+        prohibited = {
+            "max_turnover": constraints["max_turnover"],
+            "max_tracking_error": constraints["max_tracking_error"],
+            "sector_active_limit": constraints["sector_active_limit"],
+            "factor_active_limit": constraints["factor_active_limit"],
+            "industry_active_range": constraints["industry_active_range"],
+            "style_active_ranges": constraints["style_active_ranges"],
+        }
+        enabled = sorted(
+            name for name, value in prohibited.items() if value is not None
+        )
+        if enabled:
+            raise ConfigError(
+                "schema_version 10 uses soft factor risk and does not allow "
+                "hard risk/turnover constraints: " + ", ".join(enabled)
+            )
+        candidate_range = constraints["candidate_weight_range"]
+        if candidate_range is None or candidate_range["min_weight"] < 0.95:
+            raise ConfigError(
+                "schema_version 10 requires "
+                "candidate_weight_range.min_weight >= 0.95"
+            )
+    elif selection["mode"] != "none":
+        raise ConfigError(
+            "risk-aware selection requires schema_version 10"
+        )
+
     config["cost_model"]["linear_cost_bps"] = _finite_number(
         config["cost_model"]["linear_cost_bps"],
         "cost_model.linear_cost_bps",
@@ -552,6 +757,17 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     top_n = config["baseline"]["top_n"]
     if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n <= 0:
         raise ConfigError("baseline.top_n must be a positive integer")
+    if config["schema_version"] == 10:
+        if selection["target_holdings"] != top_n:
+            raise ConfigError(
+                "schema_version 10 requires selection.target_holdings "
+                "to equal baseline.top_n"
+            )
+        minimum_equal_weight = 1.0 / float(selection["target_holdings"])
+        if constraints["max_weight"] + constraints["constraint_tolerance"] < minimum_equal_weight:
+            raise ConfigError(
+                "constraints.max_weight cannot support equal-weight target holdings"
+            )
     return config
 
 

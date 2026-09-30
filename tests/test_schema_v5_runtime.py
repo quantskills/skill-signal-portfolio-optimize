@@ -85,6 +85,20 @@ def test_schema_v5_parses_and_rejects_invalid_capture(tmp_path: Path) -> None:
     assert loaded["constraints"]["candidate_weight_range"] is None
     assert loaded["cost_model"]["linear_cost_bps"] == 7.0
 
+    initial_cash_exempt = _v5_config()
+    initial_cash_exempt["constraints"]["initial_cash_turnover_exempt"] = True
+    path.write_text(
+        yaml.safe_dump(initial_cash_exempt, sort_keys=False), encoding="utf-8"
+    )
+    assert load_config(path)["constraints"]["initial_cash_turnover_exempt"]
+
+    initial_cash_exempt["constraints"]["initial_cash_turnover_exempt"] = 1
+    path.write_text(
+        yaml.safe_dump(initial_cash_exempt, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(ConfigError, match="initial_cash_turnover_exempt must be boolean"):
+        load_config(path)
+
     invalid = _v5_config(capture=1.01)
     path.write_text(yaml.safe_dump(invalid, sort_keys=False), encoding="utf-8")
     with pytest.raises(ConfigError, match="must not exceed 1"):

@@ -15,6 +15,7 @@ from .diagnostics import (
 )
 from .errors import OptimizationError
 from .risk import PortfolioRisk, as_portfolio_risk
+from .selection import select_risk_aware_equal_weight
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ def _build_linear_system(
     config: dict[str, Any],
     *,
     exit_only_mask: pd.Series | None = None,
+    anchor_reference: pd.Series | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Bounds, bool]:
     n_assets = len(benchmark)
     with_turnover = config["max_turnover"] is not None
@@ -57,12 +59,38 @@ def _build_linear_system(
         benchmark.to_numpy(dtype=float) + float(config["max_active_weight"]),
     )
     frozen = ~tradable.to_numpy(dtype=bool)
+    frozen_weights = np.zeros(n_assets)
     if frozen.any():
         if current is None:
             raise OptimizationError("current weights are required for non-tradable assets")
         frozen_values = current.to_numpy(dtype=float)[frozen]
         lower[:n_assets][frozen] = frozen_values
         upper[:n_assets][frozen] = frozen_values
+        frozen_weights = np.where(frozen, np.clip(current.to_numpy(dtype=float), 0.0, None), 0.0)
+    # 可调整部分口径：冻结持仓（停牌/不可卖出）的权重不可控，不应计入主动带；
+    # 参考基准同时剔除冻结持仓对应的成分股权重，并按可调整总权重重新缩放，
+    # 使「可调整组合 vs 可调整基准」两侧口径一致，再叠加冻结权重本身：
+    #   center_k = β_k · (1 − Σfrozen) / (1 − Σfrozen_benchmark) + Σ_{i∈k} frozen_i
+    # 无冻结持仓时恒等于原口径（center_k = b_k），因此不影响任何既有结果。
+    frozen_band_exemption = bool(config.get("frozen_active_band_exemption", False))
+    if frozen_band_exemption:
+        benchmark_values = benchmark.to_numpy(dtype=float)
+        frozen_benchmark = np.where(frozen, benchmark_values, 0.0)
+        band_base_scale = max(1.0 - float(frozen_weights.sum()), 0.0) / max(
+            1.0 - float(frozen_benchmark.sum()), 1.0e-12
+        )
+    else:
+        benchmark_values = benchmark.to_numpy(dtype=float)
+        frozen_benchmark = None
+        band_base_scale = 1.0
+
+    def band_center(coefficients: np.ndarray, base: np.ndarray) -> float:
+        center = float(coefficients @ base)
+        if frozen_band_exemption:
+            center = float(coefficients @ (base - frozen_benchmark)) * band_base_scale + float(
+                coefficients @ frozen_weights
+            )
+        return center
 
     if exit_only_mask is not None:
         if current is None:
@@ -110,7 +138,7 @@ def _build_linear_system(
         ranges = resolve_industry_ranges(config, names)
         for name, specification in ranges.items():
             coefficients = (sectors == name).to_numpy(dtype=float)
-            center = float(coefficients @ benchmark.to_numpy(dtype=float))
+            center = band_center(coefficients, benchmark_values)
             add_active_range(
                 coefficients, center, specification["lower_active"], specification["upper_active"]
             )
@@ -120,10 +148,24 @@ def _build_linear_system(
         ranges = resolve_style_ranges(config, names)
         for name, specification in ranges.items():
             coefficients = exposures[name].to_numpy(dtype=float)
-            center = float(coefficients @ benchmark.to_numpy(dtype=float))
+            center = band_center(coefficients, benchmark_values)
             add_active_range(
                 coefficients, center, specification["lower_active"], specification["upper_active"]
             )
+        if anchor_reference is not None:
+            reference = anchor_reference.reindex(benchmark.index)
+            if reference.isna().any():
+                raise OptimizationError("anchor_reference is missing optimization assets")
+            anchor_ranges = resolve_style_ranges(
+                config, names, key="anchor_style_active_ranges"
+            )
+            reference_values = reference.to_numpy(dtype=float)
+            for name, specification in anchor_ranges.items():
+                coefficients = exposures[name].to_numpy(dtype=float)
+                center = band_center(coefficients, reference_values)
+                add_active_range(
+                    coefficients, center, specification["lower_active"], specification["upper_active"]
+                )
 
     candidate_range = config.get("candidate_weight_range")
     if candidate_range is not None:
@@ -718,6 +760,7 @@ def _optimize_cvxpy(
     *,
     signal_score: pd.Series | None = None,
     signal_floor: float | None = None,
+    anchor_reference: pd.Series | None = None,
 ) -> OptimizationResult:
     from .conic_optimizer import solve_clarabel_socp
 
@@ -732,6 +775,7 @@ def _optimize_cvxpy(
         tradable,
         constraint_config,
         exit_only_mask=exit_only_mask,
+        anchor_reference=anchor_reference,
     )
     requested_backend = str(optimizer_config["solver_backend"])
     solved = solve_clarabel_socp(
@@ -1149,6 +1193,17 @@ def _optimize_blended_minimum_variance(
     optimized_volatility = float(
         np.sqrt(max(risk.variance(weights.to_numpy(dtype=float)), 0.0))
     )
+    predicted_risk_reduction = anchor_volatility - optimized_volatility
+    trigger_threshold = float(optimizer_config.get("minimum_predicted_risk_reduction", 0.0))
+    risk_triggered_passthrough = (
+        trigger_threshold > 0.0 and predicted_risk_reduction < trigger_threshold
+    )
+    if risk_triggered_passthrough:
+        weights = anchor.copy().rename("target_weight")
+        optimized_alpha = anchor_alpha
+        optimized_volatility = anchor_volatility
+        report = anchor_report
+        predicted_risk_reduction = 0.0
     risk_tolerance = max(100.0 * tolerance, 1.0e-7)
     if optimized_volatility > anchor_volatility + risk_tolerance:
         raise OptimizationError(
@@ -1173,6 +1228,392 @@ def _optimize_blended_minimum_variance(
     )
     return OptimizationResult(weights=weights, solver=solver, constraints=report)
 
+def _optimize_blended_alpha_preserving_minimum_variance(
+    expected_return: pd.Series,
+    covariance: pd.DataFrame | PortfolioRisk,
+    benchmark: pd.Series,
+    current: pd.Series | None,
+    sectors: pd.Series | None,
+    exposures: pd.DataFrame | None,
+    tradable: pd.Series,
+    optimizer_config: dict[str, Any],
+    constraint_config: dict[str, Any],
+    *,
+    anchor_weights: pd.Series | None,
+    candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
+) -> OptimizationResult:
+    """Minimize total risk without sacrificing calibrated expected return."""
+    if anchor_weights is None:
+        raise OptimizationError(
+            "blended alpha-preserving minimum variance requires anchor_weights"
+        )
+    if candidate_mask is None:
+        raise OptimizationError(
+            "blended alpha-preserving minimum variance requires a candidate_mask"
+        )
+
+    index = expected_return.index
+    alpha = expected_return.reindex(index)
+    if alpha.isna().any() or not np.isfinite(alpha).all():
+        raise OptimizationError(
+            "expected_return contains missing or non-finite values"
+        )
+    parent_objective = str(optimizer_config["objective_mode"])
+    supported_objectives = {
+        "blended_alpha_preserving_minimum_variance",
+        "blended_alpha_reward_minimum_variance",
+    }
+    if parent_objective not in supported_objectives:
+        raise OptimizationError(
+            f"unsupported blended alpha objective: {parent_objective}"
+        )
+    reward_enabled = (
+        parent_objective == "blended_alpha_reward_minimum_variance"
+    )
+    tolerance = float(constraint_config["constraint_tolerance"])
+    anchor = _execution_aware_anchor(
+        anchor_weights.reindex(index),
+        current,
+        tradable,
+        tolerance=tolerance,
+    )
+    anchor_report = constraint_report(
+        anchor,
+        benchmark,
+        current,
+        covariance,
+        sectors,
+        exposures,
+        tradable,
+        constraint_config,
+        candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
+    )
+    if not anchor_report["passed"]:
+        details = ", ".join(
+            item["constraint"] for item in anchor_report["violations"]
+        )
+        raise OptimizationError(
+            "executable alpha anchor violates configured constraints: "
+            + details
+        )
+
+    strength = float(optimizer_config["blend_strength"])
+    minimum_capture = float(optimizer_config["minimum_alpha_capture"])
+    anchor_alpha = float(alpha @ anchor)
+    normalized_alpha_scale = max(abs(anchor_alpha), 1.0e-6)
+    normalized_alpha = alpha / normalized_alpha_scale
+    alpha_reward_weight = (
+        float(optimizer_config["alpha_reward_weight"])
+        if reward_enabled
+        else 0.0
+    )
+    inner_objective = (
+        "alpha_reward_minimum_variance"
+        if reward_enabled
+        else "alpha_preserving_minimum_variance"
+    )
+    final_alpha_floor = anchor_alpha - (
+        (1.0 - minimum_capture) * abs(anchor_alpha)
+    )
+    endpoint_candidate_mask = candidate_mask.reindex(index)
+    if endpoint_candidate_mask.isna().any():
+        raise OptimizationError("candidate_mask is missing optimization assets")
+    endpoint_candidate_mask = endpoint_candidate_mask.astype(bool).rename(
+        "is_candidate"
+    )
+
+    if strength == 0.0:
+        endpoint_weights = anchor.copy()
+        endpoint_solver: dict[str, Any] = {
+            "backend": "anchor_only",
+            "solver": None,
+            "iterations": 0,
+            "problem_cache_hit": False,
+            "solver_wall_seconds": 0.0,
+            "problem_compile_seconds": 0.0,
+        }
+        endpoint_alpha_floor = anchor_alpha
+    else:
+        endpoint_alpha_floor = (
+            final_alpha_floor - (1.0 - strength) * anchor_alpha
+        ) / strength
+        endpoint_optimizer = dict(optimizer_config)
+        endpoint_optimizer.update(
+            {
+                "objective_mode": inner_objective,
+                "risk_aversion": (
+                    float(optimizer_config["risk_aversion"])
+                    if reward_enabled
+                    else 1.0
+                ),
+                "turnover_penalty": 0.0,
+            }
+        )
+        endpoint = _optimize_cvxpy(
+            alpha,
+            normalized_alpha if reward_enabled else alpha,
+            covariance,
+            benchmark,
+            current,
+            sectors,
+            exposures,
+            endpoint_candidate_mask,
+            exit_only_mask,
+            tradable,
+            endpoint_optimizer,
+            constraint_config,
+            signal_score=alpha,
+            signal_floor=endpoint_alpha_floor,
+            anchor_reference=anchor,
+        )
+        endpoint_weights = endpoint.weights
+        endpoint_solver = dict(endpoint.solver)
+
+    weights = (
+        (1.0 - strength) * anchor + strength * endpoint_weights
+    ).rename("target_weight")
+    report = constraint_report(
+        weights,
+        benchmark,
+        current,
+        covariance,
+        sectors,
+        exposures,
+        tradable,
+        constraint_config,
+        candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
+    )
+    if not report["passed"]:
+        details = ", ".join(
+            item["constraint"] for item in report["violations"]
+        )
+        raise OptimizationError(
+            "blended alpha-preserving portfolio violates constraints: "
+            + details
+        )
+
+    endpoint_alpha = float(alpha @ endpoint_weights)
+    optimized_alpha = float(alpha @ weights)
+    alpha_tolerance = max(tolerance, 1.0e-10)
+    if optimized_alpha < final_alpha_floor - alpha_tolerance:
+        raise OptimizationError(
+            "blended alpha-preserving portfolio violates expected-return floor"
+        )
+
+    risk = as_portfolio_risk(covariance)
+    anchor_volatility = float(
+        np.sqrt(max(risk.variance(anchor.to_numpy(dtype=float)), 0.0))
+    )
+    endpoint_volatility = float(
+        np.sqrt(
+            max(risk.variance(endpoint_weights.to_numpy(dtype=float)), 0.0)
+        )
+    )
+    optimized_volatility = float(
+        np.sqrt(max(risk.variance(weights.to_numpy(dtype=float)), 0.0))
+    )
+    predicted_risk_reduction = anchor_volatility - optimized_volatility
+    trigger_threshold = float(optimizer_config.get("minimum_predicted_risk_reduction", 0.0))
+    risk_triggered_passthrough = (
+        trigger_threshold > 0.0 and predicted_risk_reduction < trigger_threshold
+    )
+    if risk_triggered_passthrough:
+        weights = anchor.copy().rename("target_weight")
+        optimized_alpha = anchor_alpha
+        optimized_volatility = anchor_volatility
+        report = anchor_report
+        predicted_risk_reduction = 0.0
+    risk_tolerance = max(100.0 * tolerance, 1.0e-7)
+    if (
+        not reward_enabled
+        and optimized_volatility > anchor_volatility + risk_tolerance
+    ):
+        raise OptimizationError(
+            "blended alpha-preserving portfolio increases predicted total volatility"
+        )
+
+    from .lexicographic import signal_capture_ratio
+
+    solver = dict(endpoint_solver)
+    solver.update(
+        {
+            "objective_mode": parent_objective,
+            "inner_objective_mode": inner_objective,
+            "blend_strength": strength,
+            "minimum_alpha_capture": minimum_capture,
+            "alpha_reward_weight": alpha_reward_weight,
+            "normalized_alpha_scale": normalized_alpha_scale,
+            "alpha_reward_contribution": float(
+                alpha_reward_weight * (normalized_alpha @ endpoint_weights)
+            ),
+            "anchor_expected_return": anchor_alpha,
+            "endpoint_expected_return": endpoint_alpha,
+            "optimized_expected_return": optimized_alpha,
+            "alpha_floor": final_alpha_floor,
+            "endpoint_alpha_floor": endpoint_alpha_floor,
+            "alpha_capture_ratio": signal_capture_ratio(
+                anchor_alpha, optimized_alpha
+            ),
+            "anchor_predicted_volatility": anchor_volatility,
+            "alpha_preserving_predicted_volatility": endpoint_volatility,
+            "optimized_predicted_volatility": optimized_volatility,
+            "predicted_risk_reduction": predicted_risk_reduction,
+            "minimum_predicted_risk_reduction": trigger_threshold,
+            "risk_triggered_passthrough": risk_triggered_passthrough,
+            "anchor_reallocation": float(
+                0.5 * (weights - anchor).abs().sum()
+            ),
+            "maximum_anchor_weight_deviation": float(
+                (weights - anchor).abs().max()
+            ),
+            "anchor_asset_count": int(endpoint_candidate_mask.sum()),
+            "objective_value": risk.variance(
+                weights.to_numpy(dtype=float)
+            ),
+        }
+    )
+    return OptimizationResult(
+        weights=weights,
+        solver=solver,
+        constraints=report,
+    )
+
+
+
+def _optimize_risk_aware_selection(
+    expected_return: pd.Series,
+    covariance: pd.DataFrame | PortfolioRisk,
+    benchmark: pd.Series,
+    current: pd.Series | None,
+    sectors: pd.Series | None,
+    exposures: pd.DataFrame | None,
+    tradable: pd.Series,
+    optimizer_config: dict[str, Any],
+    constraint_config: dict[str, Any],
+    selection_config: dict[str, Any],
+    *,
+    linear_cost_bps: float,
+    signal_score: pd.Series | None,
+    anchor_weights: pd.Series | None,
+    candidate_mask: pd.Series | None,
+    exit_only_mask: pd.Series | None,
+    execution_anchor_passthrough: bool = False,
+) -> OptimizationResult:
+    if signal_score is None:
+        raise OptimizationError("risk-aware selection requires signal_score")
+    if anchor_weights is None:
+        raise OptimizationError("risk-aware selection requires anchor_weights")
+    if candidate_mask is None:
+        raise OptimizationError("risk-aware selection requires candidate_mask")
+
+    index = expected_return.index
+    tolerance = float(constraint_config["constraint_tolerance"])
+    raw_anchor = anchor_weights.reindex(index)
+    strict_target_passthrough = bool(constraint_config.get("_strict_target_holdings", False))
+    target_passthrough = (
+        strict_target_passthrough
+        or (execution_anchor_passthrough and float(selection_config["risk_penalty"]) == 0.0)
+    )
+    anchor = (
+        raw_anchor.copy()
+        if target_passthrough
+        else _execution_aware_anchor(
+            raw_anchor, current, tradable, tolerance=tolerance
+        )
+    )
+    selection = select_risk_aware_equal_weight(
+        signal_score=signal_score.reindex(index),
+        risk_input=covariance,
+        anchor_weights=raw_anchor,
+        candidate_mask=candidate_mask.reindex(index),
+        config=selection_config,
+    )
+    weights = (
+        selection.weights
+        if target_passthrough
+        else _execution_aware_anchor(
+            selection.weights, current, tradable, tolerance=tolerance
+        )
+    )
+    report = constraint_report(
+        weights,
+        benchmark,
+        current,
+        covariance,
+        sectors,
+        exposures,
+        tradable,
+        constraint_config,
+        candidate_mask=candidate_mask,
+        exit_only_mask=exit_only_mask,
+    )
+    deferred_freeze = (
+        target_passthrough
+    )
+    deferred_constraints = {
+        "tradability_freeze",
+        "candidate_weight_range:lower",
+        "candidate_weight_range:upper",
+    }
+    blocking_violations = [
+        item for item in report["violations"]
+        if not (
+            deferred_freeze and item["constraint"] in deferred_constraints
+        )
+    ]
+    if blocking_violations:
+        details = ", ".join(
+            "{constraint}({excess:.6g})".format(**item)
+            for item in blocking_violations
+        )
+        raise OptimizationError(
+            "risk-aware selection violates configured constraints: " + details
+        )
+
+    risk = as_portfolio_risk(covariance)
+    anchor_volatility = float(
+        np.sqrt(max(risk.variance(anchor.to_numpy(dtype=float)), 0.0))
+    )
+    selected_volatility = float(
+        np.sqrt(max(risk.variance(weights.to_numpy(dtype=float)), 0.0))
+    )
+    expected = expected_return.reindex(index)
+    one_way_turnover = report.get("one_way_turnover")
+    estimated_cost = (
+        None
+        if one_way_turnover is None
+        else float(one_way_turnover) * float(linear_cost_bps) / 10_000.0
+    )
+    solver = {
+        "backend": "deterministic_risk_aware_selection",
+        "solver": None,
+        "iterations": 0,
+        "objective_mode": optimizer_config["objective_mode"],
+        "success": True,
+        "risk_form": risk.form,
+        "execution_anchor_passthrough": deferred_freeze,
+        "strict_target_passthrough": strict_target_passthrough,
+        "execution_deferred_freeze_count": (
+            len(report["violations"]) - len(blocking_violations)
+        ),
+        "one_way_turnover": one_way_turnover,
+        "estimated_transaction_cost": estimated_cost,
+        "anchor_expected_return": float(expected.dot(anchor)),
+        "optimized_expected_return": float(expected.dot(weights)),
+        "anchor_predicted_volatility": anchor_volatility,
+        "optimized_predicted_volatility": selected_volatility,
+        "predicted_risk_reduction": anchor_volatility - selected_volatility,
+        "anchor_reallocation": float(0.5 * (weights - anchor).abs().sum()),
+        "maximum_anchor_weight_deviation": float((weights - anchor).abs().max()),
+        "objective_value": risk.variance(weights.to_numpy(dtype=float)),
+        **selection.diagnostics,
+    }
+    return OptimizationResult(weights=weights, solver=solver, constraints=report)
+
+
 def optimize_portfolio(
     expected_return: pd.Series,
     covariance: pd.DataFrame | PortfolioRisk,
@@ -1188,6 +1629,8 @@ def optimize_portfolio(
     candidate_mask: pd.Series | None = None,
     exit_only_mask: pd.Series | None = None,
     cost_model: dict[str, Any] | None = None,
+    selection_config: dict[str, Any] | None = None,
+    execution_anchor_passthrough: bool = False,
 ) -> OptimizationResult:
     if candidate_mask is not None:
         candidate_mask = candidate_mask.reindex(expected_return.index)
@@ -1209,6 +1652,33 @@ def optimize_portfolio(
             raise OptimizationError("exit-only assets must be tradable")
 
     objective_mode = optimizer_config["objective_mode"]
+    if objective_mode == "risk_aware_selection":
+        if selection_config is None:
+            raise OptimizationError(
+                "risk-aware selection requires selection_config"
+            )
+        return _optimize_risk_aware_selection(
+            expected_return,
+            covariance,
+            benchmark,
+            current,
+            sectors,
+            exposures,
+            tradable,
+            optimizer_config,
+            constraint_config,
+            selection_config,
+            linear_cost_bps=float(
+                (cost_model or {"linear_cost_bps": 7.0})[
+                    "linear_cost_bps"
+                ]
+            ),
+            signal_score=signal_score,
+            anchor_weights=anchor_weights,
+            candidate_mask=candidate_mask,
+            exit_only_mask=exit_only_mask,
+            execution_anchor_passthrough=execution_anchor_passthrough,
+        )
     if objective_mode == "signal_preserving_minimum_variance":
         return _optimize_signal_preserving_minimum_variance(
             expected_return,
@@ -1232,6 +1702,24 @@ def optimize_portfolio(
         )
     if objective_mode == "blended_minimum_variance":
         return _optimize_blended_minimum_variance(
+            expected_return,
+            covariance,
+            benchmark,
+            current,
+            sectors,
+            exposures,
+            tradable,
+            optimizer_config,
+            constraint_config,
+            anchor_weights=anchor_weights,
+            candidate_mask=candidate_mask,
+            exit_only_mask=exit_only_mask,
+        )
+    if objective_mode in {
+        "blended_alpha_preserving_minimum_variance",
+        "blended_alpha_reward_minimum_variance",
+    }:
+        return _optimize_blended_alpha_preserving_minimum_variance(
             expected_return,
             covariance,
             benchmark,

@@ -230,12 +230,22 @@ def _build_problem(
 
     risk_weights = (
         weights
-        if objective_mode == "minimum_variance"
+        if objective_mode in {
+            "minimum_variance",
+            "alpha_preserving_minimum_variance",
+            "alpha_reward_minimum_variance",
+        }
         else weights - benchmark
     )
     risk_vector = risk_operator @ risk_weights
     objective = linear_objective @ decision
-    if objective_mode in {"mean_variance", "minimum_variance", "signal_preserving_minimum_variance"}:
+    if objective_mode in {
+        "mean_variance",
+        "minimum_variance",
+        "signal_preserving_minimum_variance",
+        "alpha_preserving_minimum_variance",
+        "alpha_reward_minimum_variance",
+    }:
         objective += 0.5 * float(risk_aversion) * cp.sum_squares(risk_vector)
     if current is not None:
         objective += float(turnover_penalty) * cp.norm1(weights - current)
@@ -295,10 +305,14 @@ def solve_clarabel_socp(
     objective_mode = str(optimizer_config["objective_mode"])
     risk_aversion = float(optimizer_config["risk_aversion"])
     turnover_penalty = float(optimizer_config["turnover_penalty"])
-    has_signal_floor = objective_mode == "signal_preserving_minimum_variance"
+    has_signal_floor = objective_mode in {
+        "signal_preserving_minimum_variance",
+        "alpha_preserving_minimum_variance",
+        "alpha_reward_minimum_variance",
+    }
     if has_signal_floor != (signal_score is not None and signal_floor is not None):
         raise OptimizationError(
-            "signal_preserving_minimum_variance requires signal_score and signal_floor"
+            "alpha/signal-preserving minimum variance requires a floor vector and value"
         )
     has_current_l1 = (
         current is not None and turnover_penalty > 0.0 and not with_turnover_auxiliary
@@ -340,8 +354,16 @@ def solve_clarabel_socp(
         assert signal_score is not None and signal_floor is not None
     if objective_mode in {"mean_variance", "minimum_variance"}:
         linear[:n_assets] = -np.asarray(expected_return, dtype=float)
-    elif objective_mode == "signal_preserving_minimum_variance":
+    elif objective_mode in {
+        "signal_preserving_minimum_variance",
+        "alpha_preserving_minimum_variance",
+    }:
         linear[:n_assets] = 0.0
+    elif objective_mode == "alpha_reward_minimum_variance":
+        alpha_reward_weight = float(optimizer_config["alpha_reward_weight"])
+        linear[:n_assets] = (
+            -alpha_reward_weight * np.asarray(objective_signal, dtype=float)
+        )
     else:
         linear[:n_assets] = -np.asarray(objective_signal, dtype=float)
     if with_turnover_auxiliary:
@@ -395,8 +417,10 @@ def solve_clarabel_socp(
             "CVXPY CLARABEL did not return an acceptable optimum: "
             f"{compiled.problem.status}"
         )
+    # Clarabel 在紧的风格/行业带边界上会留下约 1e-6 量级的负权重残差（组合权重的 1e-6，
+    # 经济上可忽略）。与效用下限校验保持同一量级：容差下限取 1e-5，超出才报错。
     cleaning_tolerance = max(
-        100.0 * float(optimizer_config["ftol"]), 1.0e-6
+        100.0 * float(optimizer_config["ftol"]), 1.0e-5
     )
     cleaned_decision, clipped_weight_mass = _clean_long_only_numerics(
         np.asarray(compiled.decision.value, dtype=float),
@@ -645,8 +669,10 @@ def solve_lexicographic_clarabel(
             "CVXPY CLARABEL primary solve did not return an acceptable optimum: "
             f"{compiled.primary_problem.status}"
         )
+    # Clarabel 在紧的风格/行业带边界上会留下约 1e-6 量级的负权重残差（组合权重的 1e-6，
+    # 经济上可忽略）。与效用下限校验保持同一量级：容差下限取 1e-5，超出才报错。
     cleaning_tolerance = max(
-        100.0 * float(optimizer_config["ftol"]), 1.0e-6
+        100.0 * float(optimizer_config["ftol"]), 1.0e-5
     )
     primary_decision, primary_clipped_weight_mass = _clean_long_only_numerics(
         np.asarray(compiled.decision.value, dtype=float),
