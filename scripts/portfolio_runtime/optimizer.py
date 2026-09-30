@@ -1512,9 +1512,14 @@ def _optimize_risk_aware_selection(
     index = expected_return.index
     tolerance = float(constraint_config["constraint_tolerance"])
     raw_anchor = anchor_weights.reindex(index)
+    strict_target_passthrough = bool(constraint_config.get("_strict_target_holdings", False))
+    target_passthrough = (
+        strict_target_passthrough
+        or (execution_anchor_passthrough and float(selection_config["risk_penalty"]) == 0.0)
+    )
     anchor = (
         raw_anchor.copy()
-        if execution_anchor_passthrough and float(selection_config["risk_penalty"]) == 0.0
+        if target_passthrough
         else _execution_aware_anchor(
             raw_anchor, current, tradable, tolerance=tolerance
         )
@@ -1528,7 +1533,7 @@ def _optimize_risk_aware_selection(
     )
     weights = (
         selection.weights
-        if execution_anchor_passthrough and float(selection_config["risk_penalty"]) == 0.0
+        if target_passthrough
         else _execution_aware_anchor(
             selection.weights, current, tradable, tolerance=tolerance
         )
@@ -1546,7 +1551,7 @@ def _optimize_risk_aware_selection(
         exit_only_mask=exit_only_mask,
     )
     deferred_freeze = (
-        execution_anchor_passthrough and float(selection_config["risk_penalty"]) == 0.0
+        target_passthrough
     )
     deferred_constraints = {
         "tradability_freeze",
@@ -1590,6 +1595,7 @@ def _optimize_risk_aware_selection(
         "success": True,
         "risk_form": risk.form,
         "execution_anchor_passthrough": deferred_freeze,
+        "strict_target_passthrough": strict_target_passthrough,
         "execution_deferred_freeze_count": (
             len(report["violations"]) - len(blocking_violations)
         ),

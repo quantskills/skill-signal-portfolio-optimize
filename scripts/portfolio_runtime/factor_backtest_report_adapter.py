@@ -28,6 +28,7 @@ class FactorBacktestReportConfig:
     twap_file: Path
     output_dir: Path
     benchmark_name: str = "zz1000"
+    benchmark_index_file: Path | None = None
     initial_cash: float | None = None
 
 
@@ -74,11 +75,15 @@ def _infer_initial_cash(stats: pd.DataFrame, configured: float | None) -> float:
     raise InputDataError("cannot infer initial_cash; pass --initial-cash explicitly")
 
 
-def _prepare_stats(stats_file: Path, initial_cash: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _prepare_stats(
+    stats_file: Path,
+    initial_cash: float,
+    benchmark_index_file: Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not stats_file.is_file():
         raise InputDataError(f"stats file does not exist: {stats_file}")
     raw = pd.read_csv(stats_file)
-    required = {"date", "unrealized_pnl", "benchmark_nav"}
+    required = {"date", "unrealized_pnl"}
     missing = sorted(required - set(raw.columns))
     if missing:
         raise InputDataError("ledger stats missing column(s): " + ", ".join(missing))
@@ -86,10 +91,34 @@ def _prepare_stats(stats_file: Path, initial_cash: float) -> tuple[pd.DataFrame,
     raw = raw.drop_duplicates("date", keep="last").sort_values("date")
     raw.index = pd.to_datetime(raw["date"], format="%Y%m%d")
     original_stats = raw[["unrealized_pnl"]].copy()
-    benchmark = pd.DataFrame(
-        {"benchmark": raw["benchmark_nav"].astype(float).to_numpy() * initial_cash},
-        index=original_stats.index,
-    )
+    if benchmark_index_file is not None:
+        path = benchmark_index_file.expanduser().resolve()
+        if not path.is_file():
+            raise InputDataError(f"benchmark index file does not exist: {path}")
+        index = pd.read_parquet(path)
+        if not {"date", "close"}.issubset(index.columns):
+            raise InputDataError("benchmark index requires date and close columns")
+        index["date"] = _normalize_date(index["date"])
+        index = index.drop_duplicates("date", keep="last").set_index("date")
+        close = pd.to_numeric(index["close"], errors="coerce")
+        close.index = pd.to_datetime(close.index, format="%Y%m%d")
+        close = close.reindex(original_stats.index).ffill()
+        if close.isna().any() or close.empty or float(close.iloc[0]) <= 0:
+            raise InputDataError("benchmark index does not cover execution dates")
+        benchmark = pd.DataFrame(
+            {"benchmark": close / float(close.iloc[0]) * initial_cash},
+            index=original_stats.index,
+        )
+    else:
+        if "benchmark_nav" not in raw.columns:
+            raise InputDataError("ledger stats requires benchmark_nav when benchmark index is omitted")
+        values = pd.to_numeric(raw["benchmark_nav"], errors="coerce")
+        if values.isna().all():
+            raise InputDataError("benchmark_nav is empty; provide benchmark_index_file")
+        benchmark = pd.DataFrame(
+            {"benchmark": values.to_numpy() * initial_cash},
+            index=original_stats.index,
+        )
     return original_stats, benchmark
 
 
@@ -178,7 +207,9 @@ def render_factor_backtest_compatible_report(config: FactorBacktestReportConfig)
 
     ledger = pd.read_csv(config.stats_file)
     initial_cash = _infer_initial_cash(ledger, config.initial_cash)
-    stats, benchmark = _prepare_stats(config.stats_file, initial_cash)
+    stats, benchmark = _prepare_stats(
+        config.stats_file, initial_cash, config.benchmark_index_file
+    )
     ics, buy_data = _calculate_execution_ic(
         signal_file=config.signal_file,
         twap_file=config.twap_file,

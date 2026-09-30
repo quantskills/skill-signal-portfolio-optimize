@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--twap-file", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--benchmark-name", default="zz1000")
+    parser.add_argument("--benchmark-index-file", type=Path, required=True)
     parser.add_argument("--initial-cash", type=float)
     return parser.parse_args()
 
@@ -44,6 +45,7 @@ def main() -> int:
             twap_file=args.twap_file,
             output_dir=args.output_dir,
             benchmark_name=args.benchmark_name,
+            benchmark_index_file=args.benchmark_index_file,
             initial_cash=args.initial_cash,
         )
     )

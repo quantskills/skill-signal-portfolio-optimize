@@ -776,6 +776,7 @@ def run_rolling_experiment(
     signal_file: str | Path,
     candidate_file: str | Path | None = None,
     anchor_file: str | Path | None = None,
+    anchor_weights_file: str | Path | None = None,
     benchmark_file: str | Path,
     asset_returns_file: str | Path,
     output_dir: str | Path,
@@ -829,6 +830,7 @@ def run_rolling_experiment(
         or initial_position_policy != "cash"
         or candidate_file is None
         or anchor_file is not None
+        or anchor_weights_file is not None
     ):
         raise InputDataError(
             "stockdemo_signal_anchor requires StockDemo execution, cash initial "
@@ -1060,6 +1062,9 @@ def run_rolling_experiment(
         "anchor_sha256": (
             None if anchor_file is None else sha256_file(anchor_file)
         ),
+        "anchor_weights_sha256": (
+            None if anchor_weights_file is None else sha256_file(anchor_weights_file)
+        ),
         "benchmark_sha256": sha256_file(benchmark_file),
         "risk_refresh_frequency": risk_refresh_frequency,
         "missing_security_policy": effective_missing_security_policy,
@@ -1092,7 +1097,7 @@ def run_rolling_experiment(
     }
     effective_candidate_file = candidate_file
     effective_anchor_file = anchor_file
-    signal_anchor_by_date: dict[str, pd.Series] = {}
+    effective_anchor_weights_file = anchor_weights_file
     try:
         if stockdemo_signal_anchor:
             assert execution_market is not None and execution_config is not None
@@ -1110,10 +1115,6 @@ def run_rolling_experiment(
                 record_signal_targets=True,
             )
             reference_targets = pd.read_parquet(reference_dir / "signal_targets.parquet")
-            signal_anchor_by_date = {
-                str(date): group.set_index("ticker")["target_weight"].astype(float)
-                for date, group in reference_targets.groupby("date", sort=True)
-            }
             counts = reference_targets.groupby("date")["ticker"].nunique()
             if counts.to_dict() != {
                 date: int(portfolio_config["baseline"]["top_n"])
@@ -1125,6 +1126,12 @@ def run_rolling_experiment(
             effective_anchor_file = working / "stockdemo_anchor.parquet"
             reference_targets[["date", "ticker"]].to_parquet(
                 effective_anchor_file, index=False
+            )
+            effective_anchor_weights_file = working / "stockdemo_anchor_weights.parquet"
+            reference_targets.rename(
+                columns={"target_weight": "anchor_weight"}
+            )[["date", "ticker", "anchor_weight"]].to_parquet(
+                effective_anchor_weights_file, index=False
             )
             candidates_input = read_table(candidate_file)[["date", "ticker"]].copy()
             candidates_input["date"] = candidates_input["date"].map(normalize_date)
@@ -1157,6 +1164,11 @@ def run_rolling_experiment(
             shutil.copyfile(
                 reference_dir / "signal_targets.parquet",
                 temporary / "stockdemo_signal_anchor.parquet",
+            )
+            reference_targets.rename(
+                columns={"target_weight": "anchor_weight"}
+            )[["date", "ticker", "anchor_weight"]].to_parquet(
+                temporary / "stockdemo_signal_anchor_weights.parquet", index=False
             )
         for position, date in enumerate(dates, start=1):
             feedback_cash_weight: float | None = None
@@ -1447,6 +1459,11 @@ def run_rolling_experiment(
                     None if effective_anchor_file is None
                     else sha256_file(effective_anchor_file)
                 ),
+                "effective_anchor_weights_sha256": (
+                    None
+                    if effective_anchor_weights_file is None
+                    else sha256_file(effective_anchor_weights_file)
+                ),
                 "effective_candidate_file_sha256": (
                     None if effective_candidate_file is None
                     else sha256_file(effective_candidate_file)
@@ -1515,6 +1532,7 @@ def run_rolling_experiment(
                         signal_file=signal_file,
                         candidate_file=effective_candidate_file,
                         anchor_file=effective_anchor_file,
+                        anchor_weights_file=effective_anchor_weights_file,
                         candidate_universe=(
                             candidates if dynamic_cache is not None else None
                         ),
@@ -1561,10 +1579,12 @@ def run_rolling_experiment(
                 stockdemo_signal_anchor
                 and float(portfolio_config["selection"]["risk_penalty"]) == 0.0
             ):
-                requested_anchor = signal_anchor_by_date[date]
                 risk_rows = weights.loc[
                     weights["portfolio"].eq("risk_optimized")
                 ].set_index("ticker")
+                requested_anchor = risk_rows["anchor_weight"].astype(float)
+                if requested_anchor.isna().any():
+                    raise InputDataError("optimized target is missing anchor weights")
                 comparison_index = risk_rows.index.union(requested_anchor.index)
                 previous_values = risk_rows["target_weight"].reindex(
                     comparison_index, fill_value=0.0
@@ -2014,6 +2034,7 @@ def run_rolling_experiment(
             "config": config_path,
             "signal": signal_file,
             "candidates": candidate_file,
+            "anchor_weights": anchor_weights_file,
             "benchmark": benchmark_file,
             "asset_returns": asset_returns_file,
             "sectors": sector_file,
@@ -2047,6 +2068,10 @@ def run_rolling_experiment(
             "stockdemo_signal_anchor": stockdemo_signal_anchor,
             "stockdemo_signal_anchor_sha256": (
                 sha256_file(temporary / "stockdemo_signal_anchor.parquet")
+                if stockdemo_signal_anchor else None
+            ),
+            "stockdemo_signal_anchor_weights_sha256": (
+                sha256_file(temporary / "stockdemo_signal_anchor_weights.parquet")
                 if stockdemo_signal_anchor else None
             ),
             "missing_security_policy": effective_missing_security_policy,
@@ -2107,6 +2132,10 @@ def run_rolling_experiment(
             "outputs": [
                 *ROLLING_OUTPUT_FILES,
                 *(["stockdemo_signal_anchor.parquet"] if stockdemo_signal_anchor else []),
+                *(
+                    ["stockdemo_signal_anchor_weights.parquet"]
+                    if stockdemo_signal_anchor else []
+                ),
                 *(
                     ["execution_feedback.parquet", "stockdemo_compat"]
                     if execution_config is not None

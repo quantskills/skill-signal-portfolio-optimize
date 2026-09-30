@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional date-ticker equal-weight anchor universe",
     )
+    parser.add_argument(
+        "--anchor-weights-file",
+        type=Path,
+        help="Optional date-ticker-anchor_weight table used as the optimization anchor",
+    )
     parser.add_argument("--signal-file", required=True, type=Path)
     parser.add_argument(
         "--covariance-root",
@@ -145,6 +150,7 @@ def main() -> int:
             signal_file=args.signal_file,
             candidate_file=args.candidate_file,
             anchor_file=args.anchor_file,
+            anchor_weights_file=args.anchor_weights_file,
             covariance_root=args.covariance_root,
             benchmark_file=args.benchmark_file,
             asset_returns_file=args.asset_returns_file,

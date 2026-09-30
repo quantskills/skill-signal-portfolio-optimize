@@ -265,6 +265,7 @@ def run_single_date(
     signal_file: str | Path,
     candidate_file: str | Path | None = None,
     anchor_file: str | Path | None = None,
+    anchor_weights_file: str | Path | None = None,
     candidate_universe: pd.Index | None = None,
     covariance_file: str | Path | None,
     benchmark_file: str | Path,
@@ -287,6 +288,9 @@ def run_single_date(
     date = normalize_date(requested_date)
     config = load_config(config_path)
     constraint_config = dict(config["constraints"])
+    constraint_config["_strict_target_holdings"] = (
+        int(config["schema_version"]) == 10
+    )
     if ignore_turnover_constraint:
         constraint_config["max_turnover"] = None
     effective_cost_bps, cost_resolution = resolve_linear_cost_bps(
@@ -307,6 +311,29 @@ def run_single_date(
         if anchor_file is None
         else load_candidate_universe(anchor_file, date, table_cache=table_cache)
     )
+    source_anchor_weights = None
+    if anchor_weights_file is not None:
+        source_anchor_weights = load_weight_series(
+            anchor_weights_file,
+            date,
+            "anchor_weight",
+            "anchor weights",
+            table_cache=table_cache,
+        )
+        _validate_weight_vector(
+            source_anchor_weights,
+            "anchor weights",
+            require_full_investment=True,
+            tolerance=tolerance,
+        )
+        outside_anchor = source_anchor_weights[
+            source_anchor_weights.gt(tolerance)
+        ].index.difference(source_anchor_candidates)
+        if len(outside_anchor):
+            raise InputDataError(
+                "anchor weights contain positive ticker(s) outside the anchor "
+                f"universe: {list(outside_anchor[:10])}"
+            )
     outside_anchor_source = source_anchor_candidates.difference(source_candidates)
     if len(outside_anchor_source):
         raise InputDataError(
@@ -392,6 +419,13 @@ def run_single_date(
             raise InputDataError(
                 "available anchor and candidate pool cannot support baseline.top_n"
             )
+    if source_anchor_weights is not None and config["schema_version"] == 10:
+        # A StockDemo anchor can lose an unavailable name during tradability
+        # filtering. Schema 10 instead requires an exact N-name full-investment
+        # target, so rebuild the post-filter anchor on eligible names.
+        source_anchor_weights = pd.Series(
+            1.0 / top_n, index=available_anchor[:top_n], dtype=float
+        )
     benchmark = benchmark_input.reindex(universe, fill_value=0.0)
     current = (
         None if current_input is None else current_input.reindex(universe, fill_value=0.0)
@@ -494,6 +528,17 @@ def run_single_date(
         config["baseline"]["top_n"],
     )
     baseline = signal_baseline.reindex(universe, fill_value=0.0)
+    optimization_anchor = (
+        baseline
+        if source_anchor_weights is None
+        else source_anchor_weights.reindex(universe, fill_value=0.0)
+    )
+    _validate_weight_vector(
+        optimization_anchor,
+        "optimization anchor",
+        require_full_investment=True,
+        tolerance=tolerance,
+    )
     optimized = optimize_portfolio(
         calibrated["expected_return"],
         risk,
@@ -505,7 +550,7 @@ def run_single_date(
         config["optimizer"],
         constraint_config,
         signal_score=calibrated["signal_score"],
-        anchor_weights=baseline,
+        anchor_weights=optimization_anchor,
         candidate_mask=candidate_mask,
         exit_only_mask=exit_only_mask,
         cost_model={"linear_cost_bps": effective_cost_bps},
@@ -672,6 +717,12 @@ def run_single_date(
             "candidate_asset_count": int(len(candidates)),
             "source_anchor_asset_count": int(len(source_anchor_candidates)),
             "effective_anchor_asset_count": int(len(available_anchor)),
+            "provided_anchor_asset_count": (
+                None
+                if source_anchor_weights is None
+                else int(source_anchor_weights.gt(tolerance).sum())
+            ),
+            "provided_anchor_weight": float(optimization_anchor.sum()),
             "anchor_missing_from_risk_count": int(len(anchor_missing_from_risk)),
             "anchor_missing_from_risk_ticker_sha256": _ticker_index_hash(
                 anchor_missing_from_risk
@@ -704,6 +755,7 @@ def run_single_date(
             "current_weight": (
                 np.nan if current is None else current.to_numpy(dtype=float)
             ),
+            "anchor_weight": optimization_anchor.to_numpy(dtype=float),
             "signal_available": ~missing_prediction.to_numpy(dtype=bool),
             "is_candidate": candidate_mask.to_numpy(dtype=bool),
             "exit_only": exit_only_mask.to_numpy(dtype=bool),
@@ -729,6 +781,7 @@ def run_single_date(
     supplied_paths = {
         "candidates": candidate_file,
         "anchor": anchor_file,
+        "anchor_weights": anchor_weights_file,
         "config": config_path,
         "signal": signal_file,
         "covariance": covariance_file,

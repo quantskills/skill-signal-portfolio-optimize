@@ -139,12 +139,14 @@ class SingleDatePipelineTest(unittest.TestCase):
         self,
         output_name: str = "output",
         candidate_file: Path | None = None,
+        anchor_weights_file: Path | None = None,
         missing_security_policy: str = "error",
     ) -> dict[str, object]:
         return run_single_date(
             config_path=self.config,
             signal_file=self.signal,
             candidate_file=candidate_file,
+            anchor_weights_file=anchor_weights_file,
             covariance_file=self.covariance,
             benchmark_file=self.benchmark,
             current_weights_file=self.current,
@@ -237,6 +239,27 @@ class SingleDatePipelineTest(unittest.TestCase):
         self.assertEqual(manifest["implementation_version"], __version__)
         self.assertEqual(manifest["asset_count"], 6)
         self.assertEqual(set(manifest["outputs"]), set(OUTPUT_FILES))
+
+    def test_date_anchor_weights_are_loaded_and_recorded(self) -> None:
+        anchor = self.root / "anchor_weights.csv"
+        pd.DataFrame(
+            {
+                "date": self.date,
+                "ticker": self.tickers,
+                "anchor_weight": [0.30, 0.25, 0.15, 0.10, 0.10, 0.10],
+            }
+        ).to_csv(anchor, index=False)
+        result = self.run_pipeline(
+            "anchor-weights-output", anchor_weights_file=anchor
+        )
+        output = Path(result["output_dir"])
+        weights = pd.read_parquet(output / "target_weights.parquet")
+        optimized = weights.loc[weights["portfolio"] == "risk_optimized"]
+        self.assertAlmostEqual(float(optimized["anchor_weight"].sum()), 1.0, places=7)
+        self.assertEqual(
+            json.loads((output / "run_manifest.json").read_text())["inputs"]["anchor_weights"]["path"],
+            str(anchor.resolve()),
+        )
 
     def test_indexed_parquet_exposures_are_supported(self) -> None:
         indexed = pd.read_csv(self.exposures).set_index("ticker")
