@@ -1,14 +1,3 @@
-# 锁定默认配置 v2（2026-09-26）
-# 相对 v1（TE8%/换手20%）的两处改动，均基于时间切分实验与后续扩样验证：
-#   max_tracking_error: 0.08 -> 0.06
-#     方案 A（默认 vs TE6，15 个相互独立的信号评价）：Sharpe 14/15 改善（平均 +0.348，跨评价 t=+4.25，p=0.0005）；
-#     相对回撤 15/15 下降（平均 -3.05pp，t=+12.9）；代价为收益水平 -2.04%/年（t=-2.89）。
-#   max_turnover: 0.20 -> 0.12
-#     2 倍线性成本压力测试与 ADV 平方根冲击成本事后核算均显示低换手档相对占优；
-#     组合层面 TE6+换手12% 事前 ΔSharpe +0.18、冲击后（η=1.0）ΔSharpe +0.60（5/6 评价为正）。
-#   frozen_active_band_exemption: true
-#     修复"停牌持仓冻结 + 行业主动带"导致可行域为空、调仓失败的问题（2024-10-28 等日期实测）。
-# 证据与复现：experiments/tsplit_resel300_study_v1/README.md 与 reports/时间切分验证_2024调参_2025-2026验证.docx
 schema_version: 5
 signal:
   type: rank_score
@@ -43,8 +32,8 @@ optimizer:
 cost_model:
   linear_cost_bps: 7.0
 constraints:
-  max_weight: 0.04
-  max_active_weight: 0.04
+  max_weight: 0.02
+  max_active_weight: 0.02
   max_turnover: 0.12
   max_tracking_error: 0.06
   sector_active_limit: null
@@ -57,11 +46,9 @@ constraints:
     SIZE:
       enabled: true
       target_active: 0.0
-      tolerance: 5.0
+      tolerance: 1000000.0
     BETA:
-      enabled: true
-      target_active: 0.0
-      tolerance: 0.3
+      enabled: false
     MOMENTUM:
       enabled: false
     RESVOL:
@@ -71,6 +58,5 @@ constraints:
   candidate_weight_range: null
   weight_sum_tolerance: 1.0e-08
   constraint_tolerance: 1.0e-05
-  frozen_active_band_exemption: true
 baseline:
   top_n: 50

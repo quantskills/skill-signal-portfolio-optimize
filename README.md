@@ -60,6 +60,16 @@
 
 “已经计算”不等于“自动约束”。需要在配置中明确设置目标暴露和容忍区间。v1.1.0 提供 [行业组合配置](examples/v1.1-industry-portfolio-config.yaml) 和 [行业风险模型配置](examples/v1.1-industry-risk-model-config.yaml)，行业标签默认要求每日 100% 覆盖；若只有候选股票缺失，可显式使用 `--missing-policy exclude` 生成过滤后的候选池和排除清单，再将过滤后的文件传给优化器。基准持仓和已有持仓仍必须有行业标签。禁止用今天的行业分类回填历史。
 
+## 推荐参数预设
+
+为了复现实验结果，建议显式传入版本化 preset，而不是依赖向后兼容的代码 fallback：
+
+- `defaults/default_lexicographic_v1_8.yaml`：通用推荐的 Clarabel 词典序优化配置。
+- `defaults/259_flexible_benchmark_enhancement_keep07.yaml`：259 因子灵活基准增强复现实验。
+- `defaults/259_strict_topn_p005.yaml`：259 严格 TopN 风险边界选择研究配置，不是通用默认。
+
+完整的优化器和执行参数约定见 [docs/default-presets.md](docs/default-presets.md)。
+
 ## 安装
 
 ```bash
