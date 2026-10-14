@@ -30,6 +30,7 @@ class TargetWeightExecutionConfig:
     missing_target_policy: str = "cash"
     missing_held_policy: str = "carry_forward"
     include_final_next_execution: bool = False
+    valuation_end_date: str | None = None
 
     def as_runtime_config(self) -> StockDemoExecutionConfig:
         return StockDemoExecutionConfig(
@@ -69,6 +70,7 @@ def run_target_weight_execution(
         config=config.as_runtime_config(),
         portfolio_name=portfolio_name,
         terminal_events=terminal_events,
+        valuation_end_date=config.valuation_end_date,
     )
 
 

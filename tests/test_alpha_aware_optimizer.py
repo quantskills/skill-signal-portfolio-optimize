@@ -173,3 +173,37 @@ def test_schema8_requires_expected_return_input(tmp_path: Path) -> None:
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     with pytest.raises(ConfigError, match="signal.type expected_return"):
         load_config(path)
+
+
+def test_schema11_accepts_rank_score_alpha_preserving_input(tmp_path: Path) -> None:
+    config = deepcopy(DEFAULT_CONFIG)
+    config["schema_version"] = 11
+    config["signal"].update(
+        {
+            "type": "rank_score",
+            "zscore": False,
+            "rank_transform": "uniform",
+            "rank_power": 1.0,
+            "missing_prediction_policy": "role_aware",
+        }
+    )
+    config["covariance"]["risk_form"] = "factor_model"
+    config["optimizer"].update(
+        {
+            "objective_mode": "blended_alpha_preserving_minimum_variance",
+            "solver_backend": "clarabel_socp",
+            "fallback_policy": "error",
+        }
+    )
+    config["constraints"]["candidate_weight_range"] = {
+        "min_weight": 1.0,
+        "max_weight": 1.0,
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    assert load_config(path)["schema_version"] == 11
+
+    config["signal"]["type"] = "expected_return"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ConfigError, match="signal.type rank_score"):
+        load_config(path)

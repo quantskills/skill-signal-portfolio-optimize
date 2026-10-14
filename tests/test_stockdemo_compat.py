@@ -22,6 +22,7 @@ from portfolio_runtime.stockdemo_compat import (
     load_stockdemo_market,
     load_terminal_events,
     run_stockdemo_compat,
+    seed_stockdemo_state,
 )
 
 
@@ -196,6 +197,34 @@ def test_target_execution_reuses_stockdemo_order_accounting(tmp_path: Path) -> N
     assert summary["portfolio"] == "risk_optimized"
 
 
+def test_target_execution_can_extend_valuation_without_extra_trade(tmp_path: Path) -> None:
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    market = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230105
+    )
+    targets = pd.DataFrame(
+        {
+            "date": [20230102, 20230102],
+            "ticker": ["000001.SZ", "000002.SZ"],
+            "target_weight": [0.5, 0.5],
+        }
+    )
+    run_stockdemo_compat(
+        market=market,
+        targets=targets,
+        output_dir=tmp_path / "tail_valuation",
+        config=StockDemoExecutionConfig(
+            longx=2, initial_cash=1_000_000.0, exact_window=False
+        ),
+        valuation_end_date=20230105,
+    )
+    stats = pd.read_csv(tmp_path / "tail_valuation" / "stats.csv")
+    transactions = pd.read_csv(tmp_path / "tail_valuation" / "transaction.csv")
+    assert stats["date"].tolist() == [20230103, 20230104, 20230105]
+    assert set(transactions["date"]) == {20230103}
+
+
 def test_keep_budget_does_not_oversell_first_holding(tmp_path: Path) -> None:
     market_path = tmp_path / "market.parquet"
     _market().to_parquet(market_path, index=False)
@@ -261,6 +290,29 @@ def test_execution_state_returns_actual_normalized_holdings(tmp_path: Path) -> N
     assert weights.sum() == pytest.approx(1.0)
     assert set(weights.index) == {"000001.SZ", "000002.SZ"}
     assert snapshot["cash_weight"] != 0.0
+
+
+def test_benchmark_seed_is_cost_free_and_fully_invested(tmp_path: Path) -> None:
+    market_path = tmp_path / "market.parquet"
+    _market().to_parquet(market_path, index=False)
+    day = load_stockdemo_market(
+        market_path, start_date=20230102, end_date=20230102
+    ).set_index("ticker")
+    state = StockDemoPortfolioState.initial(1_000_000.0)
+
+    seed_stockdemo_state(
+        state=state,
+        target=pd.Series({"000001.SZ": 0.50, "000002.SZ": 0.50}),
+        day=day,
+    )
+
+    assert state.cash == pytest.approx(0.0)
+    assert state.first_execution is False
+    seeded_value = sum(
+        volume * float(day.loc[ticker, "ideal_trade_price"])
+        for ticker, volume in state.holdings.items()
+    )
+    assert seeded_value == pytest.approx(1_000_000.0)
 
 
 def test_positive_target_missing_market_fails_loudly(tmp_path: Path) -> None:

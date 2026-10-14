@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-file", type=Path)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument(
+        "--valuation-end-date",
+        help="Optional final mark-to-market date after the final signal/target execution; does not create a new trade.",
+    )
     parser.add_argument("--portfolio", choices=("signal", "target", "both"), default="signal")
     parser.add_argument("--longx", type=int, default=200)
     parser.add_argument("--keep", type=float, default=0.7)
@@ -149,6 +153,7 @@ def main() -> int:
                 config=config,
                 portfolio_name="signal_baseline",
                 terminal_events=terminal_events,
+                valuation_end_date=args.valuation_end_date,
             )
         if args.portfolio in {"target", "both"}:
             if args.target_weights_file is None:
@@ -165,6 +170,7 @@ def main() -> int:
                 config=config,
                 portfolio_name=args.target_portfolio,
                 terminal_events=terminal_events,
+                valuation_end_date=args.valuation_end_date,
             )
         output.mkdir(parents=True, exist_ok=True)
         (output / "summary.json").write_text(

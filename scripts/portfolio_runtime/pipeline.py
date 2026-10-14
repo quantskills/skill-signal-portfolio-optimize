@@ -312,6 +312,14 @@ def run_single_date(
         else load_candidate_universe(anchor_file, date, table_cache=table_cache)
     )
     source_anchor_weights = None
+    source_anchor_weight_diagnostics: dict[str, Any] = {
+        "provided_anchor_weight_before_risk_filter": None,
+        "provided_anchor_asset_count_before_risk_filter": None,
+        "provided_anchor_weight_retained_before_renormalization": None,
+        "provided_anchor_weight_dropped_by_risk_filter": 0.0,
+        "provided_anchor_asset_count_dropped_by_risk_filter": 0,
+        "provided_anchor_weight_renormalization_factor": None,
+    }
     if anchor_weights_file is not None:
         source_anchor_weights = load_weight_series(
             anchor_weights_file,
@@ -334,6 +342,16 @@ def run_single_date(
                 "anchor weights contain positive ticker(s) outside the anchor "
                 f"universe: {list(outside_anchor[:10])}"
             )
+        source_anchor_weight_diagnostics.update(
+            {
+                "provided_anchor_weight_before_risk_filter": float(
+                    source_anchor_weights.sum()
+                ),
+                "provided_anchor_asset_count_before_risk_filter": int(
+                    source_anchor_weights.gt(tolerance).sum()
+                ),
+            }
+        )
     outside_anchor_source = source_anchor_candidates.difference(source_candidates)
     if len(outside_anchor_source):
         raise InputDataError(
@@ -426,6 +444,41 @@ def run_single_date(
         source_anchor_weights = pd.Series(
             1.0 / top_n, index=available_anchor[:top_n], dtype=float
         )
+    elif source_anchor_weights is not None:
+        # Periodic risk models may not cover a source-anchor name even though
+        # the supplied anchor itself was fully invested. The optimizer cannot
+        # allocate to an uncovered asset, so retain the surviving source
+        # weights and re-normalize within the eligible candidate universe.
+        # This is an explicit same-date repair rather than a substitution with
+        # a future signal or a non-candidate security.
+        source_anchor_weights = source_anchor_weights.reindex(
+            candidates, fill_value=0.0
+        )
+        retained_anchor_weight = float(source_anchor_weights.sum())
+        if retained_anchor_weight <= tolerance:
+            raise InputDataError(
+                "risk/tradability filtering removed every positive anchor weight"
+            )
+        source_anchor_weight_diagnostics.update(
+            {
+                "provided_anchor_weight_retained_before_renormalization": (
+                    retained_anchor_weight
+                ),
+                "provided_anchor_weight_dropped_by_risk_filter": float(
+                    1.0 - retained_anchor_weight
+                ),
+                "provided_anchor_asset_count_dropped_by_risk_filter": int(
+                    source_anchor_weight_diagnostics[
+                        "provided_anchor_asset_count_before_risk_filter"
+                    ]
+                    - source_anchor_weights.gt(tolerance).sum()
+                ),
+                "provided_anchor_weight_renormalization_factor": float(
+                    1.0 / retained_anchor_weight
+                ),
+            }
+        )
+        source_anchor_weights = source_anchor_weights / retained_anchor_weight
     benchmark = benchmark_input.reindex(universe, fill_value=0.0)
     current = (
         None if current_input is None else current_input.reindex(universe, fill_value=0.0)
@@ -723,6 +776,7 @@ def run_single_date(
                 else int(source_anchor_weights.gt(tolerance).sum())
             ),
             "provided_anchor_weight": float(optimization_anchor.sum()),
+            **source_anchor_weight_diagnostics,
             "anchor_missing_from_risk_count": int(len(anchor_missing_from_risk)),
             "anchor_missing_from_risk_ticker_sha256": _ticker_index_hash(
                 anchor_missing_from_risk

@@ -25,7 +25,7 @@ from .backtest import (
 from .config import load_config
 from .cost import resolve_linear_cost_bps
 from .dynamic_risk import DynamicRiskModelCache
-from .errors import InputDataError
+from .errors import InputDataError, OptimizationError
 from .io import (
     DateTableCache,
     load_candidate_universe,
@@ -49,6 +49,7 @@ from .stockdemo_compat import (
     load_stockdemo_market,
     load_stockdemo_signal,
     run_stockdemo_compat,
+    seed_stockdemo_state,
 )
 
 
@@ -573,6 +574,15 @@ def _diagnostic_rows(
         "solver_backend": solver.get("backend"),
         "solver_name": solver.get("solver"),
         "objective_mode": solver.get("objective_mode"),
+        "feasibility_mode": solver.get("feasibility_mode", "strict"),
+        "repair_attempt": solver.get("repair_attempt"),
+        "repair_profile": solver.get("repair_profile"),
+        "original_constraints_strict": solver.get(
+            "original_constraints_strict", True
+        ),
+        "repair_errors_before_success": json.dumps(
+            solver.get("repair_errors_before_success", []), sort_keys=True
+        ),
         "selection_mode": optimization_summary.get("selection_mode"),
         "selection_pool_size": optimization_summary.get("selection_pool_size"),
         "selection_effective_pool_size": optimization_summary.get(
@@ -698,19 +708,24 @@ def _diagnostic_rows(
         ],
     }
     exposure_rows: list[dict[str, Any]] = []
-    for kind, values in (
-        ("industry", constraints["industry_exposures"]),
-        ("style", constraints["style_exposures"]),
+    for portfolio, portfolio_constraints in (
+        ("equal_weight_signal", constraint_payload["equal_weight_signal"]["constraints"]),
+        ("risk_optimized", constraints),
     ):
-        for name, detail in values.items():
-            exposure_rows.append(
-                {
-                    "date": date,
-                    "exposure_type": kind,
-                    "name": name,
-                    **detail,
-                }
-            )
+        for kind, values in (
+            ("industry", portfolio_constraints["industry_exposures"]),
+            ("style", portfolio_constraints["style_exposures"]),
+        ):
+            for name, detail in values.items():
+                exposure_rows.append(
+                    {
+                        "date": date,
+                        "portfolio": portfolio,
+                        "exposure_type": kind,
+                        "name": name,
+                        **detail,
+                    }
+                )
     return row, exposure_rows
 
 
@@ -800,6 +815,7 @@ def run_rolling_experiment(
     risk_industry_file: str | Path | None = None,
     dynamic_risk_cache_root: str | Path | None = None,
     checkpoint_root: str | Path | None = None,
+    on_optimization_failure: str = "error",
     stockdemo_market_file: str | Path | None = None,
     stockdemo_twap_file: str | Path | None = None,
     stockdemo_transaction: float = 1.4,
@@ -820,6 +836,10 @@ def run_rolling_experiment(
     if missing_security_policy not in {"auto", "error", "freeze_last"}:
         raise InputDataError(
             "missing_security_policy must be auto, error, or freeze_last"
+        )
+    if on_optimization_failure not in {"error", "carry_forward"}:
+        raise InputDataError(
+            "on_optimization_failure must be error or carry_forward"
         )
     if initial_position_policy not in {"benchmark", "cash"}:
         raise InputDataError("initial_position_policy must be benchmark or cash")
@@ -954,6 +974,13 @@ def run_rolling_experiment(
     execution_market_dates: list[str] = []
     execution_market_positions: dict[str, int] = {}
     execution_state: StockDemoPortfolioState | None = None
+    execution_initialization: dict[str, Any] = {
+        "policy": initial_position_policy,
+        "seeded": False,
+        "seed_date": None,
+        "seed_asset_count": 0,
+        "seed_transaction_cost": 0.0,
+    }
     execution_feedback_rows: list[dict[str, Any]] = []
     execution_market_fingerprint: str | None = None
     terminal_events: dict[str, frozenset[str]] | None = None
@@ -1032,8 +1059,26 @@ def run_rolling_experiment(
         position_policy=initial_position_policy,
     )
     current = initial.copy()
+    if execution_state is not None and initial_position_policy == "benchmark":
+        seed_date = dates[0]
+        seed_stockdemo_state(
+            state=execution_state,
+            target=initial,
+            day=execution_by_date[seed_date],
+        )
+        execution_initialization.update(
+            {
+                "seeded": True,
+                "seed_date": seed_date,
+                "seed_asset_count": int(initial.gt(tolerance).sum()),
+            }
+        )
     previous_target: pd.Series | None = None
+    previous_equal_weight_target: pd.Series | None = None
+    # A carried rebalance has an audit target but deliberately submits no order.
+    previous_execution_target: pd.Series | None = None
     previous_date: str | None = None
+    execution_target_dates: set[str] = set()
     weight_frames: list[pd.DataFrame] = []
     diagnostic_rows: list[dict[str, Any]] = []
     exposure_rows: list[dict[str, Any]] = []
@@ -1067,6 +1112,7 @@ def run_rolling_experiment(
         ),
         "benchmark_sha256": sha256_file(benchmark_file),
         "risk_refresh_frequency": risk_refresh_frequency,
+        "on_optimization_failure": on_optimization_failure,
         "missing_security_policy": effective_missing_security_policy,
         "tradability_sha256": (
             None if tradability_file is None else sha256_file(tradability_file)
@@ -1189,7 +1235,7 @@ def run_rolling_experiment(
                     )
                 actual_weights = pd.Series(dtype=float)
                 for offset, market_date in enumerate(advance_dates):
-                    target = previous_target if offset == 0 else None
+                    target = previous_execution_target if offset == 0 else None
                     snapshot, _, _, actual_weights = advance_stockdemo_state(
                         state=execution_state,
                         date=market_date,
@@ -1569,6 +1615,96 @@ def run_rolling_experiment(
                         )
                         os.replace(build_output, date_output)
                     checkpoint_built_count += 1
+                except OptimizationError as exc:
+                    if build_output.exists():
+                        shutil.rmtree(build_output)
+                    if (
+                        on_optimization_failure != "carry_forward"
+                        or previous_target is None
+                        or previous_equal_weight_target is None
+                        or float(current.sum()) <= tolerance
+                    ):
+                        raise
+
+                    fallback_optimized = current.loc[current.abs() > tolerance].copy()
+                    fallback_optimized = fallback_optimized / float(fallback_optimized.sum())
+                    fallback_equal_weight = previous_equal_weight_target.loc[
+                        previous_equal_weight_target.abs() > tolerance
+                    ].copy()
+                    fallback_equal_weight = fallback_equal_weight / float(
+                        fallback_equal_weight.sum()
+                    )
+                    weights = pd.concat(
+                        [
+                            pd.DataFrame(
+                                {
+                                    "date": date,
+                                    "ticker": fallback_equal_weight.index,
+                                    "portfolio": "equal_weight_signal",
+                                    "target_weight": fallback_equal_weight.to_numpy(
+                                        dtype=float
+                                    ),
+                                    "optimization_status": "carried_forward",
+                                    "optimization_failure": str(exc),
+                                }
+                            ),
+                            pd.DataFrame(
+                                {
+                                    "date": date,
+                                    "ticker": fallback_optimized.index,
+                                    "portfolio": "risk_optimized",
+                                    "target_weight": fallback_optimized.to_numpy(
+                                        dtype=float
+                                    ),
+                                    "optimization_status": "carried_forward",
+                                    "optimization_failure": str(exc),
+                                }
+                            ),
+                        ],
+                        ignore_index=True,
+                    )
+                    previous_target = fallback_optimized
+                    previous_equal_weight_target = fallback_equal_weight
+                    previous_execution_target = None
+                    previous_date = date
+                    weight_frames.append(weights)
+                    diagnostic_rows.append(
+                        {
+                            "date": date,
+                            "optimization_status": "carried_forward",
+                            "optimization_failure_policy": on_optimization_failure,
+                            "optimization_failure_type": type(exc).__name__,
+                            "optimization_failure": str(exc),
+                            "constraints_passed": False,
+                            "current_state_source": (
+                                "stockdemo_actual"
+                                if feedback_cash_weight is not None
+                                else "theoretical_drift"
+                            ),
+                            "actual_cash_weight": feedback_cash_weight,
+                            "one_way_turnover": 0.0,
+                            "estimated_transaction_cost": 0.0,
+                            "solver_backend": None,
+                            "backend_fallback_used": False,
+                        }
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "status": "fallback",
+                                "stage": "portfolio_optimization",
+                                "date": date,
+                                "action": "carry_forward",
+                                "error_type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 except BaseException:
                     if checkpoint_path is not None and build_output.exists():
                         shutil.rmtree(build_output)
@@ -1577,6 +1713,8 @@ def run_rolling_experiment(
             execution_anchor_override_count = 0
             if (
                 stockdemo_signal_anchor
+                and portfolio_config["optimizer"]["objective_mode"]
+                == "risk_aware_selection"
                 and float(portfolio_config["selection"]["risk_penalty"]) == 0.0
             ):
                 risk_rows = weights.loc[
@@ -1613,6 +1751,11 @@ def run_rolling_experiment(
             previous_target = weights.loc[
                 weights["portfolio"].eq("risk_optimized")
             ].set_index("ticker")["target_weight"].astype(float)
+            previous_equal_weight_target = weights.loc[
+                weights["portfolio"].eq("equal_weight_signal")
+            ].set_index("ticker")["target_weight"].astype(float)
+            previous_execution_target = previous_target
+            execution_target_dates.add(date)
             previous_date = date
             diagnostic, exposures = _diagnostic_rows(
                 date,
@@ -1623,7 +1766,14 @@ def run_rolling_experiment(
             )
             diagnostic.update(
                 {
+                    "optimization_status": "solved",
+                    "optimization_failure_policy": on_optimization_failure,
+                    "optimization_failure_type": None,
+                    "optimization_failure": None,
                     "current_state_source": (
+                        "benchmark_seeded"
+                        if position == 1 and execution_initialization["seeded"]
+                        else
                         "stockdemo_actual"
                         if feedback_cash_weight is not None
                         else "configured_initial_or_theoretical_drift"
@@ -1638,6 +1788,8 @@ def run_rolling_experiment(
                     "synthetic_nontradable_count": synthetic_nontradable_count,
                     "execution_anchor_override_applied": (
                         stockdemo_signal_anchor
+                        and portfolio_config["optimizer"]["objective_mode"]
+                        == "risk_aware_selection"
                         and float(
                             portfolio_config["selection"]["risk_penalty"]
                         ) == 0.0
@@ -1695,7 +1847,7 @@ def run_rolling_experiment(
                 date=final_execution_date,
                 day=execution_by_date[final_execution_date],
                 fee_rate=execution_config.one_side_fee,
-                target=previous_target,
+                target=previous_execution_target,
                 missing_target_policy=execution_config.missing_target_policy,
                 missing_held_policy=execution_config.missing_held_policy,
                 terminal_events=terminal_events,
@@ -1703,7 +1855,11 @@ def run_rolling_experiment(
             execution_feedback_rows.append(
                 {
                     **snapshot,
-                    "target_date": previous_date,
+                    "target_date": (
+                        previous_date
+                        if previous_execution_target is not None
+                        else None
+                    ),
                     "next_rebalance_date": None,
                 }
             )
@@ -1716,7 +1872,8 @@ def run_rolling_experiment(
                 temporary / "execution_feedback.parquet", index=False
             )
             optimized_targets = rebalance_weights.loc[
-                rebalance_weights["portfolio"].eq("risk_optimized"),
+                rebalance_weights["portfolio"].eq("risk_optimized")
+                & rebalance_weights["date"].isin(execution_target_dates),
                 ["date", "ticker", "target_weight"],
             ].copy()
             stockdemo_summary = run_stockdemo_compat(
@@ -1726,6 +1883,10 @@ def run_rolling_experiment(
                 config=execution_config,
                 portfolio_name="risk_optimized",
                 terminal_events=terminal_events,
+                initial_target=(
+                    initial if initial_position_policy == "benchmark" else None
+                ),
+                valuation_end_date=calendar[positions[dates[-1]] + 1],
             )
             stockdemo_summary["output_dir"] = str(destination / "stockdemo_compat")
             _write_json(
@@ -1853,6 +2014,11 @@ def run_rolling_experiment(
                 diagnostics["solver_backend"].dropna().astype(str).unique().tolist()
             ),
             "rebalance_count": len(dates),
+            "carried_forward_rebalance_count": int(
+                diagnostics.get(
+                    "optimization_status", pd.Series(dtype=str)
+                ).eq("carried_forward").sum()
+            ),
             "all_constraints_passed": bool(diagnostics["constraints_passed"].all()),
             "fallback_count": int(diagnostics["backend_fallback_used"].sum()),
             "solver_performance": {
@@ -2064,6 +2230,7 @@ def run_rolling_experiment(
             "cost_model_resolution": cost_resolution,
             "risk_form": risk_form,
             "risk_refresh_frequency": risk_refresh_frequency,
+            "on_optimization_failure": on_optimization_failure,
             "initial_position_policy": initial_position_policy,
             "stockdemo_signal_anchor": stockdemo_signal_anchor,
             "stockdemo_signal_anchor_sha256": (
@@ -2111,6 +2278,7 @@ def run_rolling_experiment(
                     if execution_config is None
                     else "actual closing stock market values normalized to one; cash is disclosed separately"
                 ),
+                "initialization": execution_initialization,
                 "summary": stockdemo_summary,
             },
             "inputs": manifest_inputs,

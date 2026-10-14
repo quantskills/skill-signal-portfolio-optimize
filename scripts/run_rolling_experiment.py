@@ -84,6 +84,15 @@ def parse_args() -> argparse.Namespace:
         help="Persistent date/signature checkpoints used to resume rolling optimization.",
     )
     parser.add_argument(
+        "--on-optimization-failure",
+        choices=("error", "carry_forward"),
+        default="error",
+        help=(
+            "On an infeasible/failed rebalance, either stop (error) or submit no "
+            "new order and carry the prior executable portfolio until the next date."
+        ),
+    )
+    parser.add_argument(
         "--stockdemo-market-file",
         type=Path,
         help=(
@@ -175,6 +184,7 @@ def main() -> int:
             risk_industry_file=args.risk_industry_file,
             dynamic_risk_cache_root=args.dynamic_risk_cache_root,
             checkpoint_root=args.checkpoint_root,
+            on_optimization_failure=args.on_optimization_failure,
             stockdemo_market_file=args.stockdemo_market_file,
             stockdemo_twap_file=args.stockdemo_twap_file,
             stockdemo_transaction=args.stockdemo_transaction,

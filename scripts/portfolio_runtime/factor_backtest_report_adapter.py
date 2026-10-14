@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -249,11 +250,17 @@ def render_factor_backtest_compatible_report(config: FactorBacktestReportConfig)
     report.buy_data = buy_data
     report.mask_isopen = buy_data.notna().astype(float)
     report._plot_module = sys.modules[plotter.__module__]
+    # The native report workflow fixes 150 DPI before rendering diagnostics.
+    # Set it explicitly so standalone target-weight reports retain the same
+    # canvas scale instead of inheriting a process-specific matplotlib default.
+    report._plot_module.plt.rcParams["figure.dpi"] = 150
     report.get_close_index = lambda *_args, **_kwargs: benchmark
     report.calc_weekly_winrate = MethodType(_compat_weekly_winrate, report)
 
     with _working_directory(config.factor_backtest_root.expanduser().resolve() / "scripts" / "backtest_engine"):
         plotter.plot(report)
+    # Keep the original artifact and provide the common lowercase display name.
+    shutil.copyfile(output_dir / "Pnl.png", output_dir / "pnl.png")
     stats.to_csv(output_dir / "stats_factor_backtest_compatible.csv", index_label="date")
     ics.to_csv(output_dir / "ICs.csv", index_label="date")
     manifest = {
@@ -269,7 +276,7 @@ def render_factor_backtest_compatible_report(config: FactorBacktestReportConfig)
         },
         "initial_cash": initial_cash,
         "benchmark_name": config.benchmark_name,
-        "outputs": ["Pnl.png", "winrate.png", "stats_factor_backtest_compatible.csv", "ICs.csv"],
+        "outputs": ["Pnl.png", "pnl.png", "winrate.png", "stats_factor_backtest_compatible.csv", "ICs.csv"],
     }
     (output_dir / "report_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

@@ -99,7 +99,7 @@ See docs/default-presets.md for the optimizer/execution parameter contract.
 - v1.3.1 can explicitly feed Stockdemo-executed closing holdings into the next rolling optimization; omitting the market flag preserves theoretical-drift behavior.
 - v1.3.2 uses `carry_forward` by default for legacy StockDemo parity, supports `terminal_writeoff` for confirmed terminal holdings, and keeps `error` as the fail-closed quality-check policy.
 - Missing tradability rows remain fail-closed by default. In StockDemo `carry_forward` rolling runs, `auto` maps them to `freeze_last`: missing candidates are excluded, while benchmark/current names stay in the universe and are frozen at current weight with explicit diagnostics.
-- Fail closed on missing covariance coverage, invalid weights, infeasible constraints, or non-finite inputs.
+- Fail closed by default on missing covariance coverage, invalid weights, infeasible constraints, or non-finite inputs. `--on-optimization-failure carry_forward` is an explicit rolling execution fallback: after all configured repair profiles fail, it submits no order for that date, retains the prior executable stock sleeve, and marks the date as carried forward in diagnostics.
 - Produce target weights, `optimization_summary.json`, and machine-readable diagnostics; do not place orders.
 
 ## Workflow
@@ -138,6 +138,15 @@ python scripts/run_single_date.py \
 5. Add `--current-weights-file` when turnover or frozen-position constraints apply.
 6. Add `--sector-file`, `--exposure-file`, or `--tradability-file` only when their corresponding constraints are enabled.
 7. Inspect `constraint_diagnostics.json` before consuming `target_weights.parquet`.
+8. After a rolling run, render active-exposure diagnostics without rerunning the optimizer:
+
+```bash
+python scripts/render_exposure_report.py \
+  --exposure-file /path/to/rolling_output/exposure_timeseries.parquet \
+  --output-dir /path/to/rolling_output/exposure_report
+```
+
+See [references/exposure-report.md](references/exposure-report.md) for the output contract.
 
 For a rolling experiment, read [references/backtest-contract.md](references/backtest-contract.md) and run:
 

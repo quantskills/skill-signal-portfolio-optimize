@@ -141,15 +141,21 @@ class SingleDatePipelineTest(unittest.TestCase):
         candidate_file: Path | None = None,
         anchor_weights_file: Path | None = None,
         missing_security_policy: str = "error",
+        candidate_universe: pd.Index | None = None,
+        benchmark_file: Path | None = None,
+        current_weights_file: Path | None = None,
     ) -> dict[str, object]:
         return run_single_date(
             config_path=self.config,
             signal_file=self.signal,
             candidate_file=candidate_file,
             anchor_weights_file=anchor_weights_file,
+            candidate_universe=candidate_universe,
             covariance_file=self.covariance,
-            benchmark_file=self.benchmark,
-            current_weights_file=self.current,
+            benchmark_file=self.benchmark if benchmark_file is None else benchmark_file,
+            current_weights_file=(
+                self.current if current_weights_file is None else current_weights_file
+            ),
             sector_file=self.sectors,
             exposure_file=self.exposures,
             tradability_file=self.tradability,
@@ -259,6 +265,59 @@ class SingleDatePipelineTest(unittest.TestCase):
         self.assertEqual(
             json.loads((output / "run_manifest.json").read_text())["inputs"]["anchor_weights"]["path"],
             str(anchor.resolve()),
+        )
+
+    def test_anchor_weights_are_renormalized_after_candidate_filter(self) -> None:
+        anchor = self.root / "anchor_weights.csv"
+        pd.DataFrame(
+            {
+                "date": self.date,
+                "ticker": self.tickers,
+                "anchor_weight": [0.20, 0.20, 0.20, 0.20, 0.10, 0.10],
+            }
+        ).to_csv(anchor, index=False)
+        eligible = self.tickers[:-1]
+        benchmark = self.root / "filtered_benchmark.csv"
+        current = self.root / "filtered_current.csv"
+        pd.DataFrame(
+            {
+                "date": self.date,
+                "ticker": eligible,
+                "benchmark_weight": [1.0 / len(eligible)] * len(eligible),
+            }
+        ).to_csv(benchmark, index=False)
+        pd.DataFrame(
+            {
+                "date": self.date,
+                "ticker": eligible,
+                "current_weight": [1.0 / len(eligible)] * len(eligible),
+            }
+        ).to_csv(current, index=False)
+        result = self.run_pipeline(
+            "filtered-anchor-output",
+            anchor_weights_file=anchor,
+            candidate_universe=pd.Index(eligible, name="ticker"),
+            benchmark_file=benchmark,
+            current_weights_file=current,
+        )
+        output = Path(result["output_dir"])
+        weights = pd.read_parquet(output / "target_weights.parquet")
+        optimized = weights.loc[weights["portfolio"] == "risk_optimized"]
+        self.assertAlmostEqual(float(optimized["anchor_weight"].sum()), 1.0, places=7)
+        self.assertNotIn(self.tickers[-1], set(optimized["ticker"]))
+        diagnostics = json.loads((output / "signal_diagnostics.json").read_text())
+        self.assertAlmostEqual(
+            diagnostics["provided_anchor_weight_retained_before_renormalization"],
+            0.9,
+            places=7,
+        )
+        self.assertAlmostEqual(
+            diagnostics["provided_anchor_weight_dropped_by_risk_filter"],
+            0.1,
+            places=7,
+        )
+        self.assertEqual(
+            diagnostics["provided_anchor_asset_count_dropped_by_risk_filter"], 1
         )
 
     def test_indexed_parquet_exposures_are_supported(self) -> None:

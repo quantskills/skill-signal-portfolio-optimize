@@ -34,6 +34,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--terminal-events-file", type=Path)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument(
+        "--valuation-end-date",
+        help="Optional final mark-to-market date after the last target execution; does not create a new trade.",
+    )
     parser.add_argument("--transaction", type=float, default=1.4)
     parser.add_argument("--initial-cash", type=float, default=100_000_000.0)
     parser.add_argument("--locked-limit", type=float, default=0.095)
@@ -74,6 +78,7 @@ def main() -> int:
             missing_target_policy=args.missing_target_policy,
             missing_held_policy=args.missing_held_policy,
             include_final_next_execution=args.include_final_next_execution,
+            valuation_end_date=args.valuation_end_date,
         ),
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))

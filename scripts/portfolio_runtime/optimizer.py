@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -1614,7 +1615,7 @@ def _optimize_risk_aware_selection(
     return OptimizationResult(weights=weights, solver=solver, constraints=report)
 
 
-def optimize_portfolio(
+def _optimize_portfolio_strict(
     expected_return: pd.Series,
     covariance: pd.DataFrame | PortfolioRisk,
     benchmark: pd.Series,
@@ -1819,3 +1820,89 @@ def optimize_portfolio(
         )
     result.solver["backend_fallback_used"] = bool(backend == "auto")
     return result
+
+
+def _repair_constraint_profiles(
+    constraint_config: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return progressively relaxed copies without relaxing hard stock rules."""
+    profiles: list[tuple[str, dict[str, Any]]] = [("strict", dict(constraint_config))]
+
+    def relaxed(multiplier: float, *, relax_te: bool, relax_turnover: bool) -> dict[str, Any]:
+        value = deepcopy(constraint_config)
+        industry = value.get("industry_active_range")
+        if industry is not None:
+            value["industry_active_range"] = {
+                "default": None if industry.get("default") is None else {
+                    "lower_active": industry["default"]["lower_active"] * multiplier,
+                    "upper_active": industry["default"]["upper_active"] * multiplier,
+                },
+                "overrides": {
+                    name: {
+                        "lower_active": spec["lower_active"] * multiplier,
+                        "upper_active": spec["upper_active"] * multiplier,
+                    }
+                    for name, spec in industry.get("overrides", {}).items()
+                },
+            }
+        styles = value.get("style_active_ranges")
+        if styles is not None:
+            value["style_active_ranges"] = {
+                name: ({"enabled": False} if not spec.get("enabled", True) else {
+                    "enabled": True,
+                    "lower_active": spec["lower_active"] * multiplier,
+                    "upper_active": spec["upper_active"] * multiplier,
+                })
+                for name, spec in styles.items()
+            }
+        if relax_te and value.get("max_tracking_error") is not None:
+            value["max_tracking_error"] = float(value["max_tracking_error"]) * multiplier
+        if relax_turnover and value.get("max_turnover") is not None:
+            value["max_turnover"] = min(float(value["max_turnover"]) * multiplier, 1.0)
+        return value
+
+    profiles.append(("risk_bands_x2", relaxed(2.0, relax_te=False, relax_turnover=False)))
+    profiles.append(("risk_bands_x2_te_turnover_x1_25", relaxed(2.0, relax_te=True, relax_turnover=True)))
+    return profiles
+
+
+def optimize_portfolio(
+    expected_return: pd.Series,
+    covariance: pd.DataFrame | PortfolioRisk,
+    benchmark: pd.Series,
+    current: pd.Series | None,
+    sectors: pd.Series | None,
+    exposures: pd.DataFrame | None,
+    tradable: pd.Series,
+    optimizer_config: dict[str, Any],
+    constraint_config: dict[str, Any],
+    **kwargs: Any,
+) -> OptimizationResult:
+    """Run strict optimization or an explicit, auditable repair retry."""
+    mode = str(optimizer_config.get("feasibility_mode", "strict"))
+    if mode == "strict":
+        return _optimize_portfolio_strict(
+            expected_return, covariance, benchmark, current, sectors, exposures,
+            tradable, optimizer_config, constraint_config, **kwargs,
+        )
+    if mode != "repair":
+        raise OptimizationError(f"unsupported feasibility_mode: {mode}")
+    errors: list[str] = []
+    for attempt, (profile, constraints) in enumerate(_repair_constraint_profiles(constraint_config), start=1):
+        try:
+            result = _optimize_portfolio_strict(
+                expected_return, covariance, benchmark, current, sectors, exposures,
+                tradable, {**optimizer_config, "feasibility_mode": "strict"}, constraints,
+                **kwargs,
+            )
+            result.solver.update({
+                "feasibility_mode": "repair",
+                "repair_attempt": attempt,
+                "repair_profile": profile,
+                "original_constraints_strict": attempt == 1,
+                "repair_errors_before_success": errors,
+            })
+            return result
+        except OptimizationError as error:
+            errors.append(f"{profile}: {error}")
+    raise OptimizationError("feasibility repair exhausted: " + " | ".join(errors))

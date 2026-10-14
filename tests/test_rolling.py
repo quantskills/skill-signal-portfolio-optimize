@@ -22,7 +22,7 @@ from portfolio_runtime.backtest import (  # noqa: E402
     summarize_backtest,
 )
 from portfolio_runtime.config import DEFAULT_CONFIG  # noqa: E402
-from portfolio_runtime.errors import InputDataError  # noqa: E402
+from portfolio_runtime.errors import InputDataError, OptimizationError  # noqa: E402
 from portfolio_runtime.io import DateTableCache  # noqa: E402
 from portfolio_runtime.rolling import (  # noqa: E402
     ROLLING_OUTPUT_FILES,
@@ -410,6 +410,179 @@ def test_rolling_experiment_writes_stable_outputs(tmp_path: Path) -> None:
     ]
 
 
+def test_rolling_can_carry_forward_after_optimization_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dates = [20230102, 20230103, 20230104]
+    tickers = ["000001.SZ", "000002.SZ"]
+    signal = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "prediction": float(2 - index)}
+            for date in dates[:2]
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    benchmark = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "benchmark_weight": 0.5}
+            for date in dates[:2]
+            for ticker in tickers
+        ]
+    )
+    returns = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "return": 0.001 * (index + 1)}
+            for date in dates
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    signal_path = tmp_path / "signal.parquet"
+    benchmark_path = tmp_path / "benchmark.parquet"
+    returns_path = tmp_path / "returns.parquet"
+    covariance_path = tmp_path / "covariance.parquet"
+    config_path = tmp_path / "config.yaml"
+    signal.to_parquet(signal_path, index=False)
+    benchmark.to_parquet(benchmark_path, index=False)
+    returns.to_parquet(returns_path, index=False)
+    pd.DataFrame(np.eye(2) * 0.10, index=tickers, columns=tickers).to_parquet(
+        covariance_path
+    )
+    config = deepcopy(DEFAULT_CONFIG)
+    config["constraints"].update({"max_weight": 0.8, "max_active_weight": 0.6})
+    config["baseline"]["top_n"] = 2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    import portfolio_runtime.rolling as rolling_module
+
+    original = rolling_module.run_single_date
+    calls = 0
+
+    def fail_on_second_date(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OptimizationError("deliberate infeasible test")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(rolling_module, "run_single_date", fail_on_second_date)
+    output = tmp_path / "output"
+    result = run_rolling_experiment(
+        config_path=config_path,
+        signal_file=signal_path,
+        covariance_root=covariance_path,
+        benchmark_file=benchmark_path,
+        asset_returns_file=returns_path,
+        end_date="20230103",
+        on_optimization_failure="carry_forward",
+        output_dir=output,
+    )
+
+    assert result["status"] == "success"
+    diagnostics = pd.read_parquet(output / "optimization_diagnostics.parquet")
+    assert diagnostics["optimization_status"].tolist() == ["solved", "carried_forward"]
+    assert diagnostics.loc[1, "optimization_failure_type"] == "OptimizationError"
+    summary = json.loads((output / "optimization_summary.json").read_text())
+    assert summary["carried_forward_rebalance_count"] == 1
+    manifest = json.loads((output / "rolling_manifest.json").read_text())
+    assert manifest["on_optimization_failure"] == "carry_forward"
+
+
+def test_stockdemo_carry_forward_submits_no_order_on_failed_rebalance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dates = [20230102, 20230103, 20230104]
+    tickers = ["000001.SZ", "000002.SZ"]
+    signal = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "prediction": float(2 - index)}
+            for date in dates[:2]
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    benchmark = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "benchmark_weight": 0.5}
+            for date in dates[:2]
+            for ticker in tickers
+        ]
+    )
+    returns = pd.DataFrame(
+        [
+            {"date": date, "ticker": ticker, "return": 0.001 * (index + 1)}
+            for date in dates
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    market = pd.DataFrame(
+        [
+            {
+                "date": date,
+                "ticker": ticker,
+                "open": 100.0 + 10.0 * index,
+                "close": (100.0 + 10.0 * index) * (1.0 + 0.001 * date_index),
+                "pre_close": 100.0 + 10.0 * index,
+                "twap": 100.0 + 10.0 * index,
+                "is_open": True,
+                "is_st": False,
+                "adj_factor": 1.0,
+            }
+            for date_index, date in enumerate(dates)
+            for index, ticker in enumerate(tickers)
+        ]
+    )
+    signal_path = tmp_path / "signal.parquet"
+    benchmark_path = tmp_path / "benchmark.parquet"
+    returns_path = tmp_path / "returns.parquet"
+    market_path = tmp_path / "market.parquet"
+    covariance_path = tmp_path / "covariance.parquet"
+    config_path = tmp_path / "config.yaml"
+    signal.to_parquet(signal_path, index=False)
+    benchmark.to_parquet(benchmark_path, index=False)
+    returns.to_parquet(returns_path, index=False)
+    market.to_parquet(market_path, index=False)
+    pd.DataFrame(np.eye(2) * 0.10, index=tickers, columns=tickers).to_parquet(
+        covariance_path
+    )
+    config = deepcopy(DEFAULT_CONFIG)
+    config["constraints"].update({"max_weight": 0.8, "max_active_weight": 0.6})
+    config["baseline"]["top_n"] = 2
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    import portfolio_runtime.rolling as rolling_module
+
+    original = rolling_module.run_single_date
+    calls = 0
+
+    def fail_on_second_date(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OptimizationError("deliberate infeasible test")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(rolling_module, "run_single_date", fail_on_second_date)
+    output = tmp_path / "output"
+    run_rolling_experiment(
+        config_path=config_path,
+        signal_file=signal_path,
+        covariance_root=covariance_path,
+        benchmark_file=benchmark_path,
+        asset_returns_file=returns_path,
+        stockdemo_market_file=market_path,
+        end_date="20230103",
+        on_optimization_failure="carry_forward",
+        output_dir=output,
+    )
+
+    feedback = pd.read_parquet(output / "execution_feedback.parquet")
+    assert feedback["target_date"].dropna().tolist() == ["20230102"]
+    assert feedback.iloc[-1]["date"] == "20230104"
+    diagnostics = pd.read_parquet(output / "optimization_diagnostics.parquet")
+    assert diagnostics["optimization_status"].tolist() == ["solved", "carried_forward"]
+    stats = pd.read_csv(output / "stockdemo_compat" / "stats.csv")
+    assert stats["date"].tolist() == [20230103, 20230104]
+
+
 def test_rolling_rejects_exposure_file_and_root_together(tmp_path: Path) -> None:
     with pytest.raises(InputDataError, match="only one"):
         run_rolling_experiment(
@@ -552,7 +725,7 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
     assert pd.isna(feedback.iloc[-1]["next_rebalance_date"])
     diagnostics = pd.read_parquet(output / "optimization_diagnostics.parquet")
     assert diagnostics["current_state_source"].tolist() == [
-        "configured_initial_or_theoretical_drift",
+        "benchmark_seeded",
         "stockdemo_actual",
         "stockdemo_actual",
     ]
@@ -566,6 +739,13 @@ def test_rolling_stockdemo_feedback_uses_actual_executed_holdings(tmp_path: Path
     )
     manifest = json.loads((output / "rolling_manifest.json").read_text())
     assert manifest["execution_feedback"]["enabled"] is True
+    assert manifest["execution_feedback"]["initialization"] == {
+        "policy": "benchmark",
+        "seeded": True,
+        "seed_date": "20230102",
+        "seed_asset_count": 2,
+        "seed_transaction_cost": 0.0,
+    }
     assert manifest["execution_feedback"]["summary"]["output_dir"] == str(
         output / "stockdemo_compat"
     )

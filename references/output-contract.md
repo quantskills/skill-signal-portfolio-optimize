@@ -61,7 +61,15 @@ equal-weight, optimized, and simulated benchmark portfolios. `portfolio_metrics.
 geometrically annualized excess return, realized tracking error, information ratio, ending
 active NAV, and maximum active drawdown. `optimization_diagnostics.parquet` includes scalar slacks for turnover, tracking error, stock limits, and candidate-weight bounds. Conic runs additionally include solve and compile seconds, cache key and hit status, DPP status, warm-start request, risk-operator rows, and tracking-error formulation. Conservative-blend runs additionally carry the blend and predicted-risk diagnostics through this daily table.
 
+When `optimizer.feasibility_mode: repair` is explicitly enabled, the same table
+also records `feasibility_mode`, `repair_attempt`, `repair_profile`,
+`original_constraints_strict`, and rejected earlier profiles. This makes a
+relaxed result distinguishable from a strict feasible result; stock bounds,
+tradability, frozen positions, and full-investment constraints remain hard.
+
 With missing-security handling enabled, rolling diagnostics also expose `missing_security_policy`, `synthetic_nontradable_asset_count`, and `excluded_missing_candidate_count`; the rolling manifest records the resolved policy in checkpoint provenance.
+
+`--on-optimization-failure error` is the default and stops on an infeasible solve. With the explicit `carry_forward` policy, only an `OptimizationError` after all configured feasibility-repair profiles causes a no-order rebalance: the prior actual stock sleeve is retained, the date is excluded from target execution, and the run records `optimization_status=carried_forward`, the original error type/message, and `carried_forward_rebalance_count`. This is an execution-continuity fallback, not a relaxed optimum; `constraints_passed` is `false` for that date.
 
 `optimization_summary.json` aggregates constraint binding counts and ratios, signal-capture minimum/mean/maximum, signal utility loss, turnover, estimated cost, runtime, backend, risk form, and dynamic-risk cache reuse. Its `solver_performance` section separately aggregates Clarabel solve time, problem compile time, and parameterized-problem cache hit count and ratio.
 

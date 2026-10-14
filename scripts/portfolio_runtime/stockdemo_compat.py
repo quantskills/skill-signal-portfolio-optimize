@@ -634,6 +634,69 @@ class StockDemoPortfolioState:
         return cls(cash=float(initial_cash), holdings={}, holding_adj={})
 
 
+def _seed_positions(
+    *,
+    initial_cash: float,
+    target: pd.Series,
+    day: pd.DataFrame,
+) -> tuple[float, dict[str, float], dict[str, float], dict[str, float]]:
+    """Create a cost-free initial portfolio from a supplied full-investment target."""
+    weights = pd.to_numeric(target.copy(), errors="coerce")
+    weights.index = pd.Index(
+        [normalize_ticker(value) for value in weights.index], name="ticker"
+    )
+    if weights.index.duplicated().any():
+        raise InputDataError("initial target contains duplicate tickers")
+    if weights.isna().any() or not np.isfinite(weights.to_numpy(dtype=float)).all():
+        raise InputDataError("initial target contains missing or non-finite weights")
+    if weights.lt(-1.0e-12).any():
+        raise InputDataError("initial target contains negative weights")
+    positive = weights.loc[weights.gt(1.0e-12)]
+    if positive.empty or not np.isclose(float(positive.sum()), 1.0, atol=1.0e-8):
+        raise InputDataError("initial target must be fully invested")
+    missing = positive.index.difference(day.index)
+    if len(missing):
+        raise InputDataError(
+            "initial target contains ticker(s) absent from the seed market date: "
+            f"{missing.tolist()[:10]}"
+        )
+    prices = pd.to_numeric(day.loc[positive.index, "ideal_trade_price"], errors="coerce")
+    if prices.isna().any() or not np.isfinite(prices.to_numpy(dtype=float)).all() or prices.le(0).any():
+        raise InputDataError("initial target cannot be seeded with invalid trade prices")
+    values = positive.astype(float) * float(initial_cash)
+    holdings = {
+        str(ticker): float(values.loc[ticker] / prices.loc[ticker])
+        for ticker in positive.index
+    }
+    holding_adj = {
+        str(ticker): float(day.loc[ticker, "adj_factor"])
+        for ticker in positive.index
+    }
+    last_balance_price = {
+        str(ticker): float(day.loc[ticker, "balance_price"])
+        for ticker in positive.index
+    }
+    return 0.0, holdings, holding_adj, last_balance_price
+
+
+def seed_stockdemo_state(
+    *,
+    state: StockDemoPortfolioState,
+    target: pd.Series,
+    day: pd.DataFrame,
+) -> None:
+    """Seed an execution state without charging an artificial entry trade."""
+    if state.holdings or not state.first_execution:
+        raise InputDataError("initial execution state has already been seeded")
+    (
+        state.cash,
+        state.holdings,
+        state.holding_adj,
+        state.last_balance_price,
+    ) = _seed_positions(initial_cash=state.cash, target=target, day=day)
+    state.first_execution = False
+
+
 def load_terminal_events(path: str | Path) -> dict[str, frozenset[str]]:
     """Load explicit terminal/write-off events from a terminal-return manifest."""
 
@@ -996,8 +1059,16 @@ def run_stockdemo_compat(
     portfolio_name: str = "signal",
     terminal_events: Mapping[str, Iterable[str]] | None = None,
     record_signal_targets: bool = False,
+    initial_target: pd.Series | None = None,
+    valuation_end_date: object | None = None,
 ) -> dict[str, Any]:
-    """Run signal or target-weight execution using stockdemo accounting rules."""
+    """Run signal or target-weight execution using stockdemo accounting rules.
+
+    ``valuation_end_date`` extends only mark-to-market valuation after the
+    final supplied signal or target. It never schedules an additional trade.
+    This keeps sparse target-weight schedules comparable with a signal
+    backtest that has daily observations through a requested window end.
+    """
 
     config.validate()
     if config.missing_held_policy == "terminal_writeoff" and terminal_events is None:
@@ -1082,8 +1153,39 @@ def run_stockdemo_compat(
     signal_target_rows: list[dict[str, Any]] = []
     last_balance_prices: dict[str, float] = {}
     first = True
+    initial_target_seeded = False
+    if initial_target is not None:
+        initial_date = source_dates[0]
+        if initial_date not in by_date:
+            raise InputDataError(
+                "initial target date is absent from stockdemo market: "
+                f"{initial_date}"
+            )
+        cash, holdings, holding_adj, last_balance_prices = _seed_positions(
+            initial_cash=cash,
+            target=initial_target,
+            day=by_date[initial_date],
+        )
+        first = False
+        initial_target_seeded = True
     first_execution = execution_dates[0]
-    last_valuation = max(source_dates) if config.exact_window else execution_dates[-1]
+    default_last_valuation = (
+        max(source_dates) if config.exact_window else execution_dates[-1]
+    )
+    if valuation_end_date is None:
+        last_valuation = default_last_valuation
+    else:
+        last_valuation = normalize_date(valuation_end_date)
+        if last_valuation not in market_positions:
+            raise InputDataError(
+                "valuation_end_date is absent from stockdemo market: "
+                f"{last_valuation}"
+            )
+        if last_valuation < execution_dates[-1]:
+            raise InputDataError(
+                "valuation_end_date must not precede the final execution date: "
+                f"{execution_dates[-1]}"
+            )
     valuation_dates = [
         date for date in market_dates if first_execution <= date <= last_valuation
     ]
@@ -1268,6 +1370,7 @@ def run_stockdemo_compat(
         "status": "success",
         "portfolio": portfolio_name,
         "engine": "stockdemo_compat",
+        "initial_target_seeded": initial_target_seeded,
         "config": asdict(config),
         "metrics": _stockdemo_metrics(stats, config.periods_per_year),
         "output_dir": str(output),

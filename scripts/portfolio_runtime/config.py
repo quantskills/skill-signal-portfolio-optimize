@@ -48,6 +48,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_cutting_planes": 100,
         "blend_strength": 0.10,
         "minimum_predicted_risk_reduction": 0.0,
+        # Strict preserves historical behavior. Repair is opt-in and retries
+        # only soft risk bands after the original problem is infeasible.
+        "feasibility_mode": "strict",
     },
     "selection": {
         "mode": "none",
@@ -236,8 +239,10 @@ def _candidate_weight_range(value: Any) -> dict[str, float] | None:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    if config["schema_version"] not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
-        raise ConfigError("schema_version must equal 1, 2, 3, 4, 5, 6, 7, 8, 9, or 10")
+    if config["schema_version"] not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
+        raise ConfigError(
+            "schema_version must equal 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, or 11"
+        )
 
     signal = config["signal"]
     if signal["type"] not in {"rank_score", "expected_return"}:
@@ -281,12 +286,12 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             "error_except_frozen, or role_aware"
         )
     if (
-        config["schema_version"] in {3, 4, 5, 6, 7, 8, 9, 10}
+        config["schema_version"] in {3, 4, 5, 6, 7, 8, 9, 10, 11}
         and signal["missing_prediction_policy"]
         not in {"error_except_frozen", "role_aware"}
     ):
         raise ConfigError(
-            "schema_version 3 through 10 requires signal.missing_prediction_policy "
+            "schema_version 3 through 11 requires signal.missing_prediction_policy "
             "error_except_frozen or role_aware"
         )
     for key in (
@@ -704,6 +709,55 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         if candidate_range is None or candidate_range["min_weight"] < 0.95:
             raise ConfigError(
                 "schema_version 9 requires "
+                "candidate_weight_range.min_weight >= 0.95"
+            )
+
+    if config["schema_version"] == 11:
+        if (
+            optimizer["objective_mode"]
+            != "blended_alpha_preserving_minimum_variance"
+        ):
+            raise ConfigError(
+                "schema_version 11 requires optimizer.objective_mode "
+                "blended_alpha_preserving_minimum_variance"
+            )
+        if signal["type"] != "rank_score" or signal["zscore"]:
+            raise ConfigError(
+                "schema_version 11 requires signal.type rank_score and "
+                "signal.zscore false"
+            )
+        if optimizer["solver_backend"] not in {
+            "cvxpy",
+            "clarabel_socp",
+            "auto",
+        }:
+            raise ConfigError(
+                "schema_version 11 requires a CVXPY/Clarabel solver backend"
+            )
+        if optimizer["fallback_policy"] != "error":
+            raise ConfigError(
+                "schema_version 11 requires optimizer.fallback_policy error"
+            )
+        prohibited = {
+            "max_turnover": constraints["max_turnover"],
+            "max_tracking_error": constraints["max_tracking_error"],
+            "sector_active_limit": constraints["sector_active_limit"],
+            "factor_active_limit": constraints["factor_active_limit"],
+            "industry_active_range": constraints["industry_active_range"],
+            "style_active_ranges": constraints["style_active_ranges"],
+        }
+        enabled = sorted(
+            name for name, value in prohibited.items() if value is not None
+        )
+        if enabled:
+            raise ConfigError(
+                "schema_version 11 uses soft factor risk and does not allow "
+                "hard risk/turnover constraints: " + ", ".join(enabled)
+            )
+        candidate_range = constraints["candidate_weight_range"]
+        if candidate_range is None or candidate_range["min_weight"] < 0.95:
+            raise ConfigError(
+                "schema_version 11 requires "
                 "candidate_weight_range.min_weight >= 0.95"
             )
 
