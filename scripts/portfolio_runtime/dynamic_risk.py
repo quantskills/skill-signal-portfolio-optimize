@@ -89,6 +89,7 @@ class DynamicRiskModelCache:
         returns_file: str | Path,
         market_cap_file: str | Path,
         industry_file: str | Path | None,
+        fundamental_file: str | Path | None = None,
         cache_root: str | Path,
     ) -> None:
         self.context = load_risk_model_context(
@@ -96,6 +97,7 @@ class DynamicRiskModelCache:
             returns_file=returns_file,
             market_cap_file=market_cap_file,
             industry_file=industry_file,
+            fundamental_file=fundamental_file,
         )
         self.cache_root = Path(cache_root).expanduser().resolve()
         self.cache_root.mkdir(parents=True, exist_ok=True)

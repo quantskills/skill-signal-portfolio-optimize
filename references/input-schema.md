@@ -172,6 +172,10 @@ Dynamic risk returns and market cap use the wide panel format documented in
 [risk-model.md](risk-model.md). Large panels are loaded once per rolling process, not once per
 rebalance date.
 
+### Optional PIT fundamentals
+
+Fundamental styles require one materialized Parquet file containing at least `symbol`, `available_date`, `report_year`, and `report_quarter`, plus the fields needed by the configured styles. Use `scripts/materialize_pit_fundamentals.py` to combine partitioned PIT sources, set `fundamental_file` in the risk-model YAML, and pass the same file as `--risk-fundamental-file` for dynamic rolling runs. The file must use actual availability dates, not a current financial snapshot.
+
 ## Frozen Alpha191+LGBM adapter
 
 `scripts/prepare_alpha191_lgbm_inputs.py` writes:

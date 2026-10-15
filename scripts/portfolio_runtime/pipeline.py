@@ -47,6 +47,46 @@ OUTPUT_FILES = (
 )
 
 
+def _all_style_exposure_details(
+    weights: pd.Series,
+    benchmark: pd.Series,
+    risk: pd.DataFrame | PortfolioRisk,
+    constrained: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Expose every factor-model style while retaining constraint-only bounds."""
+    if not isinstance(risk, PortfolioRisk) or risk.exposures is None:
+        return dict(constrained.get("style_exposures", {}))
+    style_names = [
+        name for name in risk.exposures.columns
+        if not str(name).upper().startswith("INDUSTRY:")
+        and str(name).upper() != "MARKET"
+    ]
+    styles = risk.exposures.loc[:, style_names]
+    result: dict[str, dict[str, Any]] = {}
+    constrained_styles = constrained.get("style_exposures", {})
+    for name in styles.columns:
+        coefficients = styles[name].to_numpy(dtype=float)
+        benchmark_value = float(coefficients @ benchmark.to_numpy(dtype=float))
+        portfolio_value = float(coefficients @ weights.to_numpy(dtype=float))
+        active_value = portfolio_value - benchmark_value
+        detail = dict(constrained_styles.get(name, {}))
+        detail.update(
+            {
+                "benchmark_exposure": benchmark_value,
+                "portfolio_exposure": portfolio_value,
+                "active_exposure": active_value,
+            }
+        )
+        detail.setdefault("lower_bound", None)
+        detail.setdefault("upper_bound", None)
+        detail.setdefault("lower_slack", None)
+        detail.setdefault("upper_slack", None)
+        detail.setdefault("binding", False)
+        detail.setdefault("passed", True)
+        result[str(name)] = detail
+    return result
+
+
 def build_optimization_universe(
     candidates: pd.Series | pd.Index,
     benchmark: pd.Series,
@@ -756,11 +796,21 @@ def run_single_date(
     constraint_diagnostics = {
         "risk_optimized": {
             "solver": optimized.solver,
-            "constraints": optimized.constraints,
+            "constraints": {
+                **optimized.constraints,
+                "all_style_exposures": _all_style_exposure_details(
+                    optimized.weights, benchmark, risk, optimized.constraints
+                ),
+            },
         },
         "equal_weight_signal": {
             "solver": None,
-            "constraints": baseline_constraints,
+            "constraints": {
+                **baseline_constraints,
+                "all_style_exposures": _all_style_exposure_details(
+                    baseline, benchmark, risk, baseline_constraints
+                ),
+            },
         },
     }
 

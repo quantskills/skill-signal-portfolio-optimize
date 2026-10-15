@@ -31,6 +31,7 @@ The open model supports:
 
 - `MARKET` when industry history is disabled;
 - `SIZE`, `BETA`, `MOMENTUM`, `RESVOL`, and `NLSIZE` market-derived styles;
+- optional PIT fundamental styles: `EARNYILD` (TTM earnings / market cap), `GROWTH` (same-quarter revenue growth), `BTOP` (book equity / market cap), `LEVERAGE` (total liabilities / total assets), and `LIQUIDTY` (cash / current liabilities);
 - one-hot level-1 industry exposures when interval history is supplied;
 - daily weighted least-squares factor returns;
 - EWMA factor covariance with configurable diagonal shrinkage;
@@ -45,12 +46,24 @@ Sigma = X F X' + diag(specific_variance)
 
 ## Run
 
+Fundamental styles are opt-in. First materialize partitioned PIT sources into one immutable Parquet file so the risk-cache input fingerprint is stable:
+
+```bash
+python scripts/materialize_pit_fundamentals.py \
+  --base-root /path/to/fundamentals_pit \
+  --extended-root /path/to/fundamentals_pit_extended \
+  --output-file /path/to/fundamentals_pit_materialized.parquet
+```
+
+Use [examples/fundamental-style-risk-model.yaml](../examples/fundamental-style-risk-model.yaml) as the risk configuration. It uses only observations whose `available_date` is no later than the exposure date. Quarterly cumulative income values become TTM for `EARNYILD`; `GROWTH` remains same-quarter year-over-year growth. These are open Barra-style definitions, not commercial Barra definitions.
+
 ```bash
 python scripts/build_risk_model.py \
   --config examples/risk-model-config.yaml \
   --returns-file /path/to/returns.parquet \
   --market-cap-file /path/to/market_cap.parquet \
   --industry-file /path/to/industry_membership_history.parquet \
+  --fundamental-file /path/to/fundamentals_pit_materialized.parquet \
   --universe-file /path/to/signal.parquet \
   --date 20230104 \
   --output-dir /path/to/risk_model/date=20230104
@@ -96,8 +109,7 @@ all positive-weight benchmark constituents on every modeled date.
 
 The rolling optimizer can repair static-universe gaps caused by carried positions. Supply
 `--risk-model-config`, `--risk-returns-file`, `--risk-market-cap-file`, and
-`--dynamic-risk-cache-root` together. `--risk-industry-file` remains optional according to
-`industry_mode`.
+`--dynamic-risk-cache-root` together. `--risk-industry-file` and `--risk-fundamental-file` remain optional according to `industry_mode` and selected `style_factors`.
 
 For each date, the runtime builds the same universe used by the optimizer: signal names,
 positive benchmark names, and positive drifted current holdings. It first checks whether both
@@ -133,5 +145,4 @@ frozen at current weight. No risk input is fabricated.
 The optimizer may consume the emitted `exposures.parquet`, `factor_cov.parquet`, and `specific_var.parquet` directly. For active weights `a`, it evaluates `(X'a)'F(X'a) + sum(D * a^2)`. The dense `asset_cov.parquet` entry remains available for compatibility and equivalence tests.
 
 The manifest discloses model type, timing contract, lookback, factor list, whether industry
-history was used, regression coverage, and specific-risk imputation. Fundamental styles are
-not yet estimated by the open model.
+history was used, regression coverage, and specific-risk imputation. Fundamental styles are estimated only when explicitly configured with a materialized PIT file. The runtime does not infer values from future filings, and it does not reproduce commercial Barra revisions, forecasts, or analyst-consensus factors.

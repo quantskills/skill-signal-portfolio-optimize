@@ -14,6 +14,11 @@ import pandas as pd
 import yaml
 
 from .errors import ConfigError, InputDataError, RiskModelError
+from .fundamental_styles import (
+    SUPPORTED_FUNDAMENTAL_STYLES,
+    build_fundamental_styles,
+    load_fundamental_panel,
+)
 from .io import normalize_date, normalize_ticker, read_table, sha256_file
 
 
@@ -21,6 +26,8 @@ DEFAULT_RISK_CONFIG: dict[str, Any] = {
     "schema_version": 1,
     "industry_mode": "required",
     "style_factors": ["SIZE"],
+    "fundamental_file": None,
+    "fundamental_minimum_coverage": 0.70,
     "style_lookback_days": 252,
     "style_minimum_observations": 126,
     "momentum_skip_days": 21,
@@ -68,6 +75,7 @@ class RiskModelContext:
     returns: pd.DataFrame
     market_cap: pd.DataFrame
     industry_history: pd.DataFrame | None
+    fundamentals: pd.DataFrame | None
     inputs: dict[str, dict[str, str]]
 
 
@@ -82,7 +90,9 @@ def _finite_number(value: Any, name: str, *, minimum: float | None = None) -> fl
     return result
 
 
-def load_risk_config(path: str | Path) -> dict[str, Any]:
+def load_risk_config(
+    path: str | Path, *, fundamental_file_override: str | Path | None = None
+) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     try:
         supplied = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -94,12 +104,22 @@ def load_risk_config(path: str | Path) -> dict[str, Any]:
         supplied = {}
     if not isinstance(supplied, dict):
         raise ConfigError("risk-model configuration root must be a mapping")
+    if fundamental_file_override is not None:
+        supplied = {
+            **supplied,
+            "fundamental_file": str(
+                Path(fundamental_file_override).expanduser().resolve()
+            ),
+        }
     unknown = set(supplied) - set(DEFAULT_RISK_CONFIG)
     if unknown:
         raise ConfigError(
             "unknown risk-model configuration key(s): " + ", ".join(sorted(unknown))
         )
     config = {**DEFAULT_RISK_CONFIG, **supplied}
+    if config["fundamental_file"] is not None:
+        if not isinstance(config["fundamental_file"], str) or not config["fundamental_file"].strip():
+            raise ConfigError("fundamental_file must be a non-empty path string or null")
     if config["schema_version"] != 1:
         raise ConfigError("risk-model schema_version must equal 1")
     integer_fields = (
@@ -123,13 +143,20 @@ def load_risk_config(path: str | Path) -> dict[str, Any]:
     if not isinstance(config["style_factors"], list) or not config["style_factors"]:
         raise ConfigError("style_factors must be a non-empty list")
     styles = [str(value).upper().strip() for value in config["style_factors"]]
-    supported_styles = {"SIZE", "BETA", "MOMENTUM", "RESVOL", "NLSIZE"}
+    supported_styles = {
+        "SIZE", "BETA", "MOMENTUM", "RESVOL", "NLSIZE",
+        *SUPPORTED_FUNDAMENTAL_STYLES,
+    }
     unknown_styles = set(styles) - supported_styles
     if unknown_styles:
         raise ConfigError(f"unsupported style_factors: {sorted(unknown_styles)}")
     if len(set(styles)) != len(styles):
         raise ConfigError("style_factors must be unique")
     config["style_factors"] = styles
+    if set(styles).intersection(SUPPORTED_FUNDAMENTAL_STYLES) and not config.get("fundamental_file"):
+        raise ConfigError(
+            "fundamental_file is required when fundamental style factors are enabled"
+        )
     if config["style_minimum_observations"] > config["style_lookback_days"]:
         raise ConfigError(
             "style_minimum_observations cannot exceed style_lookback_days"
@@ -150,6 +177,7 @@ def load_risk_config(path: str | Path) -> dict[str, Any]:
         "factor_covariance_diagonal_shrinkage",
         "specific_variance_median_shrinkage",
         "max_specific_imputation_fraction",
+        "fundamental_minimum_coverage",
     ):
         config[name] = _finite_number(config[name], name, minimum=0.0)
         if config[name] > 1.0:
@@ -304,6 +332,7 @@ def _style_exposures_asof(
     exposure_date: str,
     tickers: pd.Index,
     config: dict[str, Any],
+    fundamentals: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     cap = latest_valid_market_cap(market_cap, exposure_date, tickers)
     regression_weight = np.power(cap, config["regression_weight_power"])
@@ -332,6 +361,38 @@ def _style_exposures_asof(
             name="NLSIZE",
             winsorize_mad=config["size_winsorize_mad"],
         )
+
+    fundamental_requested = [
+        name for name in requested if name in SUPPORTED_FUNDAMENTAL_STYLES
+    ]
+    if fundamental_requested:
+        if fundamentals is None:
+            raise RiskModelError(
+                "fundamental PIT data is required for fundamental style factors"
+            )
+        raw = build_fundamental_styles(
+            fundamentals,
+            exposure_date=exposure_date,
+            tickers=tickers,
+            market_cap=cap,
+            requested=fundamental_requested,
+        )
+        coverage = raw.notna().mean()
+        insufficient = coverage[coverage.lt(config["fundamental_minimum_coverage"])]
+        if len(insufficient):
+            details = ", ".join(
+                f"{name}={value:.1%}" for name, value in insufficient.items()
+            )
+            raise RiskModelError(
+                "fundamental style coverage below configured minimum: " + details
+            )
+        for name in fundamental_requested:
+            exposures[name] = _standardize_style(
+                raw[name],
+                regression_weight,
+                name=name,
+                winsorize_mad=config["return_winsorize_mad"],
+            )
 
     return_based = {"BETA", "MOMENTUM", "RESVOL"}.intersection(requested)
     if return_based:
@@ -467,6 +528,7 @@ def estimate_structural_risk_model(
     target_universe: pd.Index,
     requested_date: str,
     config: dict[str, Any],
+    fundamentals: pd.DataFrame | None = None,
 ) -> RiskModelResult:
     config = {**DEFAULT_RISK_CONFIG, **config}
     industry_mode = config["industry_mode"]
@@ -525,6 +587,7 @@ def estimate_structural_risk_model(
                 exposure_date,
                 selected,
                 config,
+                fundamentals,
             )
         except RiskModelError:
             continue
@@ -614,12 +677,32 @@ def estimate_structural_risk_model(
             "target universe lacks required industry or market cap: "
             f"{target_universe[invalid_target.to_numpy()].tolist()[:10]}"
         )
+    target_fundamental_coverage: dict[str, float] = {}
+    fundamental_requested = [
+        name for name in config["style_factors"]
+        if name in SUPPORTED_FUNDAMENTAL_STYLES
+    ]
+    if fundamental_requested:
+        if fundamentals is None:
+            raise RiskModelError("fundamental PIT data is required for fundamental styles")
+        target_raw_fundamentals = build_fundamental_styles(
+            fundamentals,
+            exposure_date=common_dates[-1],
+            tickers=target_universe,
+            market_cap=target_cap,
+            requested=fundamental_requested,
+        )
+        target_fundamental_coverage = {
+            name: float(value)
+            for name, value in target_raw_fundamentals.notna().mean().items()
+        }
     target_styles, _ = _style_exposures_asof(
         returns,
         market_cap,
         common_dates[-1],
         target_universe,
         config,
+        fundamentals,
     )
     exposures = pd.DataFrame(0.0, index=target_universe, columns=factors)
     if not use_industry:
@@ -689,10 +772,12 @@ def estimate_structural_risk_model(
         "specific_risk_observations_min_target": int(
             observations.reindex(target_universe, fill_value=0).min()
         ),
+        "fundamental_style_coverage_target": target_fundamental_coverage,
         "config": config,
         "timing_contract": (
-            "return on date t is regressed on market cap, market-derived styles, "
-            "and any enabled industry classification known on the preceding aligned "
+            "return on date t is regressed on market cap, market-derived and PIT "
+            "fundamental styles, and any enabled industry classification known "
+            "on the preceding aligned "
             "trading date; no input date exceeds requested_date"
         ),
     }
@@ -726,7 +811,20 @@ def load_risk_model_context(
     returns_file: str | Path,
     market_cap_file: str | Path,
     industry_file: str | Path | None,
+    fundamental_file: str | Path | None = None,
 ) -> RiskModelContext:
+    config = load_risk_config(
+        config_path, fundamental_file_override=fundamental_file
+    )
+    resolved_fundamental = config.get("fundamental_file")
+    if resolved_fundamental is not None:
+        resolved_path = Path(resolved_fundamental).expanduser().resolve()
+        if not resolved_path.is_file():
+            raise InputDataError(
+                "fundamental_file must reference one materialized PIT parquet file: "
+                f"{resolved_path}"
+            )
+        resolved_fundamental = resolved_path
     supplied: dict[str, str | Path] = {
         "config": config_path,
         "returns": returns_file,
@@ -734,6 +832,8 @@ def load_risk_model_context(
     }
     if industry_file is not None:
         supplied["industry"] = industry_file
+    if resolved_fundamental is not None:
+        supplied["fundamental"] = resolved_fundamental
     inputs = {
         name: {
             "path": str(Path(path).expanduser().resolve()),
@@ -742,11 +842,16 @@ def load_risk_model_context(
         for name, path in supplied.items()
     }
     return RiskModelContext(
-        config=load_risk_config(config_path),
+        config=config,
         returns=load_wide_panel(returns_file, "returns"),
         market_cap=load_wide_panel(market_cap_file, "market cap"),
         industry_history=(
             None if industry_file is None else load_industry_history(industry_file)
+        ),
+        fundamentals=(
+            None
+            if resolved_fundamental is None
+            else load_fundamental_panel(resolved_fundamental)
         ),
         inputs=inputs,
     )
@@ -774,6 +879,7 @@ def build_risk_model_from_context(
         target_universe=universe,
         requested_date=date,
         config=context.config,
+        fundamentals=context.fundamentals,
     )
     manifest = {
         **result.manifest,
@@ -821,6 +927,7 @@ def build_risk_model_from_files(
     market_cap_file: str | Path,
     industry_file: str | Path | None,
     universe_file: str | Path,
+    fundamental_file: str | Path | None = None,
     requested_date: object,
     output_dir: str | Path,
 ) -> dict[str, Any]:
@@ -831,6 +938,7 @@ def build_risk_model_from_files(
         returns_file=returns_file,
         market_cap_file=market_cap_file,
         industry_file=industry_file,
+        fundamental_file=fundamental_file,
     )
     inputs = dict(context.inputs)
     inputs["universe"] = {
@@ -842,6 +950,7 @@ def build_risk_model_from_files(
         returns=context.returns,
         market_cap=context.market_cap,
         industry_history=context.industry_history,
+        fundamentals=context.fundamentals,
         inputs=inputs,
     )
     return build_risk_model_from_context(

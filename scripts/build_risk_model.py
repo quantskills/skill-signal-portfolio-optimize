@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, help="Risk-model YAML config")
     parser.add_argument("--returns-file", required=True, help="Date x ticker return panel")
     parser.add_argument("--market-cap-file", required=True, help="Date x ticker market-cap panel")
+    parser.add_argument("--fundamental-file", help="Optional PIT fundamental panel")
     parser.add_argument(
         "--industry-file",
         help="Optional interval industry history; required only by industry_mode=required",
@@ -43,6 +44,7 @@ def main() -> int:
             returns_file=args.returns_file,
             market_cap_file=args.market_cap_file,
             industry_file=args.industry_file,
+            fundamental_file=args.fundamental_file,
             universe_file=args.universe_file,
             requested_date=args.date,
             output_dir=args.output_dir,

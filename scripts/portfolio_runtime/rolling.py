@@ -714,7 +714,12 @@ def _diagnostic_rows(
     ):
         for kind, values in (
             ("industry", portfolio_constraints["industry_exposures"]),
-            ("style", portfolio_constraints["style_exposures"]),
+            (
+                "style",
+                portfolio_constraints.get(
+                    "all_style_exposures", portfolio_constraints["style_exposures"]
+                ),
+            ),
         ):
             for name, detail in values.items():
                 exposure_rows.append(
@@ -813,6 +818,7 @@ def run_rolling_experiment(
     risk_returns_file: str | Path | None = None,
     risk_market_cap_file: str | Path | None = None,
     risk_industry_file: str | Path | None = None,
+    risk_fundamental_file: str | Path | None = None,
     dynamic_risk_cache_root: str | Path | None = None,
     checkpoint_root: str | Path | None = None,
     on_optimization_failure: str = "error",
@@ -870,6 +876,7 @@ def run_rolling_experiment(
         "risk_model_config": risk_model_config,
         "risk_returns_file": risk_returns_file,
         "risk_market_cap_file": risk_market_cap_file,
+        "risk_fundamental_file": risk_fundamental_file,
         "dynamic_risk_cache_root": dynamic_risk_cache_root,
     }
     supplied_dynamic = [name for name, value in dynamic_required.items() if value is not None]
@@ -878,8 +885,12 @@ def run_rolling_experiment(
         raise InputDataError(
             "dynamic risk arguments must be supplied together; missing " + ", ".join(missing)
         )
-    if risk_industry_file is not None and not supplied_dynamic:
-        raise InputDataError("risk_industry_file requires complete dynamic risk arguments")
+    if (
+        risk_industry_file is not None or risk_fundamental_file is not None
+    ) and not supplied_dynamic:
+        raise InputDataError(
+            "risk_industry_file/risk_fundamental_file require complete dynamic risk arguments"
+        )
     portfolio_config = load_config(config_path)
     table_cache = DateTableCache()
     risk_form = portfolio_config["covariance"]["risk_form"]
@@ -904,6 +915,7 @@ def run_rolling_experiment(
             returns_file=risk_returns_file,
             market_cap_file=risk_market_cap_file,
             industry_file=risk_industry_file,
+            fundamental_file=risk_fundamental_file,
             cache_root=dynamic_risk_cache_root,
         )
     tolerance = float(portfolio_config["constraints"]["weight_sum_tolerance"])

@@ -62,6 +62,7 @@ def _input_records(
     returns_file: str | Path,
     market_cap_file: str | Path,
     industry_file: str | Path | None,
+    fundamental_file: str | Path | None = None,
     universe_file: str | Path,
 ) -> dict[str, dict[str, str]]:
     supplied: dict[str, str | Path] = {
@@ -72,6 +73,8 @@ def _input_records(
     }
     if industry_file is not None:
         supplied["industry"] = industry_file
+    if fundamental_file is not None:
+        supplied["fundamental"] = fundamental_file
     records: dict[str, dict[str, str]] = {}
     for name, value in supplied.items():
         path = Path(value).expanduser().resolve()
@@ -130,6 +133,7 @@ def build_rolling_risk_models(
     universe_file: str | Path,
     output_root: str | Path,
     industry_file: str | Path | None = None,
+    fundamental_file: str | Path | None = None,
     start_date: object | None = None,
     end_date: object | None = None,
     rebalance_every: int = 1,
@@ -150,6 +154,7 @@ def build_rolling_risk_models(
         returns_file=returns_file,
         market_cap_file=market_cap_file,
         industry_file=industry_file,
+        fundamental_file=fundamental_file,
         universe_file=universe_file,
     )
     manifest: dict[str, Any] = {
@@ -187,6 +192,7 @@ def build_rolling_risk_models(
                     returns_file=returns_file,
                     market_cap_file=market_cap_file,
                     industry_file=industry_file,
+                    fundamental_file=fundamental_file,
                     universe_file=universe_file,
                     requested_date=date,
                     output_dir=date_output,
@@ -241,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--returns-file", required=True, help="Date x ticker return panel")
     parser.add_argument("--market-cap-file", required=True, help="Date x ticker market-cap panel")
     parser.add_argument("--industry-file", help="Optional interval industry history")
+    parser.add_argument("--fundamental-file", help="Optional materialized PIT fundamental parquet")
     parser.add_argument(
         "--universe-file", required=True, help="Long-form date-ticker universe or signal file"
     )
@@ -259,6 +266,7 @@ def main() -> int:
             returns_file=args.returns_file,
             market_cap_file=args.market_cap_file,
             industry_file=args.industry_file,
+            fundamental_file=args.fundamental_file,
             universe_file=args.universe_file,
             start_date=args.start_date,
             end_date=args.end_date,

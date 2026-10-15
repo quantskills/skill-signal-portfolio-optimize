@@ -77,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk-returns-file", type=Path)
     parser.add_argument("--risk-market-cap-file", type=Path)
     parser.add_argument("--risk-industry-file", type=Path)
+    parser.add_argument("--risk-fundamental-file", type=Path)
     parser.add_argument("--dynamic-risk-cache-root", type=Path)
     parser.add_argument(
         "--checkpoint-root",
@@ -182,6 +183,7 @@ def main() -> int:
             risk_returns_file=args.risk_returns_file,
             risk_market_cap_file=args.risk_market_cap_file,
             risk_industry_file=args.risk_industry_file,
+            risk_fundamental_file=args.risk_fundamental_file,
             dynamic_risk_cache_root=args.dynamic_risk_cache_root,
             checkpoint_root=args.checkpoint_root,
             on_optimization_failure=args.on_optimization_failure,

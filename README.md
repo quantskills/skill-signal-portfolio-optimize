@@ -57,9 +57,16 @@
 | MOMENTUM | 动量 | 是，可选约束 |
 | RESVOL | 残差波动率 | 是，可选约束 |
 | NLSIZE | 非线性市值 | 是，可选约束 |
+| EARNYILD | TTM 盈利收益率 | 需显式提供 PIT 基本面文件 |
+| GROWTH | 同季营收增长 | 需显式提供 PIT 基本面文件 |
+| BTOP | 账面市值比 | 需显式提供 PIT 基本面文件 |
+| LEVERAGE | 资产负债杠杆 | 需显式提供 PIT 基本面文件 |
+| LIQUIDTY | 现金流动性 | 需显式提供 PIT 基本面文件 |
 | INDUSTRY:* | 行业哑变量 | 仅在提供严格时点行业区间数据时计算 |
 
 “已经计算”不等于“自动约束”。需要在配置中明确设置目标暴露和容忍区间。v1.1.0 提供 [行业组合配置](examples/v1.1-industry-portfolio-config.yaml) 和 [行业风险模型配置](examples/v1.1-industry-risk-model-config.yaml)，行业标签默认要求每日 100% 覆盖；若只有候选股票缺失，可显式使用 `--missing-policy exclude` 生成过滤后的候选池和排除清单，再将过滤后的文件传给优化器。基准持仓和已有持仓仍必须有行业标签。禁止用今天的行业分类回填历史。
+
+基本面风格默认关闭，不改变既有实验或 preset。启用时先将 PIT 财务分区物化为一个可哈希 Parquet 文件，再使用 [基本面风险模型配置](examples/fundamental-style-risk-model.yaml)。该开放式定义使用公告可用日与历史财务值，不包含分析师预期、分红预测或商业 Barra 的修订链。
 
 ## 推荐参数预设
 

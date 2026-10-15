@@ -16,6 +16,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from portfolio_runtime.fundamental_styles import load_fundamental_panel
 from portfolio_runtime.risk_model import (
     OUTPUT_FILES,
     build_risk_model_from_files,
@@ -110,6 +111,68 @@ class StructuralRiskModelTest(unittest.TestCase):
         second = self.estimate(extended)
         np.testing.assert_allclose(first.asset_cov, second.asset_cov, atol=1e-12)
         np.testing.assert_allclose(first.factor_cov, second.factor_cov, atol=1e-12)
+
+    def test_model_includes_optional_pit_fundamental_styles(self) -> None:
+        rows = []
+        for index, ticker in enumerate(self.tickers, start=1):
+            rows.extend(
+                [
+                    {
+                        "ticker": ticker,
+                        "available_date": "20210115",
+                        "report_year": 2020,
+                        "report_quarter": 4,
+                        "is_total_revenue": 100.0 + index * index,
+                        "is_n_income_attr_p": 10.0 + index,
+                        "bs_total_hldr_eqy_exc_min_int": 50.0 + 2.0 * index,
+                        "bs_total_liab": 80.0 + 3.0 * index,
+                        "bs_total_assets": 160.0 + 5.0 * index,
+                        "bs_money_cap": 20.0 + 1.5 * index,
+                        "bs_total_cur_liab": 10.0 + 0.7 * index,
+                    },
+                    {
+                        "ticker": ticker,
+                        "available_date": "20220115",
+                        "report_year": 2021,
+                        "report_quarter": 4,
+                        "is_total_revenue": 130.0 + 2.0 * index * index,
+                        "is_n_income_attr_p": 14.0 + 1.2 * index,
+                        "bs_total_hldr_eqy_exc_min_int": 63.0 + 3.0 * index,
+                        "bs_total_liab": 88.0 + 4.0 * index,
+                        "bs_total_assets": 172.0 + 6.0 * index,
+                        "bs_money_cap": 25.0 + 2.0 * index,
+                        "bs_total_cur_liab": 12.0 + 0.9 * index,
+                    },
+                ]
+            )
+        fundamental_path = self.root / "fundamentals.parquet"
+        pd.DataFrame(rows).rename(columns={"ticker": "symbol"}).to_parquet(
+            fundamental_path, index=False
+        )
+        fundamentals = load_fundamental_panel(fundamental_path)
+        config = {
+            **self.config,
+            "style_factors": [
+                "SIZE", "EARNYILD", "GROWTH", "BTOP", "LEVERAGE", "LIQUIDTY"
+            ],
+            "minimum_regression_periods": 60,
+        }
+        result = estimate_structural_risk_model(
+            returns=self.returns,
+            market_cap=self.market_cap,
+            industry_history=self.industry,
+            target_universe=self.universe,
+            requested_date=self.dates[-1],
+            config=config,
+            fundamentals=fundamentals,
+        )
+        for name in ("EARNYILD", "GROWTH", "BTOP", "LEVERAGE", "LIQUIDTY"):
+            self.assertIn(name, result.exposures.columns)
+            self.assertTrue(np.isfinite(result.exposures[name]).all())
+            self.assertIn(name, result.factor_cov.index)
+            self.assertGreaterEqual(
+                result.manifest["fundamental_style_coverage_target"][name], 0.70
+            )
 
     def test_market_style_model_runs_without_industry_history(self) -> None:
         config = {
